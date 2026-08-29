@@ -1,0 +1,27 @@
+src/geometry.rs
+  s_da61af4672b9a0::t_94b3010c2c05cc 135-136,262-263,286-287
+src/main.rs
+  s_da61af4672b9a0::t_dc37c351120cd4 1,146-149
+src/mtp.rs
+  s_da61af4672b9a0::t_91de8792552f3e 92-95
+src/paged_kv.rs
+  s_da61af4672b9a0::t_6e0969a2e18dac 43-49,87-93,106,113-116
+src/preflight.rs
+  s_da61af4672b9a0::t_1d0055f57c0235 200-203,209-212,269-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "26479f38c554ba482b69e727efad7cac0001ec72",
+  "prompts": {},
+  "sessions": {
+    "s_da61af4672b9a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04e4a-c0cd-7010-a70c-2a80787db5dd",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
