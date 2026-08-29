@@ -1,35 +1,42 @@
 # qwen38-metal
 
-`qwen38-metal` is a native Apple Silicon inference runtime for Qwen3.8 long-context work. The engine is written in Rust and ships precompiled Metal libraries inside its binary. It does not require Python, MLX, a runtime shader compiler, or a model-serving process.
+`qwen38-metal` is a native Apple Silicon runtime core for Qwen3.8 long-context work. It is written in Rust and embeds a build-time Metal library in the release binary. The distribution target is one native executable: no Python, MLX runtime, runtime shader compiler, or model-serving process.
 
-The project is at the runtime-substrate milestone. It proves the distribution shape first: a single native binary embeds a build-time `metallib`, and GitHub Actions builds and runs it on macOS ARM64. It does not claim to run Qwen3.8 yet.
+This repository deliberately starts with the part that constrains the eventual engine: memory geometry, model compatibility checks, and native packaging. It does not load model weights or generate tokens yet, so it does not make an inference-speed claim.
 
-## Design target
+## Runtime core
 
-- Qwen3.8-27B mixed 4-bit weights with matching native MTP heads.
-- Native 262,144-token context, one active long-context stream.
-- Paged INT8 KV cache by default. Q4 KV is an experimental memory-saving mode.
-- Precompiled Metal kernels for Q4e matmul, Gated DeltaNet, paged GQA attention, KV packing, and exact MTP verification.
-- Immutable prefix caching for large documents; SSD is a cold-cache tier only, never the active decode cache.
+The current milestone provides an executable foundation for the eventual Qwen3.8-27B engine:
 
-## Performance hypotheses
+- A release binary with an embedded `MTLB` library compiled before Rust links the executable.
+- A 48 GiB M4 Pro memory model for Qwen3.8-27B hybrid attention geometry.
+- Paged KV cache planning for BF16, Q8, and Q4 precision.
+- A logical page table that only allocates pages after tokens arrive.
+- An adaptive one-to-three-token MTP depth controller.
+- A model preflight that reads `config.json` and `model.safetensors.index.json`, then detects when a model declares MTP layers but the converted weights omit their tensors.
 
-The figures below are engineering targets for an M4 Pro with 20 GPU cores and 48 GB unified memory. They are not measured results from this repository.
+The next implementation milestone is a safetensors loader plus Metal execution for Q4e matmul, Gated DeltaNet, paged GQA attention, KV packing, and exact MTP verification. Those kernels are not claimed as implemented by this commit.
 
-| Context | Target generation throughput |
-| --- | ---: |
-| 1K | 32-36 tok/s |
-| 4K | 26-30 tok/s |
-| 64K | 17-20 tok/s |
-| 128K | 14-17 tok/s |
-| 262K | 10-13 tok/s |
+## Memory target
 
-The 262K profile requires an INT8 paged KV cache. BF16 KV alone is about 16 GiB at this context length and leaves insufficient headroom on a 48 GB Mac.
+The default profile is one 262,144-token stream with Q8 paged KV. For the currently configured Qwen3.8-27B geometry, the KV data is 8 GiB plus about 1 MiB of per-page FP32 scales. The budgeting model reserves 17 GiB for mixed Q4 weights, 3 GiB for workspace, and 12 GiB for macOS and application headroom, leaving about 8 GiB under the 48 GiB unified-memory budget.
 
-## Build contract
+BF16 KV needs 16 GiB at the same context length and exceeds that planning budget. Q4 KV requires about 4 GiB before page scales, but is intended as an experimental capacity mode until its quality and kernel cost are measured.
 
-GitHub Actions is the source of validation for this milestone. The workflow runs on `macos-14`, compiles Metal source with `xcrun`, links the Metal library before Rust links the executable, and runs `qwen38-metal doctor` from the produced ARM64 artifact.
+## Commands
+
+```text
+qwen38-metal doctor
+qwen38-metal plan --context 262144 --kv q8 --page-tokens 128
+qwen38-metal preflight /path/to/qwen38-model
+```
+
+`doctor` checks the embedded Metal library and prints the default budget. `plan` accepts `bf16`, `q8`, or `q4`. `preflight` expects a Qwen3.5-style `config.json` and `model.safetensors.index.json`; it reports the detected attention geometry and whether native MTP tensors are present.
+
+## CI contract
+
+GitHub Actions is the validation authority for this early milestone. The `macos-14` ARM64 runner formats, lints, tests, compiles Metal with `xcrun`, builds the release binary, runs `doctor`, validates the native 262K/Q8 plan, and publishes the binary as an artifact.
 
 ## License
 
-GPL-3.0-only. The repository is created with GitHub's GPL-3.0 license template.
+GPL-3.0-only. See [LICENSE](LICENSE).

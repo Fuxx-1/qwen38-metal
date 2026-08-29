@@ -33,8 +33,11 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Lint all ARM64 targets
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      - name: Test runtime core on ARM64
+        run: cargo test --all-targets --target aarch64-apple-darwin
 
       - name: Build ARM64 runtime target
         run: cargo build --release --target aarch64-apple-darwin
@@ -44,6 +47,7 @@ jobs:
           binary=target/aarch64-apple-darwin/release/qwen38-metal
           file "$binary"
           "$binary" doctor
+          "$binary" plan --context 262144 --kv q8 --page-tokens 128
 
       - name: Package artifact
         run: |
