@@ -1,0 +1,59 @@
+name: macOS ARM64 Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Native binary and precompiled Metal library
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+          targets: aarch64-apple-darwin
+          components: clippy,rustfmt
+
+      - name: Confirm Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build ARM64 runtime target
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Verify binary and embedded Metal library
+        run: |
+          binary=target/aarch64-apple-darwin/release/qwen38-metal
+          file "$binary"
+          "$binary" doctor
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          ditto --arch arm64 target/aarch64-apple-darwin/release/qwen38-metal dist/qwen38-metal
+          tar -C dist -czf dist/qwen38-metal-aarch64-apple-darwin.tar.gz qwen38-metal
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen38-metal-aarch64-apple-darwin
+          path: dist/qwen38-metal-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error

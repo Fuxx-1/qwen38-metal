@@ -1,0 +1,19 @@
+[package]
+name = "qwen38-metal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A native Rust and Metal runtime substrate for Qwen3.8 long-context inference."
+license = "GPL-3.0-only"
+repository = "https://github.com/Fuxx-1/qwen38-metal"
+build = "build.rs"
+
+[[bin]]
+name = "qwen38-metal"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
