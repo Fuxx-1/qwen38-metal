@@ -1,0 +1,42 @@
+Cargo.toml
+  s_da61af4672b9a0::t_7db94497013f3c 15-18
+README.md
+  s_da61af4672b9a0::t_733d849254bac1 3,5,7,9,11-16,18,20,22,24,26-38,42
+src/preflight.rs
+  s_da61af4672b9a0::t_733d849254bac1 69-70,195-197
+  s_da61af4672b9a0::t_eb5fc61a7b8e1a 1-68,71-194,198-201,205-277
+  s_da61af4672b9a0::t_80cb75476ab6fd 202-204
+src/geometry.rs
+  s_da61af4672b9a0::t_7db94497013f3c 1-303
+src/lib.rs
+  s_da61af4672b9a0::t_7db94497013f3c 1-8
+src/metal.rs
+  s_da61af4672b9a0::t_7db94497013f3c 1-28,32-46
+  s_da61af4672b9a0::t_733d849254bac1 29-31
+src/main.rs
+  s_da61af4672b9a0::t_733d849254bac1 1-8,11-31,33,35-37,39-57,64,67-68,70-71,75-77,80-185,187,190,192,195-224
+  s_da61af4672b9a0::t_f5a6bf251bcf69 186,188-189,191,193-194
+.github/workflows/macos-arm64.yml
+  s_da61af4672b9a0::t_733d849254bac1 36-40,50
+src/mtp.rs
+  s_da61af4672b9a0::t_7db94497013f3c 1-130
+src/paged_kv.rs
+  s_da61af4672b9a0::t_733d849254bac1 114-116
+  s_da61af4672b9a0::t_7db94497013f3c 1-113,117-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4e60e8e17ea8b6be0402efa14900fdbbc76d6f61",
+  "prompts": {},
+  "sessions": {
+    "s_da61af4672b9a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04e4a-c0cd-7010-a70c-2a80787db5dd",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
