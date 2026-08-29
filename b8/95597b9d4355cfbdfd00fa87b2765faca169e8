@@ -1,0 +1,19 @@
+Cargo.toml
+  s_910ce63e7e907f::t_f198f0b8f46c5f 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b895597b9d4355cfbdfd00fa87b2765faca169e8",
+  "prompts": {},
+  "sessions": {
+    "s_910ce63e7e907f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04ecd-430b-7c92-8ee5-e121ca5c9fc4",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
