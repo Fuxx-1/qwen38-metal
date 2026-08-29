@@ -1,6 +1,4 @@
-use qwen38_metal::geometry::{
-    format_gib, CachePlan, KvPrecision, M4ProBudget, Qwen35Geometry,
-};
+use qwen38_metal::geometry::{format_gib, CachePlan, KvPrecision, M4ProBudget, Qwen35Geometry};
 use qwen38_metal::metal::embedded_library_info;
 use qwen38_metal::preflight::inspect_model_dir;
 
@@ -145,7 +143,10 @@ fn print_memory_plan(
     println!("KV data: {}", format_gib(cache.data_bytes));
     println!("KV page scales: {}", format_gib(cache.page_scale_bytes));
     println!("KV total: {}", format_gib(cache.total_bytes));
-    println!("M4 Pro 48 GiB budget: {}", format_gib(budget.unified_memory_bytes));
+    println!(
+        "M4 Pro 48 GiB budget: {}",
+        format_gib(budget.unified_memory_bytes)
+    );
     println!("estimated total: {}", format_gib(report.required_bytes));
 
     match report.headroom_bytes {

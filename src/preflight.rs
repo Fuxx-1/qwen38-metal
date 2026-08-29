@@ -197,13 +197,19 @@ impl fmt::Display for PreflightError {
             }
             Self::ConfigJson(error) => write!(formatter, "cannot parse config.json: {error}"),
             Self::WeightIndexJson(error) => {
-                write!(formatter, "cannot parse model.safetensors.index.json: {error}")
+                write!(
+                    formatter,
+                    "cannot parse model.safetensors.index.json: {error}"
+                )
             }
             Self::MissingTextConfig => {
                 write!(formatter, "config.json does not contain text_config")
             }
             Self::UnsupportedModelType(model_type) => {
-                write!(formatter, "unsupported model type {model_type:?}; expected qwen3_5")
+                write!(
+                    formatter,
+                    "unsupported model type {model_type:?}; expected qwen3_5"
+                )
             }
             Self::Geometry(error) => write!(formatter, "invalid Qwen geometry: {error}"),
         }
@@ -260,7 +266,9 @@ mod tests {
         assert_eq!(inspection.geometry.full_attention_layers, 2);
         assert!(matches!(
             inspection.mtp_support,
-            MtpSupport::DeclaredButWeightsMissing { configured_layers: 1 }
+            MtpSupport::DeclaredButWeightsMissing {
+                configured_layers: 1
+            }
         ));
     }
 

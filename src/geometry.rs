@@ -132,10 +132,8 @@ impl CachePlan {
         }
 
         let page_count = context_tokens.div_ceil(page_tokens);
-        let kv_elements = checked_mul(
-            geometry.kv_elements_per_token()?,
-            u64::from(context_tokens),
-        )?;
+        let kv_elements =
+            checked_mul(geometry.kv_elements_per_token()?, u64::from(context_tokens))?;
         let data_bits = checked_mul(kv_elements, precision.bits_per_element())?;
         let data_bytes = data_bits.div_ceil(8);
 
@@ -261,13 +259,8 @@ mod tests {
 
     #[test]
     fn q8_cache_for_native_262k_is_eight_gib_before_page_scales() {
-        let plan = CachePlan::new(
-            &Qwen35Geometry::qwen38_27b(),
-            KvPrecision::Q8,
-            262_144,
-            128,
-        )
-        .unwrap();
+        let plan =
+            CachePlan::new(&Qwen35Geometry::qwen38_27b(), KvPrecision::Q8, 262_144, 128).unwrap();
 
         assert_eq!(plan.page_count, 2_048);
         assert_eq!(plan.data_bytes, 8 * GIB);
@@ -290,13 +283,8 @@ mod tests {
 
     #[test]
     fn q4_cache_uses_four_gib_before_page_scales() {
-        let plan = CachePlan::new(
-            &Qwen35Geometry::qwen38_27b(),
-            KvPrecision::Q4,
-            262_144,
-            128,
-        )
-        .unwrap();
+        let plan =
+            CachePlan::new(&Qwen35Geometry::qwen38_27b(), KvPrecision::Q4, 262_144, 128).unwrap();
 
         assert_eq!(plan.data_bytes, 4 * GIB);
     }

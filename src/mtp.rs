@@ -89,7 +89,10 @@ impl fmt::Display for MtpError {
             Self::InvalidDepthRange {
                 min_depth,
                 max_depth,
-            } => write!(formatter, "invalid MTP depth range {min_depth}..={max_depth}"),
+            } => write!(
+                formatter,
+                "invalid MTP depth range {min_depth}..={max_depth}"
+            ),
             Self::InitialDepthOutOfRange {
                 initial_depth,
                 min_depth,

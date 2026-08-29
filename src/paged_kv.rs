@@ -40,12 +40,13 @@ impl LogicalPageTable {
         }
 
         let start_token = self.sequence_tokens;
-        let end_token_exclusive = start_token
-            .checked_add(token_count)
-            .ok_or(PageTableError::CapacityExceeded {
-                requested_end: u32::MAX,
-                max_tokens: self.max_tokens,
-            })?;
+        let end_token_exclusive =
+            start_token
+                .checked_add(token_count)
+                .ok_or(PageTableError::CapacityExceeded {
+                    requested_end: u32::MAX,
+                    max_tokens: self.max_tokens,
+                })?;
         if end_token_exclusive > self.max_tokens {
             return Err(PageTableError::CapacityExceeded {
                 requested_end: end_token_exclusive,
@@ -83,13 +84,13 @@ impl LogicalPageTable {
     }
 
     fn allocate(&mut self, logical_page: u32) -> Result<(), PageTableError> {
-        let slot = self
-            .pages
-            .get_mut(logical_page as usize)
-            .ok_or(PageTableError::CapacityExceeded {
-                requested_end: logical_page.saturating_mul(self.page_tokens),
-                max_tokens: self.max_tokens,
-            })?;
+        let slot =
+            self.pages
+                .get_mut(logical_page as usize)
+                .ok_or(PageTableError::CapacityExceeded {
+                    requested_end: logical_page.saturating_mul(self.page_tokens),
+                    max_tokens: self.max_tokens,
+                })?;
         if slot.is_none() {
             *slot = Some(self.next_page_id);
             self.next_page_id = self.next_page_id.saturating_add(1);
@@ -102,17 +103,17 @@ impl LogicalPageTable {
 pub enum PageTableError {
     ZeroCapacity,
     EmptyAppend,
-    CapacityExceeded {
-        requested_end: u32,
-        max_tokens: u32,
-    },
+    CapacityExceeded { requested_end: u32, max_tokens: u32 },
 }
 
 impl fmt::Display for PageTableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroCapacity => {
-                write!(formatter, "page table capacity and page size must be non-zero")
+                write!(
+                    formatter,
+                    "page table capacity and page size must be non-zero"
+                )
             }
             Self::EmptyAppend => write!(formatter, "cannot append an empty token range"),
             Self::CapacityExceeded {
