@@ -230,6 +230,68 @@ impl NativeWeights {
         matrices: &[&Q4AffineMatrix],
         input: &[f32],
     ) -> Result<Vec<Vec<f32>>, NativeError> {
+        let jobs = self.mapped_q4_jobs(matrices, input.len())?;
+        runtime
+            .q4_affine_matvec_mapped_batch(input, &jobs)
+            .map_err(NativeError::Metal)
+    }
+
+    /// Evaluates a set of Q4 projections for every row in a prompt. Each
+    /// returned matrix is row-major and preserves the prompt row order.
+    pub fn q4_affine_matmul_batch(
+        &self,
+        runtime: &MetalRuntime,
+        matrices: &[&Q4AffineMatrix],
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>, NativeError> {
+        if batch_size == 0 || input.is_empty() || input.len() % batch_size != 0 {
+            return Err(NativeError::InvalidConfig(
+                "a Q4 prefill batch needs non-empty, evenly sized rows".to_owned(),
+            ));
+        }
+        let jobs = self.mapped_q4_jobs(matrices, input.len() / batch_size)?;
+        runtime
+            .q4_affine_matmul_mapped_batch(input, batch_size, &jobs)
+            .map_err(NativeError::Metal)
+    }
+
+    /// Fuses the MLP's gate/up/down Q4 projections with GPU SwiGLU for all
+    /// prompt rows. There is a single GPU completion fence for the chain.
+    pub fn q4_affine_mlp_batch(
+        &self,
+        runtime: &MetalRuntime,
+        gate: &Q4AffineMatrix,
+        up: &Q4AffineMatrix,
+        down: &Q4AffineMatrix,
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<Vec<f32>, NativeError> {
+        if batch_size == 0 || input.is_empty() || input.len() % batch_size != 0 {
+            return Err(NativeError::InvalidConfig(
+                "an MLP prefill batch needs non-empty, evenly sized rows".to_owned(),
+            ));
+        }
+        let gate_and_up = self.mapped_q4_jobs(&[gate, up], input.len() / batch_size)?;
+        let gate_output_elements = usize::try_from(gate.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("MLP gate output rows".to_owned()))?;
+        let down_job = self.mapped_q4_jobs(&[down], gate_output_elements)?;
+        runtime
+            .q4_affine_mlp_mapped_batch(
+                input,
+                batch_size,
+                &gate_and_up[0],
+                &gate_and_up[1],
+                &down_job[0],
+            )
+            .map_err(NativeError::Metal)
+    }
+
+    fn mapped_q4_jobs<'a>(
+        &'a self,
+        matrices: &[&Q4AffineMatrix],
+        input_elements: usize,
+    ) -> Result<Vec<MappedQ4AffineJob<'a>>, NativeError> {
         if matrices.is_empty() {
             return Err(NativeError::InvalidConfig(
                 "a Q4 projection batch requires at least one matrix".to_owned(),
@@ -237,9 +299,9 @@ impl NativeWeights {
         }
         let mut jobs = Vec::with_capacity(matrices.len());
         for matrix in matrices {
-            if input.len() as u64 != matrix.input_elements {
+            if input_elements as u64 != matrix.input_elements {
                 return Err(NativeError::InputDimension {
-                    actual: input.len(),
+                    actual: input_elements,
                     expected: matrix.input_elements,
                 });
             }
@@ -281,9 +343,7 @@ impl NativeWeights {
                 aligned,
             ));
         }
-        runtime
-            .q4_affine_matvec_mapped_batch(input, &jobs)
-            .map_err(NativeError::Metal)
+        Ok(jobs)
     }
 
     pub fn mapped_shard_count(&self) -> usize {
@@ -1747,10 +1807,9 @@ impl NativeModel {
         self.forward_embedding(runtime, weights, state, hidden, position)
     }
 
-    /// Runs a prompt as one prefill phase. Hybrid DeltaNet state makes the
-    /// token recurrence causal, but reserving all KV capacity before the scan
-    /// removes geometric reallocation and gives the runtime a single sequence
-    /// boundary for future batched projection kernels.
+    /// Runs a prompt as a layer-major prefill. DeltaNet and causal GQA still
+    /// scan positions in order inside each layer, while all independent Q4
+    /// projections and MLPs consume the complete prompt matrix at once.
     fn prefill(
         &self,
         runtime: &MetalRuntime,
@@ -1770,21 +1829,93 @@ impl NativeModel {
             ));
         }
         state.reserve_prefill(runtime, token_ids.len())?;
-        let mut hidden = Vec::new();
-        for ((token_id, position), embedding) in token_ids
-            .iter()
-            .copied()
-            .zip(positions.iter().copied())
-            .zip(embedding_overrides.iter().copied())
-        {
-            hidden = match embedding {
-                Some(embedding) => {
-                    self.forward_embedding(runtime, weights, state, embedding.to_vec(), position)?
-                }
-                None => self.forward_token(runtime, weights, state, token_id, position)?,
+        if token_ids.len() == 1 {
+            return match embedding_overrides[0] {
+                Some(embedding) => self.forward_embedding(
+                    runtime,
+                    weights,
+                    state,
+                    embedding.to_vec(),
+                    positions[0],
+                ),
+                None => self.forward_token(runtime, weights, state, token_ids[0], positions[0]),
             };
         }
-        Ok(hidden)
+
+        let batch_size = token_ids.len();
+        let mut hidden =
+            Vec::with_capacity(batch_size.checked_mul(self.config.hidden_size).ok_or_else(
+                || NativeError::DimensionOverflow("prefill hidden activations".to_owned()),
+            )?);
+        for (token_id, embedding) in token_ids
+            .iter()
+            .copied()
+            .zip(embedding_overrides.iter().copied())
+        {
+            let row = match embedding {
+                Some(embedding) => embedding,
+                None => {
+                    if token_id as usize >= self.config.vocab_size {
+                        return Err(NativeError::TokenOutOfRange(token_id));
+                    }
+                    let embedding =
+                        dequantized_row(weights, &self.embed_tokens, token_id as usize)?;
+                    hidden.extend_from_slice(&embedding);
+                    continue;
+                }
+            };
+            if row.len() != self.config.hidden_size {
+                return Err(NativeError::VectorLengthMismatch {
+                    actual: row.len(),
+                    expected: self.config.hidden_size,
+                });
+            }
+            hidden.extend_from_slice(row);
+        }
+
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            let normalized = rms_norm_rows(&hidden, layer.input_norm(), self.config.rms_norm_eps)?;
+            let mixed = match (layer, layer_state) {
+                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => linear
+                    .forward_prefill(
+                        runtime,
+                        weights,
+                        &normalized,
+                        batch_size,
+                        layer_state,
+                        self.config.rms_norm_eps,
+                    )?,
+                (LayerWeights::Full(full), LayerRuntimeState::Full(layer_state)) => full
+                    .forward_prefill(
+                        runtime,
+                        weights,
+                        &normalized,
+                        positions,
+                        layer_state,
+                        &self.config.rope(),
+                        self.config.rms_norm_eps,
+                    )?,
+                _ => unreachable!("layer weights and runtime state are constructed together"),
+            };
+            add_in_place(&mut hidden, &mixed)?;
+            let post_norm = rms_norm_rows(
+                &hidden,
+                layer.post_attention_norm(),
+                self.config.rms_norm_eps,
+            )?;
+            let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
+            let mlp = weights.q4_affine_mlp_batch(
+                runtime, gate_proj, up_proj, down_proj, &post_norm, batch_size,
+            )?;
+            add_in_place(&mut hidden, &mlp)?;
+        }
+        let final_offset = hidden
+            .len()
+            .checked_sub(self.config.hidden_size)
+            .ok_or_else(|| {
+                NativeError::DimensionOverflow("prefill final hidden activation".to_owned())
+            })?;
+        Ok(hidden[final_offset..].to_vec())
     }
 
     fn forward_embedding(
@@ -1830,15 +1961,8 @@ impl NativeModel {
                 self.config.rms_norm_eps,
             )?;
             let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
-            let mut gate_and_up =
-                weights.q4_affine_matvec_batch(runtime, &[gate_proj, up_proj], &post_norm)?;
-            let gate = gate_and_up.remove(0);
-            let up = gate_and_up.remove(0);
-            let mut swiglu = Vec::with_capacity(gate.len());
-            for (gate, up) in gate.into_iter().zip(up) {
-                swiglu.push(silu(gate) * up);
-            }
-            let mlp = weights.q4_affine_matvec(runtime, down_proj, &swiglu)?;
+            let mlp = weights
+                .q4_affine_mlp_batch(runtime, gate_proj, up_proj, down_proj, &post_norm, 1)?;
             add_in_place(&mut hidden, &mlp)?;
         }
         Ok(hidden)
@@ -1966,6 +2090,51 @@ impl LinearLayerWeights {
         let projected = weights.q4_affine_matvec(runtime, &self.out_proj, &output)?;
         Ok(projected)
     }
+
+    fn forward_prefill(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        input: &[f32],
+        batch_size: usize,
+        state: &mut MetalDeltaNetState,
+        eps: f32,
+    ) -> Result<Vec<f32>, NativeError> {
+        let mut projections = weights.q4_affine_matmul_batch(
+            runtime,
+            &[
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &self.in_proj_b,
+                &self.in_proj_a,
+            ],
+            input,
+            batch_size,
+        )?;
+        let qkv = projections.remove(0);
+        let z = projections.remove(0);
+        let b = projections.remove(0);
+        let a = projections.remove(0);
+        let qkv_width = usize::try_from(self.in_proj_qkv.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet qkv rows".to_owned()))?;
+        let z_width = usize::try_from(self.in_proj_z.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet z rows".to_owned()))?;
+        let b_width = usize::try_from(self.in_proj_b.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet b rows".to_owned()))?;
+        let a_width = usize::try_from(self.in_proj_a.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet a rows".to_owned()))?;
+        ensure_batched_width(&qkv, batch_size, qkv_width, "DeltaNet qkv prefill")?;
+        ensure_batched_width(&z, batch_size, z_width, "DeltaNet z prefill")?;
+        ensure_batched_width(&b, batch_size, b_width, "DeltaNet b prefill")?;
+        ensure_batched_width(&a, batch_size, a_width, "DeltaNet a prefill")?;
+
+        let output = runtime
+            .deltanet_prefill(&self.delta, state, &qkv, &z, &b, &a, batch_size, eps)
+            .map_err(NativeError::Metal)?;
+        let mut projected =
+            weights.q4_affine_matmul_batch(runtime, &[&self.out_proj], &output, batch_size)?;
+        Ok(projected.remove(0))
+    }
 }
 
 impl FullLayerWeights {
@@ -2031,6 +2200,118 @@ impl FullLayerWeights {
             .gqa_attention_q8(state, &query, &gate, &key, &value, num_heads)
             .map_err(NativeError::Metal)?;
         weights.q4_affine_matvec(runtime, &self.o_proj, &attention_output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        input: &[f32],
+        positions: &[MropePosition],
+        state: &mut Q8KvState,
+        rope: &RopeParameters,
+        eps: f32,
+    ) -> Result<Vec<f32>, NativeError> {
+        let batch_size = positions.len();
+        let mut projections = weights.q4_affine_matmul_batch(
+            runtime,
+            &[&self.q_proj, &self.k_proj, &self.v_proj],
+            input,
+            batch_size,
+        )?;
+        let q_with_gate = projections.remove(0);
+        let key = projections.remove(0);
+        let value = projections.remove(0);
+        let q_width = usize::try_from(self.q_proj.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("GQA q rows".to_owned()))?;
+        let key_width = usize::try_from(self.k_proj.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("GQA k rows".to_owned()))?;
+        let value_width = usize::try_from(self.v_proj.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("GQA v rows".to_owned()))?;
+        ensure_batched_width(&q_with_gate, batch_size, q_width, "GQA q prefill")?;
+        ensure_batched_width(&key, batch_size, key_width, "GQA k prefill")?;
+        ensure_batched_width(&value, batch_size, value_width, "GQA v prefill")?;
+
+        let num_heads = self.num_attention_heads;
+        let kv_heads = self.num_key_value_heads;
+        let head_dim = self.head_dim;
+        let expected_key_values = kv_heads.checked_mul(head_dim).ok_or_else(|| {
+            NativeError::DimensionOverflow("full attention KV dimensions".to_owned())
+        })?;
+        if key_width != expected_key_values || value_width != expected_key_values {
+            return Err(NativeError::VectorLengthMismatch {
+                actual: key_width.min(value_width),
+                expected: expected_key_values,
+            });
+        }
+        let rotary_dim =
+            ((head_dim as f32 * rope.partial_rotary_factor).round() as usize).min(head_dim);
+        let output_width = num_heads.checked_mul(head_dim).ok_or_else(|| {
+            NativeError::DimensionOverflow("full attention output dimensions".to_owned())
+        })?;
+        let mut queries = Vec::with_capacity(
+            batch_size
+                .checked_mul(output_width)
+                .ok_or_else(|| NativeError::DimensionOverflow("GQA prefill query".to_owned()))?,
+        );
+        let mut gates = Vec::with_capacity(
+            batch_size
+                .checked_mul(output_width)
+                .ok_or_else(|| NativeError::DimensionOverflow("GQA prefill gate".to_owned()))?,
+        );
+        let mut keys = Vec::with_capacity(
+            batch_size
+                .checked_mul(expected_key_values)
+                .ok_or_else(|| NativeError::DimensionOverflow("GQA prefill key".to_owned()))?,
+        );
+
+        for ((q_with_gate, key), position) in q_with_gate
+            .chunks_exact(q_width)
+            .zip(key.chunks_exact(key_width))
+            .zip(positions.iter().copied())
+        {
+            let (mut query, gate) = split_query_and_gate(q_with_gate, num_heads, head_dim)?;
+            let mut key = key.to_vec();
+            for head in 0..num_heads {
+                let offset = head * head_dim;
+                let normalized =
+                    rms_norm_slice(&query[offset..offset + head_dim], &self.q_norm, eps);
+                query[offset..offset + head_dim].copy_from_slice(&normalized);
+                apply_mrope(
+                    &mut query[offset..offset + head_dim],
+                    position,
+                    rotary_dim,
+                    rope,
+                );
+            }
+            for head in 0..kv_heads {
+                let offset = head * head_dim;
+                let normalized = rms_norm_slice(&key[offset..offset + head_dim], &self.k_norm, eps);
+                key[offset..offset + head_dim].copy_from_slice(&normalized);
+                apply_mrope(
+                    &mut key[offset..offset + head_dim],
+                    position,
+                    rotary_dim,
+                    rope,
+                );
+            }
+            queries.extend_from_slice(&query);
+            gates.extend_from_slice(&gate);
+            keys.extend_from_slice(&key);
+        }
+        let attention_output = runtime
+            .gqa_attention_q8_prefill(
+                state, &queries, &gates, &keys, &value, num_heads, batch_size,
+            )
+            .map_err(NativeError::Metal)?;
+        let mut projected = weights.q4_affine_matmul_batch(
+            runtime,
+            &[&self.o_proj],
+            &attention_output,
+            batch_size,
+        )?;
+        Ok(projected.remove(0))
     }
 }
 
@@ -2206,6 +2487,24 @@ fn add_in_place(destination: &mut [f32], source: &[f32]) -> Result<(), NativeErr
     Ok(())
 }
 
+fn ensure_batched_width(
+    values: &[f32],
+    batch_size: usize,
+    width: usize,
+    name: &str,
+) -> Result<(), NativeError> {
+    let expected = batch_size
+        .checked_mul(width)
+        .ok_or_else(|| NativeError::DimensionOverflow(name.to_owned()))?;
+    if values.len() != expected {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: values.len(),
+            expected,
+        });
+    }
+    Ok(())
+}
+
 fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, NativeError> {
     if input.len() != weight.len() {
         return Err(NativeError::VectorLengthMismatch {
@@ -2214,6 +2513,20 @@ fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, NativeE
         });
     }
     Ok(rms_norm_slice(input, weight, eps))
+}
+
+fn rms_norm_rows(input: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, NativeError> {
+    if weight.is_empty() || input.len() % weight.len() != 0 {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: input.len(),
+            expected: weight.len(),
+        });
+    }
+    let mut output = Vec::with_capacity(input.len());
+    for row in input.chunks_exact(weight.len()) {
+        output.extend(rms_norm_slice(row, weight, eps));
+    }
+    Ok(output)
 }
 
 fn rms_norm_slice(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
@@ -2243,10 +2556,6 @@ fn apply_mrope(
         values[index] = left * cos - right * sin;
         values[index + half] = right * cos + left * sin;
     }
-}
-
-fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
 }
 
 fn bf16_to_f32(value: u16) -> f32 {
