@@ -82,7 +82,7 @@ fn print_help() {
            qwen38-metal plan [--context TOKENS] [--kv bf16|q8|q4] [--page-tokens TOKENS]\n\
            qwen38-metal serve --model MODEL_DIR [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
            qwen38-metal serve --fixture-response TEXT [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
-           qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT]\n\
+           qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT] [--batch TOKENS]\n\
            qwen38-metal inspect-model MODEL_DIR\n\
            qwen38-metal preflight MODEL_DIR\n\
            qwen38-metal version\n\n\
@@ -103,15 +103,27 @@ fn run_q4_probe(options: Q4ProbeOptions) -> Result<(), String> {
     let matrix = weights
         .q4_matrix(&options.tensor)
         .map_err(|error| error.to_string())?;
-    let input: Vec<f32> = (0..matrix.input_elements)
+    let input_elements = usize::try_from(matrix.input_elements)
+        .map_err(|_| "matrix input dimension exceeds host limits".to_owned())?;
+    let input_len = input_elements
+        .checked_mul(options.batch)
+        .ok_or_else(|| "Q4 probe input size overflows host limits".to_owned())?;
+    let input: Vec<f32> = (0..input_len)
         .map(|index| ((index % 29) as f32 - 14.0) / 29.0)
         .collect();
     let started = Instant::now();
     let mut output = Vec::new();
     for _ in 0..options.iterations {
-        output = weights
-            .q4_affine_matvec(&runtime, &matrix, &input)
-            .map_err(|error| error.to_string())?;
+        output = if options.batch == 1 {
+            weights
+                .q4_affine_matvec(&runtime, &matrix, &input)
+                .map_err(|error| error.to_string())?
+        } else {
+            weights
+                .q4_affine_matmul_batch(&runtime, &[&matrix], &input, options.batch)
+                .map_err(|error| error.to_string())?
+                .remove(0)
+        };
     }
     let elapsed = started.elapsed();
     let checksum = output.iter().map(|value| f64::from(*value)).sum::<f64>();
@@ -126,6 +138,7 @@ fn run_q4_probe(options: Q4ProbeOptions) -> Result<(), String> {
         matrix.output_rows, matrix.input_elements
     );
     println!("iterations: {}", options.iterations);
+    println!("batch tokens: {}", options.batch);
     println!("elapsed: {:.3} ms", elapsed.as_secs_f64() * 1_000.0);
     println!("output checksum: {checksum:.6}");
     Ok(())
@@ -526,13 +539,14 @@ struct Q4ProbeOptions {
     model_dir: String,
     tensor: String,
     iterations: u32,
+    batch: usize,
 }
 
 impl Q4ProbeOptions {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let Some((model_dir, rest)) = arguments.split_first() else {
             return Err(
-                "usage: qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT]"
+                "usage: qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT] [--batch TOKENS]"
                     .to_owned(),
             );
         };
@@ -540,6 +554,7 @@ impl Q4ProbeOptions {
             model_dir: model_dir.clone(),
             tensor: "language_model.model.layers.0.linear_attn.in_proj_b.weight".to_owned(),
             iterations: 1,
+            batch: 1,
         };
         let mut index = 0;
         while index < rest.len() {
@@ -551,6 +566,7 @@ impl Q4ProbeOptions {
             match flag.as_str() {
                 "--tensor" => options.tensor = value.clone(),
                 "--iterations" => options.iterations = parse_positive_u32("--iterations", value)?,
+                "--batch" => options.batch = parse_positive_usize("--batch", value)?,
                 _ => return Err(format!("unknown q4-probe option {flag:?}")),
             }
         }

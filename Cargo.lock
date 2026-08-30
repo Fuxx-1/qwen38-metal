@@ -1077,6 +1077,7 @@ dependencies = [
  "image",
  "memmap2",
  "metal",
+ "objc",
  "reqwest",
  "serde",
  "serde_json",

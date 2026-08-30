@@ -3,6 +3,7 @@ pub mod geometry;
 pub mod metal;
 pub mod metal_runtime;
 pub mod model;
+mod mps;
 pub mod mtp;
 pub mod native;
 pub mod paged_kv;

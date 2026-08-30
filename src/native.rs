@@ -4,8 +4,9 @@ use crate::api::{
     ToolChoice,
 };
 use crate::metal_runtime::{
-    DeltaNetConfig, MappedQ4AffineJob, MappedWeightBuffers, MetalDeltaNetState,
-    MetalDeltaNetWeights, MetalRuntime, MetalRuntimeError, Q8KvState,
+    DeltaNetConfig, MappedQ4AffineJob, MappedWeightBuffers, MetalDecodeFullLayer, MetalDecodeLayer,
+    MetalDecodeLinearLayer, MetalDecodeState, MetalDeltaNetState, MetalDeltaNetWeights,
+    MetalF32Buffer, MetalGqaDecodeConfig, MetalRuntime, MetalRuntimeError, Q8KvState,
 };
 use crate::model::{open_mlx_safetensors_dir, MlxTensor, MlxWeightStore};
 use crate::mtp::SpeculativeDecodeSupport;
@@ -16,12 +17,16 @@ use serde_json::json;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 const VALUES_PER_PACKED_WORD: u64 = 8;
 const AFFINE_GROUP_SIZE: u64 = 64;
 const DEFAULT_EOS_TOKEN_ID: u32 = 248_044;
 const END_OF_MESSAGE_TOKEN_ID: u32 = 248_046;
+// Keeps MPS matrix work large enough to amortize Q4 expansion without
+// materializing an entire long prompt's MLP intermediates at once.
+const PREFILL_CHUNK_TOKENS: usize = 8_192;
 
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
@@ -1627,6 +1632,8 @@ enum LayerWeights {
 struct CommonLayerWeights {
     input_norm: Vec<f32>,
     post_attention_norm: Vec<f32>,
+    input_norm_gpu: MetalF32Buffer,
+    post_attention_norm_gpu: MetalF32Buffer,
     gate_proj: Q4AffineMatrix,
     up_proj: Q4AffineMatrix,
     down_proj: Q4AffineMatrix,
@@ -1650,6 +1657,8 @@ struct FullLayerWeights {
     o_proj: Q4AffineMatrix,
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
+    q_norm_gpu: MetalF32Buffer,
+    k_norm_gpu: MetalF32Buffer,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -1675,17 +1684,25 @@ impl NativeModel {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
             let prefix = format!("language_model.model.layers.{index}");
+            let input_norm = load_vector(
+                weights,
+                &format!("{prefix}.input_layernorm.weight"),
+                config.hidden_size,
+            )?;
+            let post_attention_norm = load_vector(
+                weights,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                config.hidden_size,
+            )?;
             let common = CommonLayerWeights {
-                input_norm: load_vector(
-                    weights,
-                    &format!("{prefix}.input_layernorm.weight"),
-                    config.hidden_size,
-                )?,
-                post_attention_norm: load_vector(
-                    weights,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                    config.hidden_size,
-                )?,
+                input_norm_gpu: runtime
+                    .create_f32_buffer(&input_norm)
+                    .map_err(NativeError::Metal)?,
+                post_attention_norm_gpu: runtime
+                    .create_f32_buffer(&post_attention_norm)
+                    .map_err(NativeError::Metal)?,
+                input_norm,
+                post_attention_norm,
                 gate_proj: weights.q4_matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
                 up_proj: weights.q4_matrix(&format!("{prefix}.mlp.up_proj.weight"))?,
                 down_proj: weights.q4_matrix(&format!("{prefix}.mlp.down_proj.weight"))?,
@@ -1749,22 +1766,30 @@ impl NativeModel {
                 };
                 layers.push(LayerWeights::Linear(linear));
             } else {
+                let q_norm = load_vector(
+                    weights,
+                    &format!("{prefix}.self_attn.q_norm.weight"),
+                    config.head_dim,
+                )?;
+                let k_norm = load_vector(
+                    weights,
+                    &format!("{prefix}.self_attn.k_norm.weight"),
+                    config.head_dim,
+                )?;
                 let full = FullLayerWeights {
                     common,
                     q_proj: weights.q4_matrix(&format!("{prefix}.self_attn.q_proj.weight"))?,
                     k_proj: weights.q4_matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
                     v_proj: weights.q4_matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
                     o_proj: weights.q4_matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
-                    q_norm: load_vector(
-                        weights,
-                        &format!("{prefix}.self_attn.q_norm.weight"),
-                        config.head_dim,
-                    )?,
-                    k_norm: load_vector(
-                        weights,
-                        &format!("{prefix}.self_attn.k_norm.weight"),
-                        config.head_dim,
-                    )?,
+                    q_norm_gpu: runtime
+                        .create_f32_buffer(&q_norm)
+                        .map_err(NativeError::Metal)?,
+                    k_norm_gpu: runtime
+                        .create_f32_buffer(&k_norm)
+                        .map_err(NativeError::Metal)?,
+                    q_norm,
+                    k_norm,
                     num_attention_heads: config.num_attention_heads,
                     num_key_value_heads: config.num_key_value_heads,
                     head_dim: config.head_dim,
@@ -1873,41 +1898,123 @@ impl NativeModel {
             hidden.extend_from_slice(row);
         }
 
-        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
-            let normalized = rms_norm_rows(&hidden, layer.input_norm(), self.config.rms_norm_eps)?;
-            let mixed = match (layer, layer_state) {
-                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => linear
-                    .forward_prefill(
-                        runtime,
-                        weights,
-                        &normalized,
-                        batch_size,
-                        layer_state,
-                        self.config.rms_norm_eps,
-                    )?,
-                (LayerWeights::Full(full), LayerRuntimeState::Full(layer_state)) => full
-                    .forward_prefill(
-                        runtime,
-                        weights,
-                        &normalized,
-                        positions,
-                        layer_state,
-                        &self.config.rope(),
-                        self.config.rms_norm_eps,
-                    )?,
-                _ => unreachable!("layer weights and runtime state are constructed together"),
-            };
-            add_in_place(&mut hidden, &mixed)?;
-            let post_norm = rms_norm_rows(
-                &hidden,
-                layer.post_attention_norm(),
-                self.config.rms_norm_eps,
-            )?;
+        let profile = std::env::var_os("QWEN38_PROFILE").is_some();
+        let prefill_started = profile.then(Instant::now);
+        let prefill_chunk_size = configured_prefill_chunk_tokens(batch_size)?;
+        let rope = self.config.rope();
+        for (layer_index, (layer, layer_state)) in
+            self.layers.iter().zip(state.layers.iter_mut()).enumerate()
+        {
+            let layer_started = profile.then(Instant::now);
+            let mut norm_elapsed = Duration::ZERO;
+            let mut mixed_elapsed = Duration::ZERO;
+            let mut residual_elapsed = Duration::ZERO;
+            let mut post_norm_elapsed = Duration::ZERO;
+            let mut mlp_elapsed = Duration::ZERO;
+            let mut mlp_residual_elapsed = Duration::ZERO;
             let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
-            let mlp = weights.q4_affine_mlp_batch(
-                runtime, gate_proj, up_proj, down_proj, &post_norm, batch_size,
-            )?;
-            add_in_place(&mut hidden, &mlp)?;
+            for chunk_start in (0..batch_size).step_by(prefill_chunk_size) {
+                let chunk_end = (chunk_start + prefill_chunk_size).min(batch_size);
+                let chunk_tokens = chunk_end - chunk_start;
+                let hidden_start = chunk_start
+                    .checked_mul(self.config.hidden_size)
+                    .ok_or_else(|| {
+                        NativeError::DimensionOverflow("prefill chunk start".to_owned())
+                    })?;
+                let hidden_end =
+                    chunk_end
+                        .checked_mul(self.config.hidden_size)
+                        .ok_or_else(|| {
+                            NativeError::DimensionOverflow("prefill chunk end".to_owned())
+                        })?;
+
+                let norm_started = profile.then(Instant::now);
+                let normalized = rms_norm_rows(
+                    &hidden[hidden_start..hidden_end],
+                    layer.input_norm(),
+                    self.config.rms_norm_eps,
+                )?;
+                if let Some(started) = norm_started {
+                    norm_elapsed += started.elapsed();
+                }
+                let mixed_started = profile.then(Instant::now);
+                let mixed = match (layer, &mut *layer_state) {
+                    (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => {
+                        linear.forward_prefill(
+                            runtime,
+                            weights,
+                            &normalized,
+                            chunk_tokens,
+                            layer_state,
+                            self.config.rms_norm_eps,
+                        )?
+                    }
+                    (LayerWeights::Full(full), LayerRuntimeState::Full(layer_state)) => full
+                        .forward_prefill(
+                            runtime,
+                            weights,
+                            &normalized,
+                            &positions[chunk_start..chunk_end],
+                            layer_state,
+                            &rope,
+                            self.config.rms_norm_eps,
+                        )?,
+                    _ => unreachable!("layer weights and runtime state are constructed together"),
+                };
+                if let Some(started) = mixed_started {
+                    mixed_elapsed += started.elapsed();
+                }
+                let residual_started = profile.then(Instant::now);
+                add_in_place(&mut hidden[hidden_start..hidden_end], &mixed)?;
+                if let Some(started) = residual_started {
+                    residual_elapsed += started.elapsed();
+                }
+                let post_norm_started = profile.then(Instant::now);
+                let post_norm = rms_norm_rows(
+                    &hidden[hidden_start..hidden_end],
+                    layer.post_attention_norm(),
+                    self.config.rms_norm_eps,
+                )?;
+                if let Some(started) = post_norm_started {
+                    post_norm_elapsed += started.elapsed();
+                }
+                let mlp_started = profile.then(Instant::now);
+                let mlp = weights.q4_affine_mlp_batch(
+                    runtime,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    &post_norm,
+                    chunk_tokens,
+                )?;
+                if let Some(started) = mlp_started {
+                    mlp_elapsed += started.elapsed();
+                }
+                let mlp_residual_started = profile.then(Instant::now);
+                add_in_place(&mut hidden[hidden_start..hidden_end], &mlp)?;
+                if let Some(started) = mlp_residual_started {
+                    mlp_residual_elapsed += started.elapsed();
+                }
+            }
+            if let Some(layer_started) = layer_started {
+                eprintln!(
+                    "prefill layer={layer_index} total={:.3}ms norm={:.3}ms mixed={:.3}ms residual={:.3}ms post_norm={:.3}ms mlp={:.3}ms mlp_residual={:.3}ms",
+                    layer_started.elapsed().as_secs_f64() * 1_000.0,
+                    norm_elapsed.as_secs_f64() * 1_000.0,
+                    mixed_elapsed.as_secs_f64() * 1_000.0,
+                    residual_elapsed.as_secs_f64() * 1_000.0,
+                    post_norm_elapsed.as_secs_f64() * 1_000.0,
+                    mlp_elapsed.as_secs_f64() * 1_000.0,
+                    mlp_residual_elapsed.as_secs_f64() * 1_000.0,
+                );
+            }
+        }
+        if let Some(prefill_started) = prefill_started {
+            eprintln!(
+                "prefill total={:.3}ms tokens={batch_size} tok_per_s={:.3}",
+                prefill_started.elapsed().as_secs_f64() * 1_000.0,
+                batch_size as f64 / prefill_started.elapsed().as_secs_f64(),
+            );
         }
         let final_offset = hidden
             .len()
@@ -1932,8 +2039,127 @@ impl NativeModel {
                 expected: self.config.hidden_size,
             });
         }
-        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+        let profile = std::env::var_os("QWEN38_PROFILE").is_some();
+        let gpu_decode = std::env::var_os("QWEN38_DISABLE_GPU_DECODE").is_none();
+        let gpu_decode_graph =
+            gpu_decode && std::env::var_os("QWEN38_DISABLE_GPU_DECODE_GRAPH").is_none();
+        let decode_started = profile.then(Instant::now);
+        let mut norm_elapsed = Duration::ZERO;
+        let mut mixed_elapsed = Duration::ZERO;
+        let mut residual_elapsed = Duration::ZERO;
+        let mut post_norm_elapsed = Duration::ZERO;
+        let mut mlp_elapsed = Duration::ZERO;
+        let mut gpu_linear_elapsed = Duration::ZERO;
+        let mut gpu_full_elapsed = Duration::ZERO;
+        let rope = self.config.rope();
+        let (layer_states, decode) = (&mut state.layers, &mut state.decode);
+        if gpu_decode_graph {
+            runtime
+                .write_decode_hidden(decode, &hidden)
+                .map_err(NativeError::Metal)?;
+            let started = profile.then(Instant::now);
+            let mut gpu_layers = Vec::with_capacity(self.layers.len());
+            for (layer, layer_state) in self.layers.iter().zip(layer_states.iter_mut()) {
+                match (layer, layer_state) {
+                    (LayerWeights::Linear(linear), LayerRuntimeState::Linear(linear_state)) => {
+                        gpu_layers.push(MetalDecodeLayer::Linear(
+                            linear.gpu_decode_layer(weights, linear_state)?,
+                        ));
+                    }
+                    (LayerWeights::Full(full), LayerRuntimeState::Full(kv_state)) => {
+                        gpu_layers.push(MetalDecodeLayer::Full(
+                            full.gpu_decode_layer(weights, position, &rope)?,
+                            kv_state,
+                        ));
+                    }
+                    _ => unreachable!("layer weights and runtime state are constructed together"),
+                }
+            }
+            runtime
+                .decode_layers(decode, &mut gpu_layers, self.config.rms_norm_eps)
+                .map_err(NativeError::Metal)?;
+            hidden = runtime
+                .read_decode_hidden(decode)
+                .map_err(NativeError::Metal)?;
+            if let Some(started) = started {
+                eprintln!(
+                    "decode total={:.3}ms gpu_graph={:.3}ms layers={}",
+                    decode_started
+                        .expect("decode profiling start exists with graph timing")
+                        .elapsed()
+                        .as_secs_f64()
+                        * 1_000.0,
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    self.layers.len(),
+                );
+            }
+            return Ok(hidden);
+        }
+        if gpu_decode {
+            runtime
+                .write_decode_hidden(decode, &hidden)
+                .map_err(NativeError::Metal)?;
+        }
+        let mut layer_index = 0;
+        while layer_index < self.layers.len() {
+            if gpu_decode {
+                if matches!(&self.layers[layer_index], LayerWeights::Linear(_)) {
+                    let started = profile.then(Instant::now);
+                    let mut gpu_layers = Vec::new();
+                    while layer_index < self.layers.len() {
+                        let LayerWeights::Linear(linear) = &self.layers[layer_index] else {
+                            break;
+                        };
+                        let LayerRuntimeState::Linear(layer_state) = &layer_states[layer_index]
+                        else {
+                            unreachable!(
+                                "layer weights and runtime state are constructed together"
+                            );
+                        };
+                        gpu_layers.push(linear.gpu_decode_layer(weights, layer_state)?);
+                        layer_index += 1;
+                    }
+                    runtime
+                        .decode_linear_layers(decode, &gpu_layers, self.config.rms_norm_eps)
+                        .map_err(NativeError::Metal)?;
+                    if let Some(started) = started {
+                        gpu_linear_elapsed += started.elapsed();
+                    }
+                    continue;
+                }
+                if let LayerWeights::Full(full) = &self.layers[layer_index] {
+                    let LayerRuntimeState::Full(layer_state) = &mut layer_states[layer_index]
+                    else {
+                        unreachable!("layer weights and runtime state are constructed together");
+                    };
+                    let started = profile.then(Instant::now);
+                    let gpu_layer = full.gpu_decode_layer(weights, position, &rope)?;
+                    runtime
+                        .decode_full_layer(
+                            decode,
+                            &gpu_layer,
+                            layer_state,
+                            self.config.rms_norm_eps,
+                        )
+                        .map_err(NativeError::Metal)?;
+                    if let Some(started) = started {
+                        gpu_full_elapsed += started.elapsed();
+                    }
+                    layer_index += 1;
+                    continue;
+                }
+                hidden = runtime
+                    .read_decode_hidden(decode)
+                    .map_err(NativeError::Metal)?;
+            }
+            let layer = &self.layers[layer_index];
+            let layer_state = &mut layer_states[layer_index];
+            let started = profile.then(Instant::now);
             let normalized = rms_norm(&hidden, layer.input_norm(), self.config.rms_norm_eps)?;
+            if let Some(started) = started {
+                norm_elapsed += started.elapsed();
+            }
+            let started = profile.then(Instant::now);
             let mixed = match (layer, layer_state) {
                 (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => linear
                     .forward(
@@ -1949,21 +2175,64 @@ impl NativeModel {
                     &normalized,
                     layer_state,
                     position,
-                    self.config.rope(),
+                    rope.clone(),
                     self.config.rms_norm_eps,
                 )?,
                 _ => unreachable!("layer weights and runtime state are constructed together"),
             };
+            if let Some(started) = started {
+                mixed_elapsed += started.elapsed();
+            }
+            let started = profile.then(Instant::now);
             add_in_place(&mut hidden, &mixed)?;
+            if let Some(started) = started {
+                residual_elapsed += started.elapsed();
+            }
+            let started = profile.then(Instant::now);
             let post_norm = rms_norm(
                 &hidden,
                 layer.post_attention_norm(),
                 self.config.rms_norm_eps,
             )?;
+            if let Some(started) = started {
+                post_norm_elapsed += started.elapsed();
+            }
             let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
+            let started = profile.then(Instant::now);
             let mlp = weights
                 .q4_affine_mlp_batch(runtime, gate_proj, up_proj, down_proj, &post_norm, 1)?;
+            if let Some(started) = started {
+                mlp_elapsed += started.elapsed();
+            }
+            let started = profile.then(Instant::now);
             add_in_place(&mut hidden, &mlp)?;
+            if let Some(started) = started {
+                residual_elapsed += started.elapsed();
+            }
+            if gpu_decode {
+                runtime
+                    .write_decode_hidden(decode, &hidden)
+                    .map_err(NativeError::Metal)?;
+            }
+            layer_index += 1;
+        }
+        if gpu_decode {
+            hidden = runtime
+                .read_decode_hidden(decode)
+                .map_err(NativeError::Metal)?;
+        }
+        if let Some(decode_started) = decode_started {
+            eprintln!(
+                "decode total={:.3}ms norm={:.3}ms mixed={:.3}ms residual={:.3}ms post_norm={:.3}ms mlp={:.3}ms linear_gpu={:.3}ms full_gpu={:.3}ms",
+                decode_started.elapsed().as_secs_f64() * 1_000.0,
+                norm_elapsed.as_secs_f64() * 1_000.0,
+                mixed_elapsed.as_secs_f64() * 1_000.0,
+                residual_elapsed.as_secs_f64() * 1_000.0,
+                post_norm_elapsed.as_secs_f64() * 1_000.0,
+                mlp_elapsed.as_secs_f64() * 1_000.0,
+                gpu_linear_elapsed.as_secs_f64() * 1_000.0,
+                gpu_full_elapsed.as_secs_f64() * 1_000.0,
+            );
         }
         Ok(hidden)
     }
@@ -2018,6 +2287,7 @@ fn load_vector(
 
 struct RuntimeState {
     layers: Vec<LayerRuntimeState>,
+    decode: MetalDecodeState,
 }
 
 enum LayerRuntimeState {
@@ -2042,7 +2312,12 @@ impl RuntimeState {
                 )),
             }
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            decode: runtime
+                .create_decode_state(model.config.hidden_size)
+                .map_err(NativeError::Metal)?,
+        })
     }
 
     fn reserve_prefill(
@@ -2062,6 +2337,47 @@ impl RuntimeState {
 }
 
 impl LinearLayerWeights {
+    fn gpu_decode_layer<'a>(
+        &'a self,
+        weights: &'a NativeWeights,
+        state: &'a MetalDeltaNetState,
+    ) -> Result<MetalDecodeLinearLayer<'a>, NativeError> {
+        let hidden_elements = self.common.input_norm.len();
+        let input_jobs = weights.mapped_q4_jobs(
+            &[
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &self.in_proj_b,
+                &self.in_proj_a,
+            ],
+            hidden_elements,
+        )?;
+        let delta_elements = usize::try_from(self.out_proj.input_elements)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet output elements".to_owned()))?;
+        let out_jobs = weights.mapped_q4_jobs(&[&self.out_proj], delta_elements)?;
+        let mlp_jobs = weights.mapped_q4_jobs(
+            &[&self.common.gate_proj, &self.common.up_proj],
+            hidden_elements,
+        )?;
+        let mlp_elements = usize::try_from(self.common.gate_proj.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("MLP gate output rows".to_owned()))?;
+        let down_jobs = weights.mapped_q4_jobs(&[&self.common.down_proj], mlp_elements)?;
+        Ok(MetalDecodeLinearLayer::new(
+            &self.common.input_norm_gpu,
+            &self.common.post_attention_norm_gpu,
+            input_jobs[0],
+            input_jobs[1],
+            input_jobs[2],
+            input_jobs[3],
+            out_jobs[0],
+            &self.delta,
+            state,
+            mlp_jobs[0],
+            mlp_jobs[1],
+            down_jobs[0],
+        ))
+    }
+
     fn forward(
         &self,
         runtime: &MetalRuntime,
@@ -2138,6 +2454,68 @@ impl LinearLayerWeights {
 }
 
 impl FullLayerWeights {
+    fn gpu_decode_layer<'a>(
+        &'a self,
+        weights: &'a NativeWeights,
+        position: MropePosition,
+        rope: &'a RopeParameters,
+    ) -> Result<MetalDecodeFullLayer<'a>, NativeError> {
+        let hidden_elements = self.common.input_norm.len();
+        let attention_jobs =
+            weights.mapped_q4_jobs(&[&self.q_proj, &self.k_proj, &self.v_proj], hidden_elements)?;
+        let query_elements = self
+            .num_attention_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                NativeError::DimensionOverflow("full-attention query elements".to_owned())
+            })?;
+        let output_jobs = weights.mapped_q4_jobs(&[&self.o_proj], query_elements)?;
+        let mlp_jobs = weights.mapped_q4_jobs(
+            &[&self.common.gate_proj, &self.common.up_proj],
+            hidden_elements,
+        )?;
+        let mlp_elements = usize::try_from(self.common.gate_proj.output_rows).map_err(|_| {
+            NativeError::DimensionOverflow("full-attention MLP elements".to_owned())
+        })?;
+        let down_jobs = weights.mapped_q4_jobs(&[&self.common.down_proj], mlp_elements)?;
+        let (section1, section2, has_mrope_sections) = match rope.mrope_section.as_deref() {
+            Some([_, section1, section2]) => (
+                u32::try_from(*section1)
+                    .map_err(|_| NativeError::DimensionOverflow("M-RoPE section one".to_owned()))?,
+                u32::try_from(*section2)
+                    .map_err(|_| NativeError::DimensionOverflow("M-RoPE section two".to_owned()))?,
+                true,
+            ),
+            _ => (0, 0, false),
+        };
+        let rotary_dim = ((self.head_dim as f32 * rope.partial_rotary_factor).round() as usize)
+            .min(self.head_dim);
+        Ok(MetalDecodeFullLayer::new(
+            &self.common.input_norm_gpu,
+            &self.common.post_attention_norm_gpu,
+            attention_jobs[0],
+            attention_jobs[1],
+            attention_jobs[2],
+            output_jobs[0],
+            &self.q_norm_gpu,
+            &self.k_norm_gpu,
+            MetalGqaDecodeConfig {
+                num_heads: self.num_attention_heads,
+                kv_heads: self.num_key_value_heads,
+                head_dim: self.head_dim,
+                rotary_dim,
+                position: position.0,
+                section1,
+                section2,
+                has_mrope_sections,
+                rope_theta: rope.rope_theta,
+            },
+            mlp_jobs[0],
+            mlp_jobs[1],
+            down_jobs[0],
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -2503,6 +2881,28 @@ fn ensure_batched_width(
         });
     }
     Ok(())
+}
+
+fn configured_prefill_chunk_tokens(batch_size: usize) -> Result<usize, NativeError> {
+    let Some(value) = std::env::var_os("QWEN38_PREFILL_CHUNK_TOKENS") else {
+        return Ok(batch_size.min(PREFILL_CHUNK_TOKENS));
+    };
+    let text = value.to_str().ok_or_else(|| {
+        NativeError::InvalidConfig(
+            "QWEN38_PREFILL_CHUNK_TOKENS must be a positive integer".to_owned(),
+        )
+    })?;
+    let chunk_size = text.parse::<usize>().map_err(|_| {
+        NativeError::InvalidConfig(
+            "QWEN38_PREFILL_CHUNK_TOKENS must be a positive integer".to_owned(),
+        )
+    })?;
+    if chunk_size == 0 {
+        return Err(NativeError::InvalidConfig(
+            "QWEN38_PREFILL_CHUNK_TOKENS must be a positive integer".to_owned(),
+        ));
+    }
+    Ok(batch_size.min(chunk_size))
 }
 
 fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, NativeError> {
