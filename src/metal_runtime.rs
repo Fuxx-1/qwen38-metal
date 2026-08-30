@@ -4,6 +4,7 @@ use metal::{ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOpt
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
+use std::sync::Mutex;
 
 const QUANT_BITS: usize = 4;
 const VALUES_PER_PACKED_WORD: usize = 32 / QUANT_BITS;
@@ -18,6 +19,166 @@ pub struct MetalRuntime {
     bf16_gemm: ComputePipelineState,
     vision_attention_scores: ComputePipelineState,
     vision_attention_values: ComputePipelineState,
+    deltanet_conv: ComputePipelineState,
+    deltanet_prepare: ComputePipelineState,
+    deltanet_recurrence: ComputePipelineState,
+    deltanet_gate_norm: ComputePipelineState,
+    q8_kv_append: ComputePipelineState,
+    gqa_q8_scores: ComputePipelineState,
+    gqa_q8_values: ComputePipelineState,
+    q4_activations: Mutex<Q4ActivationPool>,
+    language_activations: Mutex<LanguageActivationPool>,
+}
+
+/// A borrowed description of one mapped Q4 affine projection. A batch shares
+/// its input activation and commits all projections in one command buffer.
+pub struct MappedQ4AffineJob<'a> {
+    weights: &'a metal::Buffer,
+    weight_offset: u64,
+    scales: &'a metal::Buffer,
+    scale_offset: u64,
+    biases: &'a metal::Buffer,
+    bias_offset: u64,
+    output_rows: usize,
+    aligned: bool,
+}
+
+impl<'a> MappedQ4AffineJob<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        weights: &'a metal::Buffer,
+        weight_offset: u64,
+        scales: &'a metal::Buffer,
+        scale_offset: u64,
+        biases: &'a metal::Buffer,
+        bias_offset: u64,
+        output_rows: usize,
+        aligned: bool,
+    ) -> Self {
+        Self {
+            weights,
+            weight_offset,
+            scales,
+            scale_offset,
+            biases,
+            bias_offset,
+            output_rows,
+            aligned,
+        }
+    }
+}
+
+struct ReusableBuffer {
+    buffer: metal::Buffer,
+    capacity_bytes: u64,
+}
+
+#[derive(Default)]
+struct Q4ActivationPool {
+    input: Option<ReusableBuffer>,
+    outputs: Vec<Option<ReusableBuffer>>,
+}
+
+#[derive(Default)]
+struct LanguageActivationPool {
+    slots: Vec<Option<ReusableBuffer>>,
+    scores: Option<ReusableBuffer>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaNetConfig {
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub conv_kernel_size: usize,
+}
+
+impl DeltaNetConfig {
+    fn channels(self) -> Result<usize, MetalRuntimeError> {
+        self.key_heads
+            .checked_mul(self.key_head_dim)
+            .and_then(|keys| keys.checked_mul(2))
+            .and_then(|keys| {
+                self.value_heads
+                    .checked_mul(self.value_head_dim)
+                    .and_then(|values| keys.checked_add(values))
+            })
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "DeltaNet channel count",
+            ))
+    }
+
+    fn recurrent_elements(self) -> Result<usize, MetalRuntimeError> {
+        self.value_heads
+            .checked_mul(self.value_head_dim)
+            .and_then(|values| values.checked_mul(self.key_head_dim))
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "DeltaNet recurrent state elements",
+            ))
+    }
+
+    fn as_u32(self) -> Result<DeltaNetConfigU32, MetalRuntimeError> {
+        Ok(DeltaNetConfigU32 {
+            key_heads: u32::try_from(self.key_heads)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet key heads"))?,
+            value_heads: u32::try_from(self.value_heads)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet value heads"))?,
+            key_head_dim: u32::try_from(self.key_head_dim)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet key head dimension"))?,
+            value_head_dim: u32::try_from(self.value_head_dim).map_err(|_| {
+                MetalRuntimeError::DimensionOverflow("DeltaNet value head dimension")
+            })?,
+            conv_kernel_size: u32::try_from(self.conv_kernel_size)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet convolution kernel"))?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeltaNetConfigU32 {
+    key_heads: u32,
+    value_heads: u32,
+    key_head_dim: u32,
+    value_head_dim: u32,
+    conv_kernel_size: u32,
+}
+
+pub struct MetalDeltaNetWeights {
+    config: DeltaNetConfig,
+    conv_weight: metal::Buffer,
+    a_log: metal::Buffer,
+    dt_bias: metal::Buffer,
+    norm: metal::Buffer,
+}
+
+pub struct MetalDeltaNetState {
+    conv: metal::Buffer,
+    recurrent: metal::Buffer,
+}
+
+pub struct Q8KvState {
+    keys: metal::Buffer,
+    values: metal::Buffer,
+    key_scales: metal::Buffer,
+    value_scales: metal::Buffer,
+    capacity_tokens: usize,
+    sequence_length: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+fn pipeline_for(
+    device: &Device,
+    library: &metal::Library,
+    name: &str,
+) -> Result<ComputePipelineState, MetalRuntimeError> {
+    let function = library
+        .get_function(name, None)
+        .map_err(MetalRuntimeError::Function)?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalRuntimeError::Pipeline)
 }
 
 /// GPU views of read-only safetensors mappings. `MlxWeightStore` must outlive
@@ -89,6 +250,13 @@ impl MetalRuntime {
         let vision_attention_values = device
             .new_compute_pipeline_state_with_function(&vision_attention_values_function)
             .map_err(MetalRuntimeError::Pipeline)?;
+        let deltanet_conv = pipeline_for(&device, &library, "qwen38_deltanet_conv")?;
+        let deltanet_prepare = pipeline_for(&device, &library, "qwen38_deltanet_prepare")?;
+        let deltanet_recurrence = pipeline_for(&device, &library, "qwen38_deltanet_recurrence")?;
+        let deltanet_gate_norm = pipeline_for(&device, &library, "qwen38_deltanet_gate_norm")?;
+        let q8_kv_append = pipeline_for(&device, &library, "qwen38_q8_kv_append")?;
+        let gqa_q8_scores = pipeline_for(&device, &library, "qwen38_gqa_q8_scores")?;
+        let gqa_q8_values = pipeline_for(&device, &library, "qwen38_gqa_q8_values")?;
 
         if q4_affine_matvec.max_total_threads_per_threadgroup() < THREADS_PER_THREADGROUP
             || q4_affine_matvec_unaligned.max_total_threads_per_threadgroup()
@@ -110,6 +278,15 @@ impl MetalRuntime {
             bf16_gemm,
             vision_attention_scores,
             vision_attention_values,
+            deltanet_conv,
+            deltanet_prepare,
+            deltanet_recurrence,
+            deltanet_gate_norm,
+            q8_kv_append,
+            gqa_q8_scores,
+            gqa_q8_values,
+            q4_activations: Mutex::new(Q4ActivationPool::default()),
+            language_activations: Mutex::new(LanguageActivationPool::default()),
         })
     }
 
@@ -239,6 +416,144 @@ impl MetalRuntime {
             output_rows,
             words_per_row,
         )
+    }
+
+    /// Runs several mapped affine-Q4 projections over the same activation in
+    /// one command buffer. The activation and result buffers are retained by
+    /// the runtime, so steady-state decode avoids per-projection Metal buffer
+    /// allocation in addition to command-buffer and fence overhead.
+    pub fn q4_affine_matvec_mapped_batch(
+        &self,
+        input: &[f32],
+        jobs: &[MappedQ4AffineJob<'_>],
+    ) -> Result<Vec<Vec<f32>>, MetalRuntimeError> {
+        if jobs.is_empty() {
+            return Err(MetalRuntimeError::EmptyDimension);
+        }
+        let words_per_rows: Vec<u32> = jobs
+            .iter()
+            .map(|job| {
+                validate_mapped_q4_affine_matvec(
+                    input,
+                    job.weights,
+                    job.weight_offset,
+                    job.scales,
+                    job.scale_offset,
+                    job.biases,
+                    job.bias_offset,
+                    job.output_rows,
+                )
+                .and_then(|words| {
+                    u32::try_from(words)
+                        .map_err(|_| MetalRuntimeError::DimensionOverflow("words per row"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let input_bytes = checked_byte_len::<f32>(input.len())?;
+        let mut activations = self
+            .q4_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::ActivationPoolPoisoned)?;
+        ensure_shared_buffer(&self.device, &mut activations.input, input_bytes)?;
+        if activations.outputs.len() < jobs.len() {
+            activations.outputs.resize_with(jobs.len(), || None);
+        }
+        for (slot, job) in activations.outputs.iter_mut().zip(jobs) {
+            ensure_shared_buffer(
+                &self.device,
+                slot,
+                checked_byte_len::<f32>(job.output_rows)?,
+            )?;
+        }
+        let input_buffer = &activations
+            .input
+            .as_ref()
+            .expect("input buffer is initialized")
+            .buffer;
+        copy_slice_to_buffer(input_buffer, input);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        for ((index, job), words_per_row) in jobs.iter().enumerate().zip(words_per_rows) {
+            let output = &activations.outputs[index]
+                .as_ref()
+                .expect("output buffer is initialized")
+                .buffer;
+            let output_rows = u64::try_from(job.output_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("output row count"))?;
+            if job.aligned {
+                encoder.set_compute_pipeline_state(&self.q4_affine_matvec);
+                encoder.set_buffer(0, Some(input_buffer), 0);
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+            } else {
+                encoder.set_compute_pipeline_state(&self.q4_affine_matvec_unaligned);
+                encoder.set_buffer(0, Some(input_buffer), 0);
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+            }
+            encoder.set_threadgroup_memory_length(
+                0,
+                THREADS_PER_THREADGROUP * size_of::<f32>() as u64,
+            );
+            encoder.set_threadgroup_memory_length(
+                1,
+                THREADS_PER_THREADGROUP * size_of::<f32>() as u64,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(output_rows, 1, 1),
+                MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+            );
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+
+        jobs.iter()
+            .enumerate()
+            .map(|(index, job)| {
+                let output = &activations.outputs[index]
+                    .as_ref()
+                    .expect("output buffer is initialized")
+                    .buffer;
+                Ok(unsafe {
+                    std::slice::from_raw_parts(output.contents().cast::<f32>(), job.output_rows)
+                        .to_vec()
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -581,6 +896,562 @@ impl MetalRuntime {
         })
     }
 
+    pub fn create_deltanet_weights(
+        &self,
+        config: DeltaNetConfig,
+        conv_weight: &[f32],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        norm: &[f32],
+    ) -> Result<MetalDeltaNetWeights, MetalRuntimeError> {
+        validate_deltanet_config(config)?;
+        let channels = config.channels()?;
+        let expected_conv = channels.checked_mul(config.conv_kernel_size).ok_or(
+            MetalRuntimeError::DimensionOverflow("DeltaNet convolution weights"),
+        )?;
+        if conv_weight.len() != expected_conv {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "DeltaNet convolution weights",
+                actual: conv_weight.len(),
+                expected: expected_conv,
+            });
+        }
+        for (name, values, expected) in [
+            ("DeltaNet A_log", a_log, config.value_heads),
+            ("DeltaNet dt_bias", dt_bias, config.value_heads),
+            ("DeltaNet norm", norm, config.value_head_dim),
+        ] {
+            if values.len() != expected {
+                return Err(MetalRuntimeError::WrongLength {
+                    name,
+                    actual: values.len(),
+                    expected,
+                });
+            }
+        }
+        Ok(MetalDeltaNetWeights {
+            config,
+            conv_weight: self.buffer_from_slice(conv_weight)?,
+            a_log: self.buffer_from_slice(a_log)?,
+            dt_bias: self.buffer_from_slice(dt_bias)?,
+            norm: self.buffer_from_slice(norm)?,
+        })
+    }
+
+    pub fn create_deltanet_state(
+        &self,
+        weights: &MetalDeltaNetWeights,
+    ) -> Result<MetalDeltaNetState, MetalRuntimeError> {
+        let config = weights.config;
+        let channels = config.channels()?;
+        let history_elements = channels
+            .checked_mul(config.conv_kernel_size.saturating_sub(1))
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "DeltaNet convolution state",
+            ))?;
+        Ok(MetalDeltaNetState {
+            // A one-element allocation keeps the buffer binding valid for a
+            // kernel-size-one model, whose shader never reads this state.
+            conv: self.zeroed_shared_buffer(checked_byte_len::<f32>(history_elements.max(1))?)?,
+            recurrent: self
+                .zeroed_shared_buffer(checked_byte_len::<f32>(config.recurrent_elements()?)?)?,
+        })
+    }
+
+    pub fn create_q8_kv_state(
+        &self,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Q8KvState, MetalRuntimeError> {
+        validate_attention_shape(kv_heads, head_dim)?;
+        self.allocate_q8_kv_state(kv_heads, head_dim, 16)
+    }
+
+    pub fn reserve_q8_kv_tokens(
+        &self,
+        state: &mut Q8KvState,
+        additional_tokens: usize,
+    ) -> Result<(), MetalRuntimeError> {
+        let required_tokens = state
+            .sequence_length
+            .checked_add(additional_tokens)
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV token capacity"))?;
+        self.ensure_q8_kv_capacity(state, required_tokens)
+    }
+
+    fn allocate_q8_kv_state(
+        &self,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity_tokens: usize,
+    ) -> Result<Q8KvState, MetalRuntimeError> {
+        let elements = capacity_tokens
+            .checked_mul(kv_heads)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV elements"))?;
+        let scale_elements = capacity_tokens
+            .checked_mul(kv_heads)
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV scale elements"))?;
+        Ok(Q8KvState {
+            keys: self
+                .zeroed_shared_buffer(u64::try_from(elements).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("Q8 KV key byte length")
+                })?)?,
+            values: self
+                .zeroed_shared_buffer(u64::try_from(elements).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("Q8 KV value byte length")
+                })?)?,
+            key_scales: self.zeroed_shared_buffer(checked_byte_len::<f32>(scale_elements)?)?,
+            value_scales: self.zeroed_shared_buffer(checked_byte_len::<f32>(scale_elements)?)?,
+            capacity_tokens,
+            sequence_length: 0,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    fn ensure_q8_kv_capacity(
+        &self,
+        state: &mut Q8KvState,
+        required_tokens: usize,
+    ) -> Result<(), MetalRuntimeError> {
+        if required_tokens <= state.capacity_tokens {
+            return Ok(());
+        }
+        let capacity_tokens = required_tokens
+            .checked_next_power_of_two()
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV token capacity"))?
+            .max(16);
+        let replacement =
+            self.allocate_q8_kv_state(state.kv_heads, state.head_dim, capacity_tokens)?;
+        let active_elements = state
+            .sequence_length
+            .checked_mul(state.kv_heads)
+            .and_then(|value| value.checked_mul(state.head_dim))
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "active Q8 KV elements",
+            ))?;
+        let active_scales = state
+            .sequence_length
+            .checked_mul(state.kv_heads)
+            .ok_or(MetalRuntimeError::DimensionOverflow("active Q8 KV scales"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                state.keys.contents().cast::<u8>(),
+                replacement.keys.contents().cast::<u8>(),
+                active_elements,
+            );
+            std::ptr::copy_nonoverlapping(
+                state.values.contents().cast::<u8>(),
+                replacement.values.contents().cast::<u8>(),
+                active_elements,
+            );
+            std::ptr::copy_nonoverlapping(
+                state.key_scales.contents().cast::<u8>(),
+                replacement.key_scales.contents().cast::<u8>(),
+                checked_byte_len::<f32>(active_scales)? as usize,
+            );
+            std::ptr::copy_nonoverlapping(
+                state.value_scales.contents().cast::<u8>(),
+                replacement.value_scales.contents().cast::<u8>(),
+                checked_byte_len::<f32>(active_scales)? as usize,
+            );
+        }
+        *state = replacement;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_step(
+        &self,
+        weights: &MetalDeltaNetWeights,
+        state: &mut MetalDeltaNetState,
+        qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        epsilon: f32,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        let config = weights.config;
+        validate_deltanet_config(config)?;
+        let channels = config.channels()?;
+        let value_elements = config
+            .value_heads
+            .checked_mul(config.value_head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "DeltaNet value elements",
+            ))?;
+        for (name, values, expected) in [
+            ("DeltaNet qkv activation", qkv, channels),
+            ("DeltaNet z activation", z, value_elements),
+            ("DeltaNet b activation", b, config.value_heads),
+            ("DeltaNet a activation", a, config.value_heads),
+        ] {
+            if values.len() != expected {
+                return Err(MetalRuntimeError::WrongLength {
+                    name,
+                    actual: values.len(),
+                    expected,
+                });
+            }
+        }
+        let dimensions = config.as_u32()?;
+        let channels_u32 = u32::try_from(channels)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet channel count"))?;
+        let mut activations = self
+            .language_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::LanguageActivationPoolPoisoned)?;
+        ensure_language_slots(
+            &self.device,
+            &mut activations,
+            &[
+                checked_byte_len::<f32>(qkv.len())?,
+                checked_byte_len::<f32>(z.len())?,
+                checked_byte_len::<f32>(b.len())?,
+                checked_byte_len::<f32>(a.len())?,
+                checked_byte_len::<f32>(channels)?,
+                checked_byte_len::<f32>(value_elements)?,
+            ],
+        )?;
+        copy_slice_to_buffer(language_slot(&activations, 0), qkv);
+        copy_slice_to_buffer(language_slot(&activations, 1), z);
+        copy_slice_to_buffer(language_slot(&activations, 2), b);
+        copy_slice_to_buffer(language_slot(&activations, 3), a);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let conv_encoder = command_buffer.new_compute_command_encoder();
+        conv_encoder.set_compute_pipeline_state(&self.deltanet_conv);
+        conv_encoder.set_buffer(0, Some(language_slot(&activations, 0)), 0);
+        conv_encoder.set_buffer(1, Some(&weights.conv_weight), 0);
+        conv_encoder.set_buffer(2, Some(&state.conv), 0);
+        conv_encoder.set_buffer(3, Some(language_slot(&activations, 4)), 0);
+        conv_encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&channels_u32 as *const u32).cast(),
+        );
+        conv_encoder.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            (&dimensions.conv_kernel_size as *const u32).cast(),
+        );
+        conv_encoder.dispatch_threads(
+            MTLSize::new(u64::from(channels_u32), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        conv_encoder.end_encoding();
+
+        let prepare_encoder = command_buffer.new_compute_command_encoder();
+        prepare_encoder.set_compute_pipeline_state(&self.deltanet_prepare);
+        prepare_encoder.set_buffer(0, Some(language_slot(&activations, 4)), 0);
+        prepare_encoder.set_bytes(
+            1,
+            size_of::<u32>() as u64,
+            (&dimensions.key_heads as *const u32).cast(),
+        );
+        prepare_encoder.set_bytes(
+            2,
+            size_of::<u32>() as u64,
+            (&dimensions.key_head_dim as *const u32).cast(),
+        );
+        prepare_encoder.set_bytes(3, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        prepare_encoder
+            .set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        prepare_encoder
+            .set_threadgroup_memory_length(1, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        prepare_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dimensions.key_heads), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        prepare_encoder.end_encoding();
+
+        let recurrence_encoder = command_buffer.new_compute_command_encoder();
+        recurrence_encoder.set_compute_pipeline_state(&self.deltanet_recurrence);
+        recurrence_encoder.set_buffer(0, Some(language_slot(&activations, 4)), 0);
+        recurrence_encoder.set_buffer(1, Some(language_slot(&activations, 1)), 0);
+        recurrence_encoder.set_buffer(2, Some(language_slot(&activations, 2)), 0);
+        recurrence_encoder.set_buffer(3, Some(language_slot(&activations, 3)), 0);
+        recurrence_encoder.set_buffer(4, Some(&weights.a_log), 0);
+        recurrence_encoder.set_buffer(5, Some(&weights.dt_bias), 0);
+        recurrence_encoder.set_buffer(6, Some(&state.recurrent), 0);
+        recurrence_encoder.set_buffer(7, Some(language_slot(&activations, 5)), 0);
+        recurrence_encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&dimensions.key_heads as *const u32).cast(),
+        );
+        recurrence_encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&dimensions.value_heads as *const u32).cast(),
+        );
+        recurrence_encoder.set_bytes(
+            10,
+            size_of::<u32>() as u64,
+            (&dimensions.key_head_dim as *const u32).cast(),
+        );
+        recurrence_encoder.set_bytes(
+            11,
+            size_of::<u32>() as u64,
+            (&dimensions.value_head_dim as *const u32).cast(),
+        );
+        recurrence_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dimensions.value_heads), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        recurrence_encoder.end_encoding();
+
+        let gate_norm_encoder = command_buffer.new_compute_command_encoder();
+        gate_norm_encoder.set_compute_pipeline_state(&self.deltanet_gate_norm);
+        gate_norm_encoder.set_buffer(0, Some(language_slot(&activations, 5)), 0);
+        gate_norm_encoder.set_buffer(1, Some(language_slot(&activations, 1)), 0);
+        gate_norm_encoder.set_buffer(2, Some(&weights.norm), 0);
+        gate_norm_encoder.set_bytes(
+            3,
+            size_of::<u32>() as u64,
+            (&dimensions.value_heads as *const u32).cast(),
+        );
+        gate_norm_encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&dimensions.value_head_dim as *const u32).cast(),
+        );
+        gate_norm_encoder.set_bytes(5, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        gate_norm_encoder
+            .set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        gate_norm_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dimensions.value_heads), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        gate_norm_encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                language_slot(&activations, 5).contents().cast::<f32>(),
+                value_elements,
+            )
+            .to_vec()
+        })
+    }
+
+    pub fn gqa_attention_q8(
+        &self,
+        state: &mut Q8KvState,
+        query: &[f32],
+        gate: &[f32],
+        key: &[f32],
+        value: &[f32],
+        num_heads: usize,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        validate_attention_shape(state.kv_heads, state.head_dim)?;
+        if num_heads == 0 || num_heads % state.kv_heads != 0 || num_heads > u32::MAX as usize {
+            return Err(MetalRuntimeError::InvalidAttentionShape);
+        }
+        let query_elements = num_heads
+            .checked_mul(state.head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA query elements"))?;
+        let key_value_elements = state
+            .kv_heads
+            .checked_mul(state.head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA KV elements"))?;
+        for (name, values, expected) in [
+            ("GQA query", query, query_elements),
+            ("GQA gate", gate, query_elements),
+            ("GQA key", key, key_value_elements),
+            ("GQA value", value, key_value_elements),
+        ] {
+            if values.len() != expected {
+                return Err(MetalRuntimeError::WrongLength {
+                    name,
+                    actual: values.len(),
+                    expected,
+                });
+            }
+        }
+        let sequence_length = state
+            .sequence_length
+            .checked_add(1)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA sequence length"))?;
+        self.ensure_q8_kv_capacity(state, sequence_length)?;
+        let sequence_length_u32 = u32::try_from(sequence_length)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA sequence length"))?;
+        let token_index_u32 = u32::try_from(state.sequence_length)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA token index"))?;
+        let num_heads_u32 = u32::try_from(num_heads)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA head count"))?;
+        let kv_heads_u32 = u32::try_from(state.kv_heads)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA KV head count"))?;
+        let head_dim_u32 = u32::try_from(state.head_dim)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA head dimension"))?;
+        let score_elements = num_heads
+            .checked_mul(sequence_length)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA score elements"))?;
+        let mut activations = self
+            .language_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::LanguageActivationPoolPoisoned)?;
+        ensure_language_slots(
+            &self.device,
+            &mut activations,
+            &[
+                checked_byte_len::<f32>(query_elements)?,
+                checked_byte_len::<f32>(query_elements)?,
+                checked_byte_len::<f32>(key_value_elements)?,
+                checked_byte_len::<f32>(key_value_elements)?,
+                checked_byte_len::<f32>(query_elements)?,
+            ],
+        )?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.scores,
+            checked_byte_len::<f32>(score_elements)?,
+        )?;
+        copy_slice_to_buffer(language_slot(&activations, 0), query);
+        copy_slice_to_buffer(language_slot(&activations, 1), gate);
+        copy_slice_to_buffer(language_slot(&activations, 2), key);
+        copy_slice_to_buffer(language_slot(&activations, 3), value);
+        let scores = &activations
+            .scores
+            .as_ref()
+            .expect("GQA score buffer is initialized")
+            .buffer;
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let append_encoder = command_buffer.new_compute_command_encoder();
+        append_encoder.set_compute_pipeline_state(&self.q8_kv_append);
+        append_encoder.set_buffer(0, Some(language_slot(&activations, 2)), 0);
+        append_encoder.set_buffer(1, Some(language_slot(&activations, 3)), 0);
+        append_encoder.set_buffer(2, Some(&state.keys), 0);
+        append_encoder.set_buffer(3, Some(&state.values), 0);
+        append_encoder.set_buffer(4, Some(&state.key_scales), 0);
+        append_encoder.set_buffer(5, Some(&state.value_scales), 0);
+        append_encoder.set_bytes(
+            6,
+            size_of::<u32>() as u64,
+            (&kv_heads_u32 as *const u32).cast(),
+        );
+        append_encoder.set_bytes(
+            7,
+            size_of::<u32>() as u64,
+            (&head_dim_u32 as *const u32).cast(),
+        );
+        append_encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&token_index_u32 as *const u32).cast(),
+        );
+        append_encoder
+            .set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        append_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(kv_heads_u32), 2, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        append_encoder.end_encoding();
+
+        let score_encoder = command_buffer.new_compute_command_encoder();
+        score_encoder.set_compute_pipeline_state(&self.gqa_q8_scores);
+        score_encoder.set_buffer(0, Some(language_slot(&activations, 0)), 0);
+        score_encoder.set_buffer(1, Some(&state.keys), 0);
+        score_encoder.set_buffer(2, Some(&state.key_scales), 0);
+        score_encoder.set_buffer(3, Some(scores), 0);
+        score_encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&sequence_length_u32 as *const u32).cast(),
+        );
+        score_encoder.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            (&num_heads_u32 as *const u32).cast(),
+        );
+        score_encoder.set_bytes(
+            6,
+            size_of::<u32>() as u64,
+            (&kv_heads_u32 as *const u32).cast(),
+        );
+        score_encoder.set_bytes(
+            7,
+            size_of::<u32>() as u64,
+            (&head_dim_u32 as *const u32).cast(),
+        );
+        score_encoder
+            .set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        score_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(num_heads_u32), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        score_encoder.end_encoding();
+
+        let value_encoder = command_buffer.new_compute_command_encoder();
+        value_encoder.set_compute_pipeline_state(&self.gqa_q8_values);
+        value_encoder.set_buffer(0, Some(scores), 0);
+        value_encoder.set_buffer(1, Some(&state.values), 0);
+        value_encoder.set_buffer(2, Some(&state.value_scales), 0);
+        value_encoder.set_buffer(3, Some(language_slot(&activations, 1)), 0);
+        value_encoder.set_buffer(4, Some(language_slot(&activations, 4)), 0);
+        value_encoder.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            (&sequence_length_u32 as *const u32).cast(),
+        );
+        value_encoder.set_bytes(
+            6,
+            size_of::<u32>() as u64,
+            (&num_heads_u32 as *const u32).cast(),
+        );
+        value_encoder.set_bytes(
+            7,
+            size_of::<u32>() as u64,
+            (&kv_heads_u32 as *const u32).cast(),
+        );
+        value_encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&head_dim_u32 as *const u32).cast(),
+        );
+        value_encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(num_heads_u32), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        value_encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        state.sequence_length = sequence_length;
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                language_slot(&activations, 4).contents().cast::<f32>(),
+                query_elements,
+            )
+            .to_vec()
+        })
+    }
+
+    fn zeroed_shared_buffer(&self, byte_len: u64) -> Result<metal::Buffer, MetalRuntimeError> {
+        if byte_len == 0 {
+            return Err(MetalRuntimeError::EmptyBuffer);
+        }
+        let buffer = self.device.new_buffer(
+            byte_len,
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
+        let byte_len = usize::try_from(byte_len)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("Metal buffer byte length"))?;
+        unsafe {
+            std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, byte_len);
+        }
+        Ok(buffer)
+    }
+
     fn buffer_from_slice<T>(&self, values: &[T]) -> Result<metal::Buffer, MetalRuntimeError> {
         let byte_len = checked_byte_len::<T>(values.len())?;
         if byte_len == 0 {
@@ -708,6 +1579,92 @@ fn checked_byte_len<T>(elements: usize) -> Result<u64, MetalRuntimeError> {
     u64::try_from(bytes).map_err(|_| MetalRuntimeError::DimensionOverflow("buffer byte length"))
 }
 
+fn ensure_shared_buffer(
+    device: &Device,
+    slot: &mut Option<ReusableBuffer>,
+    required_bytes: u64,
+) -> Result<(), MetalRuntimeError> {
+    if required_bytes == 0 {
+        return Err(MetalRuntimeError::EmptyBuffer);
+    }
+    if slot
+        .as_ref()
+        .is_some_and(|buffer| buffer.capacity_bytes >= required_bytes)
+    {
+        return Ok(());
+    }
+    let capacity_bytes = required_bytes
+        .checked_next_power_of_two()
+        .unwrap_or(required_bytes);
+    *slot = Some(ReusableBuffer {
+        buffer: device.new_buffer(
+            capacity_bytes,
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeDefaultCache,
+        ),
+        capacity_bytes,
+    });
+    Ok(())
+}
+
+fn copy_slice_to_buffer<T>(buffer: &metal::Buffer, values: &[T]) {
+    let byte_len = values.len().saturating_mul(size_of::<T>());
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            values.as_ptr().cast::<u8>(),
+            buffer.contents().cast::<u8>(),
+            byte_len,
+        );
+    }
+}
+
+fn ensure_language_slots(
+    device: &Device,
+    activations: &mut LanguageActivationPool,
+    required_bytes: &[u64],
+) -> Result<(), MetalRuntimeError> {
+    if activations.slots.len() < required_bytes.len() {
+        activations.slots.resize_with(required_bytes.len(), || None);
+    }
+    for (slot, bytes) in activations.slots.iter_mut().zip(required_bytes) {
+        ensure_shared_buffer(device, slot, *bytes)?;
+    }
+    Ok(())
+}
+
+fn language_slot(activations: &LanguageActivationPool, index: usize) -> &metal::Buffer {
+    &activations.slots[index]
+        .as_ref()
+        .expect("language activation slot is initialized")
+        .buffer
+}
+
+fn validate_deltanet_config(config: DeltaNetConfig) -> Result<(), MetalRuntimeError> {
+    if config.key_heads == 0
+        || config.value_heads == 0
+        || config.key_head_dim == 0
+        || config.value_head_dim == 0
+        || config.conv_kernel_size == 0
+        || config.value_heads % config.key_heads != 0
+        || config.key_head_dim > THREADS_PER_THREADGROUP as usize
+        || config.value_head_dim > THREADS_PER_THREADGROUP as usize
+    {
+        return Err(MetalRuntimeError::InvalidDeltaNetConfig);
+    }
+    config.channels()?;
+    config.recurrent_elements()?;
+    config.as_u32()?;
+    Ok(())
+}
+
+fn validate_attention_shape(kv_heads: usize, head_dim: usize) -> Result<(), MetalRuntimeError> {
+    if kv_heads == 0 || head_dim == 0 || head_dim > THREADS_PER_THREADGROUP as usize {
+        return Err(MetalRuntimeError::InvalidAttentionShape);
+    }
+    u32::try_from(kv_heads).map_err(|_| MetalRuntimeError::InvalidAttentionShape)?;
+    u32::try_from(head_dim).map_err(|_| MetalRuntimeError::InvalidAttentionShape)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetalRuntimeError {
     NoDevice,
@@ -719,7 +1676,11 @@ pub enum MetalRuntimeError {
         required: u64,
     },
     EmptyBuffer,
+    ActivationPoolPoisoned,
+    LanguageActivationPoolPoisoned,
     EmptyDimension,
+    InvalidDeltaNetConfig,
+    InvalidAttentionShape,
     InputNotGrouped {
         input_elements: usize,
         group_size: usize,
@@ -752,7 +1713,21 @@ impl fmt::Display for MetalRuntimeError {
                 "Metal device supports {available} threads per threadgroup but the Q4 kernel requires {required}"
             ),
             Self::EmptyBuffer => write!(formatter, "Metal buffers cannot be empty"),
+            Self::ActivationPoolPoisoned => {
+                write!(formatter, "the reusable Metal activation pool is unavailable")
+            }
+            Self::LanguageActivationPoolPoisoned => {
+                write!(formatter, "the reusable language activation pool is unavailable")
+            }
             Self::EmptyDimension => write!(formatter, "matrix dimensions must be greater than zero"),
+            Self::InvalidDeltaNetConfig => write!(
+                formatter,
+                "DeltaNet dimensions must be non-zero, GPU-threadgroup compatible, and evenly grouped"
+            ),
+            Self::InvalidAttentionShape => write!(
+                formatter,
+                "attention dimensions must be non-zero and fit one GPU threadgroup"
+            ),
             Self::InputNotGrouped {
                 input_elements,
                 group_size,
@@ -870,6 +1845,142 @@ mod tests {
     }
 
     #[test]
+    fn mapped_q4_batch_reuses_one_input_without_changing_results() {
+        let input: Vec<f32> = (0..128)
+            .map(|index| ((index % 13) as f32 - 6.0) * 0.125)
+            .collect();
+        let first_rows = 2;
+        let second_rows = 4;
+        let first_quantized: Vec<u8> = (0..first_rows * input.len())
+            .map(|index| ((index * 5 + 1) % 16) as u8)
+            .collect();
+        let second_quantized: Vec<u8> = (0..second_rows * input.len())
+            .map(|index| ((index * 3 + 7) % 16) as u8)
+            .collect();
+        let first_scales = vec![f32_to_bf16(0.125); first_rows * 2];
+        let first_biases = vec![f32_to_bf16(-0.03125); first_rows * 2];
+        let second_scales = vec![f32_to_bf16(0.0625); second_rows * 2];
+        let second_biases = vec![f32_to_bf16(0.015625); second_rows * 2];
+        let runtime = MetalRuntime::new().unwrap();
+        let first_weights = runtime
+            .buffer_from_slice(&pack_q4(&first_quantized))
+            .unwrap();
+        let first_scales_buffer = runtime.buffer_from_slice(&first_scales).unwrap();
+        let first_biases_buffer = runtime.buffer_from_slice(&first_biases).unwrap();
+        let second_weights = runtime
+            .buffer_from_slice(&pack_q4(&second_quantized))
+            .unwrap();
+        let second_scales_buffer = runtime.buffer_from_slice(&second_scales).unwrap();
+        let second_biases_buffer = runtime.buffer_from_slice(&second_biases).unwrap();
+        let actual = runtime
+            .q4_affine_matvec_mapped_batch(
+                &input,
+                &[
+                    MappedQ4AffineJob::new(
+                        &first_weights,
+                        0,
+                        &first_scales_buffer,
+                        0,
+                        &first_biases_buffer,
+                        0,
+                        first_rows,
+                        true,
+                    ),
+                    MappedQ4AffineJob::new(
+                        &second_weights,
+                        0,
+                        &second_scales_buffer,
+                        0,
+                        &second_biases_buffer,
+                        0,
+                        second_rows,
+                        true,
+                    ),
+                ],
+            )
+            .unwrap();
+        let expected = [
+            cpu_q4_affine_matvec(
+                &input,
+                &first_quantized,
+                &first_scales,
+                &first_biases,
+                first_rows,
+            ),
+            cpu_q4_affine_matvec(
+                &input,
+                &second_quantized,
+                &second_scales,
+                &second_biases,
+                second_rows,
+            ),
+        ];
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 0.001,
+                    "actual {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deltanet_step_matches_a_scalar_recurrence() {
+        let config = DeltaNetConfig {
+            key_heads: 1,
+            value_heads: 1,
+            key_head_dim: 2,
+            value_head_dim: 2,
+            conv_kernel_size: 1,
+        };
+        let qkv = vec![-0.5, 0.25, 0.75, -1.0, 0.2, -0.4];
+        let z = vec![0.1, -0.2];
+        let b = vec![0.3];
+        let a = vec![-0.1];
+        let a_log = vec![0.2];
+        let dt_bias = vec![-0.3];
+        let norm = vec![1.1, 0.9];
+        let epsilon = 1e-6;
+        let runtime = MetalRuntime::new().unwrap();
+        let weights = runtime
+            .create_deltanet_weights(config, &vec![1.0; qkv.len()], &a_log, &dt_bias, &norm)
+            .unwrap();
+        let mut state = runtime.create_deltanet_state(&weights).unwrap();
+        let actual = runtime
+            .deltanet_step(&weights, &mut state, &qkv, &z, &b, &a, epsilon)
+            .unwrap();
+        let expected = cpu_deltanet_step(&qkv, &z, &b, &a, &a_log, &dt_bias, &norm, epsilon);
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_gqa_attention_keeps_kv_on_the_gpu() {
+        let runtime = MetalRuntime::new().unwrap();
+        let mut state = runtime.create_q8_kv_state(1, 2).unwrap();
+        let actual = runtime
+            .gqa_attention_q8(
+                &mut state,
+                &[1.0, 0.0],
+                &[0.0, 0.0],
+                &[1.0, 0.0],
+                &[2.0, -1.0],
+                1,
+            )
+            .unwrap();
+        assert_eq!(state.sequence_length, 1);
+        assert!((actual[0] - 1.0).abs() < 0.001, "actual {:?}", actual);
+        // Per-head int8 quantization rounds -1.0 to -64 with a 2/127 scale,
+        // so the one-token result is approximately -0.503937.
+        assert!((actual[1] + 0.5).abs() < 0.005, "actual {:?}", actual);
+    }
+
+    #[test]
     fn q4_affine_matvec_rejects_incomplete_group() {
         let error = MatvecShape::validate(&[0.0; 63], &[], &[], &[], 1).unwrap_err();
         assert!(matches!(error, MetalRuntimeError::InputNotGrouped { .. }));
@@ -980,6 +2091,90 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_deltanet_step(
+        qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        norm: &[f32],
+        epsilon: f32,
+    ) -> Vec<f32> {
+        let convolved: Vec<f32> = qkv.iter().copied().map(cpu_silu).collect();
+        let key_dim = 2;
+        let mut query = convolved[..key_dim].to_vec();
+        let mut key = convolved[key_dim..key_dim * 2].to_vec();
+        let inverse_head_scale = (key_dim as f32).sqrt().recip();
+        let query_rms = (query.iter().map(|value| value * value).sum::<f32>() / key_dim as f32
+            + epsilon)
+            .sqrt()
+            .recip();
+        let key_rms = (key.iter().map(|value| value * value).sum::<f32>() / key_dim as f32
+            + epsilon)
+            .sqrt()
+            .recip();
+        for value in &mut query {
+            *value *= query_rms * inverse_head_scale * inverse_head_scale;
+        }
+        for value in &mut key {
+            *value *= key_rms * inverse_head_scale;
+        }
+        let beta = cpu_sigmoid(b[0]);
+        let decay = (-a_log[0].exp() * cpu_softplus(a[0] + dt_bias[0])).exp();
+        let mut recurrent = vec![0.0; key_dim * z.len()];
+        let mut output = vec![0.0; z.len()];
+        for value_index in 0..z.len() {
+            let state = &mut recurrent[value_index * key_dim..(value_index + 1) * key_dim];
+            let kv_mem = state
+                .iter_mut()
+                .zip(&key)
+                .map(|(state, key)| {
+                    *state *= decay;
+                    *state * key
+                })
+                .sum::<f32>();
+            let delta = (convolved[key_dim * 2 + value_index] - kv_mem) * beta;
+            output[value_index] = state
+                .iter_mut()
+                .zip(query.iter().zip(&key))
+                .map(|(state, (query, key))| {
+                    *state += key * delta;
+                    *state * query
+                })
+                .sum();
+        }
+        let output_rms =
+            (output.iter().map(|value| value * value).sum::<f32>() / output.len() as f32 + epsilon)
+                .sqrt()
+                .recip();
+        output
+            .into_iter()
+            .zip(z)
+            .zip(norm)
+            .map(|((value, z), norm)| value * output_rms * norm * cpu_silu(*z))
+            .collect()
+    }
+
+    fn cpu_sigmoid(value: f32) -> f32 {
+        1.0 / (1.0 + (-value).exp())
+    }
+
+    fn cpu_silu(value: f32) -> f32 {
+        value * cpu_sigmoid(value)
+    }
+
+    fn cpu_softplus(value: f32) -> f32 {
+        if value > 20.0 {
+            value
+        } else if value < -20.0 {
+            value.exp()
+        } else {
+            (1.0 + value.exp()).ln()
+        }
     }
 
     fn cpu_vision_attention(

@@ -1,9 +1,15 @@
 use crate::api::{
-    parse_model_output, EngineError, ExecutionKind, FinishReason, Generation, GenerationRequest,
-    InferenceEngine, InputImage, ModelDescriptor, PromptPart, PromptRole, ToolChoice,
+    parse_model_output, EngineError, ExecutionKind, FinishReason, Generation, GenerationEvent,
+    GenerationRequest, InferenceEngine, InputImage, ModelDescriptor, PromptPart, PromptRole,
+    ToolChoice,
 };
-use crate::metal_runtime::{MappedWeightBuffers, MetalRuntime, MetalRuntimeError};
+use crate::metal_runtime::{
+    DeltaNetConfig, MappedQ4AffineJob, MappedWeightBuffers, MetalDeltaNetState,
+    MetalDeltaNetWeights, MetalRuntime, MetalRuntimeError, Q8KvState,
+};
 use crate::model::{open_mlx_safetensors_dir, MlxTensor, MlxWeightStore};
+use crate::mtp::SpeculativeDecodeSupport;
+use crate::preflight::inspect_model_dir;
 use image::imageops::FilterType;
 use serde::Deserialize;
 use serde_json::json;
@@ -214,42 +220,57 @@ impl NativeWeights {
         matrix: &Q4AffineMatrix,
         input: &[f32],
     ) -> Result<Vec<f32>, NativeError> {
-        if input.len() as u64 != matrix.input_elements {
-            return Err(NativeError::InputDimension {
-                actual: input.len(),
-                expected: matrix.input_elements,
-            });
+        let mut outputs = self.q4_affine_matvec_batch(runtime, &[matrix], input)?;
+        Ok(outputs.remove(0))
+    }
+
+    pub fn q4_affine_matvec_batch(
+        &self,
+        runtime: &MetalRuntime,
+        matrices: &[&Q4AffineMatrix],
+        input: &[f32],
+    ) -> Result<Vec<Vec<f32>>, NativeError> {
+        if matrices.is_empty() {
+            return Err(NativeError::InvalidConfig(
+                "a Q4 projection batch requires at least one matrix".to_owned(),
+            ));
         }
-        let weight_buffer = self
-            .mapped
-            .buffer(matrix.weight.shard_index)
-            .ok_or(NativeError::MissingMappedShard(matrix.weight.shard_index))?;
-        let scale_buffer = self
-            .mapped
-            .buffer(matrix.scales.shard_index)
-            .ok_or(NativeError::MissingMappedShard(matrix.scales.shard_index))?;
-        let bias_buffer = self
-            .mapped
-            .buffer(matrix.biases.shard_index)
-            .ok_or(NativeError::MissingMappedShard(matrix.biases.shard_index))?;
-        let aligned = self
-            .mapped
-            .offset_is_aligned(matrix.weight.shard_index, matrix.weight.byte_offset, 4)
-            .zip(self.mapped.offset_is_aligned(
-                matrix.scales.shard_index,
-                matrix.scales.byte_offset,
-                2,
-            ))
-            .zip(self.mapped.offset_is_aligned(
-                matrix.biases.shard_index,
-                matrix.biases.byte_offset,
-                2,
-            ))
-            .map(|((weight, scales), biases)| weight && scales && biases)
-            .ok_or(NativeError::MissingMappedShard(matrix.weight.shard_index))?;
-        let result = if aligned {
-            runtime.q4_affine_matvec_mapped(
-                input,
+        let mut jobs = Vec::with_capacity(matrices.len());
+        for matrix in matrices {
+            if input.len() as u64 != matrix.input_elements {
+                return Err(NativeError::InputDimension {
+                    actual: input.len(),
+                    expected: matrix.input_elements,
+                });
+            }
+            let weight_buffer = self
+                .mapped
+                .buffer(matrix.weight.shard_index)
+                .ok_or(NativeError::MissingMappedShard(matrix.weight.shard_index))?;
+            let scale_buffer = self
+                .mapped
+                .buffer(matrix.scales.shard_index)
+                .ok_or(NativeError::MissingMappedShard(matrix.scales.shard_index))?;
+            let bias_buffer = self
+                .mapped
+                .buffer(matrix.biases.shard_index)
+                .ok_or(NativeError::MissingMappedShard(matrix.biases.shard_index))?;
+            let aligned = self
+                .mapped
+                .offset_is_aligned(matrix.weight.shard_index, matrix.weight.byte_offset, 4)
+                .zip(self.mapped.offset_is_aligned(
+                    matrix.scales.shard_index,
+                    matrix.scales.byte_offset,
+                    2,
+                ))
+                .zip(self.mapped.offset_is_aligned(
+                    matrix.biases.shard_index,
+                    matrix.biases.byte_offset,
+                    2,
+                ))
+                .map(|((weight, scales), biases)| weight && scales && biases)
+                .ok_or(NativeError::MissingMappedShard(matrix.weight.shard_index))?;
+            jobs.push(MappedQ4AffineJob::new(
                 weight_buffer,
                 matrix.weight.byte_offset,
                 scale_buffer,
@@ -257,20 +278,12 @@ impl NativeWeights {
                 bias_buffer,
                 matrix.biases.byte_offset,
                 matrix.output_rows as usize,
-            )
-        } else {
-            runtime.q4_affine_matvec_mapped_unaligned(
-                input,
-                weight_buffer,
-                matrix.weight.byte_offset,
-                scale_buffer,
-                matrix.scales.byte_offset,
-                bias_buffer,
-                matrix.biases.byte_offset,
-                matrix.output_rows as usize,
-            )
-        };
-        result.map_err(NativeError::Metal)
+                aligned,
+            ));
+        }
+        runtime
+            .q4_affine_matvec_mapped_batch(input, &jobs)
+            .map_err(NativeError::Metal)
     }
 
     pub fn mapped_shard_count(&self) -> usize {
@@ -320,6 +333,7 @@ pub struct NativeEngine {
     vision: Option<NativeVisionModel>,
     vision_tokens: Option<VisionTokenIds>,
     eos_token_ids: Vec<u32>,
+    speculative: SpeculativeDecodeSupport,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -354,7 +368,7 @@ impl NativeEngine {
             .map_err(|error| NativeError::Tokenizer(error.to_string()))?;
         let runtime = MetalRuntime::new().map_err(NativeError::Metal)?;
         let weights = NativeWeights::open(path, &runtime)?;
-        let model = NativeModel::load(&weights, text_config.clone())?;
+        let model = NativeModel::load(&weights, text_config.clone(), &runtime)?;
         let vision = vision_config
             .map(|config| {
                 validate_vision_runtime_config(&config)?;
@@ -383,6 +397,8 @@ impl NativeEngine {
         let context_tokens = u32::try_from(text_config.max_context())
             .map_err(|_| NativeError::DimensionOverflow("max_position_embeddings".to_owned()))?;
         let eos_token_ids = load_eos_token_ids(path, text_config.eos_token_id())?;
+        let inspection = inspect_model_dir(path).map_err(NativeError::Preflight)?;
+        let speculative = SpeculativeDecodeSupport::from_mtp_support(&inspection.mtp_support);
 
         Ok(Self {
             descriptor: ModelDescriptor {
@@ -397,11 +413,16 @@ impl NativeEngine {
             vision,
             vision_tokens,
             eos_token_ids,
+            speculative,
         })
     }
 
     pub fn mapped_shard_count(&self) -> usize {
         self.weights.mapped_shard_count()
+    }
+
+    pub fn speculative_decode_support(&self) -> &SpeculativeDecodeSupport {
+        &self.speculative
     }
 
     fn prepare_images(
@@ -580,7 +601,11 @@ impl NativeEngine {
         Ok(ids)
     }
 
-    fn generate_native(&self, request: GenerationRequest) -> Result<Generation, NativeError> {
+    fn generate_native(
+        &self,
+        request: GenerationRequest,
+        mut on_event: Option<&mut dyn FnMut(GenerationEvent) -> Result<(), NativeError>>,
+    ) -> Result<Generation, NativeError> {
         let images = self.prepare_images(&request)?;
         let image_token_counts: Vec<usize> = images
             .iter()
@@ -597,6 +622,9 @@ impl NativeEngine {
                 requested,
                 maximum: self.descriptor.context_tokens,
             });
+        }
+        if let Some(callback) = on_event.as_deref_mut() {
+            callback(GenerationEvent::Started { input_tokens })?;
         }
 
         let mut image_features = Vec::new();
@@ -615,40 +643,37 @@ impl NativeEngine {
             ));
         }
 
-        let mut state = RuntimeState::new(&self.model);
-        let mut hidden = Vec::new();
+        let mut state = RuntimeState::new(&self.model, &self.runtime)?;
         let mut image_feature_index = 0;
         let image_pad = self.vision_tokens.map(|tokens| tokens.image_pad);
-        for (token_id, position) in prompt_ids.iter().copied().zip(positions.iter().copied()) {
-            hidden = if Some(token_id) == image_pad {
+        let mut embedding_overrides = Vec::with_capacity(prompt_ids.len());
+        for token_id in &prompt_ids {
+            if Some(*token_id) == image_pad {
                 let feature = image_features.get(image_feature_index).ok_or_else(|| {
                     NativeError::Prompt("image placeholders exceed visual feature count".to_owned())
                 })?;
                 image_feature_index += 1;
-                self.model.forward_embedding(
-                    &self.runtime,
-                    &self.weights,
-                    &mut state,
-                    feature.clone(),
-                    position,
-                )?
+                embedding_overrides.push(Some(feature.as_slice()));
             } else {
-                self.model.forward_token(
-                    &self.runtime,
-                    &self.weights,
-                    &mut state,
-                    token_id,
-                    position,
-                )?
-            };
+                embedding_overrides.push(None);
+            }
         }
         if image_feature_index != image_features.len() {
             return Err(NativeError::Prompt(
                 "visual features exceed image placeholders in the tokenized prompt".to_owned(),
             ));
         }
+        let mut hidden = self.model.prefill(
+            &self.runtime,
+            &self.weights,
+            &mut state,
+            &prompt_ids,
+            &positions,
+            &embedding_overrides,
+        )?;
 
         let mut generated_ids = Vec::new();
+        let mut streamed_text = String::new();
         let mut next_logits = self.model.logits(&self.runtime, &self.weights, &hidden)?;
         let mut finish_reason = FinishReason::Length;
         let mut next_position = positions
@@ -669,6 +694,30 @@ impl NativeEngine {
                 break;
             }
             generated_ids.push(token_id);
+            if let Some(stop_index) =
+                token_sequence_stop_index(&self.tokenizer, &generated_ids, &request.stop)?
+            {
+                generated_ids.truncate(stop_index);
+                finish_reason = FinishReason::StopSequence;
+                break;
+            }
+            if let Some(callback) = on_event.as_deref_mut() {
+                let decoded = self
+                    .tokenizer
+                    .decode(&generated_ids, true)
+                    .map_err(|error| NativeError::Tokenizer(error.to_string()))?;
+                if let Some(delta) = decoded.strip_prefix(&streamed_text) {
+                    if !delta.is_empty() {
+                        callback(GenerationEvent::RawToken(delta.to_owned()))?;
+                    }
+                } else if !decoded.is_empty() {
+                    // Tokenizers normally append monotonically. If a custom
+                    // tokenizer normalizes a prior token, preserve liveness
+                    // instead of withholding all remaining output.
+                    callback(GenerationEvent::RawToken(decoded.clone()))?;
+                }
+                streamed_text = decoded;
+            }
             hidden = self.model.forward_token(
                 &self.runtime,
                 &self.weights,
@@ -678,13 +727,6 @@ impl NativeEngine {
             )?;
             next_position = next_position.saturating_add(1);
             next_logits = self.model.logits(&self.runtime, &self.weights, &hidden)?;
-            if let Some(stop_index) =
-                token_sequence_stop_index(&self.tokenizer, &generated_ids, &request.stop)?
-            {
-                generated_ids.truncate(stop_index);
-                finish_reason = FinishReason::StopSequence;
-                break;
-            }
             if step + 1 == request.max_tokens {
                 finish_reason = FinishReason::Length;
             }
@@ -787,7 +829,22 @@ impl InferenceEngine for NativeEngine {
     }
 
     fn generate(&self, request: GenerationRequest) -> Result<Generation, EngineError> {
-        self.generate_native(request).map_err(native_engine_error)
+        self.generate_native(request, None)
+            .map_err(native_engine_error)
+    }
+
+    fn generate_stream(
+        &self,
+        request: GenerationRequest,
+        callback: &mut dyn FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<Generation, EngineError> {
+        let mut forward_event =
+            |event| callback(event).map_err(|error| NativeError::Streaming(error.to_string()));
+        let generation = self
+            .generate_native(request, Some(&mut forward_event))
+            .map_err(native_engine_error)?;
+        callback(GenerationEvent::Finished(generation.clone()))?;
+        Ok(generation)
     }
 }
 
@@ -1522,10 +1579,7 @@ struct LinearLayerWeights {
     in_proj_b: Q4AffineMatrix,
     in_proj_a: Q4AffineMatrix,
     out_proj: Q4AffineMatrix,
-    conv_weight: Vec<f32>,
-    a_log: Vec<f32>,
-    dt_bias: Vec<f32>,
-    norm: Vec<f32>,
+    delta: MetalDeltaNetWeights,
 }
 
 struct FullLayerWeights {
@@ -1542,7 +1596,11 @@ struct FullLayerWeights {
 }
 
 impl NativeModel {
-    fn load(weights: &NativeWeights, config: TextRuntimeConfig) -> Result<Self, NativeError> {
+    fn load(
+        weights: &NativeWeights,
+        config: TextRuntimeConfig,
+        runtime: &MetalRuntime,
+    ) -> Result<Self, NativeError> {
         let embed_tokens = weights.q4_matrix("language_model.model.embed_tokens.weight")?;
         let lm_head = weights.q4_matrix("language_model.lm_head.weight")?;
         let model_norm = weights.tensor_values_f32("language_model.model.norm.weight")?;
@@ -1578,6 +1636,35 @@ impl NativeModel {
                 .map(|kind| kind == "linear_attention")
                 .unwrap_or_else(|| (index + 1) % config.full_attention_interval.max(1) != 0);
             if is_linear {
+                let delta_config = DeltaNetConfig {
+                    key_heads: config.linear_num_key_heads,
+                    value_heads: config.linear_num_value_heads,
+                    key_head_dim: config.linear_key_head_dim,
+                    value_head_dim: config.linear_value_head_dim,
+                    conv_kernel_size: config.linear_conv_kernel_dim,
+                };
+                let conv_weight = load_vector(
+                    weights,
+                    &format!("{prefix}.linear_attn.conv1d.weight"),
+                    (config.linear_num_key_heads * config.linear_key_head_dim * 2
+                        + config.linear_num_value_heads * config.linear_value_head_dim)
+                        * config.linear_conv_kernel_dim,
+                )?;
+                let a_log = load_vector(
+                    weights,
+                    &format!("{prefix}.linear_attn.A_log"),
+                    config.linear_num_value_heads,
+                )?;
+                let dt_bias = load_vector(
+                    weights,
+                    &format!("{prefix}.linear_attn.dt_bias"),
+                    config.linear_num_value_heads,
+                )?;
+                let norm = load_vector(
+                    weights,
+                    &format!("{prefix}.linear_attn.norm.weight"),
+                    config.linear_value_head_dim,
+                )?;
                 let linear = LinearLayerWeights {
                     common,
                     in_proj_qkv: weights
@@ -1590,28 +1677,15 @@ impl NativeModel {
                         .q4_matrix(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
                     out_proj: weights
                         .q4_matrix(&format!("{prefix}.linear_attn.out_proj.weight"))?,
-                    conv_weight: load_vector(
-                        weights,
-                        &format!("{prefix}.linear_attn.conv1d.weight"),
-                        (config.linear_num_key_heads * config.linear_key_head_dim * 2
-                            + config.linear_num_value_heads * config.linear_value_head_dim)
-                            * config.linear_conv_kernel_dim,
-                    )?,
-                    a_log: load_vector(
-                        weights,
-                        &format!("{prefix}.linear_attn.A_log"),
-                        config.linear_num_value_heads,
-                    )?,
-                    dt_bias: load_vector(
-                        weights,
-                        &format!("{prefix}.linear_attn.dt_bias"),
-                        config.linear_num_value_heads,
-                    )?,
-                    norm: load_vector(
-                        weights,
-                        &format!("{prefix}.linear_attn.norm.weight"),
-                        config.linear_value_head_dim,
-                    )?,
+                    delta: runtime
+                        .create_deltanet_weights(
+                            delta_config,
+                            &conv_weight,
+                            &a_log,
+                            &dt_bias,
+                            &norm,
+                        )
+                        .map_err(NativeError::Metal)?,
                 };
                 layers.push(LayerWeights::Linear(linear));
             } else {
@@ -1673,6 +1747,46 @@ impl NativeModel {
         self.forward_embedding(runtime, weights, state, hidden, position)
     }
 
+    /// Runs a prompt as one prefill phase. Hybrid DeltaNet state makes the
+    /// token recurrence causal, but reserving all KV capacity before the scan
+    /// removes geometric reallocation and gives the runtime a single sequence
+    /// boundary for future batched projection kernels.
+    fn prefill(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        token_ids: &[u32],
+        positions: &[MropePosition],
+        embedding_overrides: &[Option<&[f32]>],
+    ) -> Result<Vec<f32>, NativeError> {
+        if token_ids.is_empty()
+            || token_ids.len() != positions.len()
+            || token_ids.len() != embedding_overrides.len()
+        {
+            return Err(NativeError::Prompt(
+                "prefill tokens, positions, and embedding overrides must have matching lengths"
+                    .to_owned(),
+            ));
+        }
+        state.reserve_prefill(runtime, token_ids.len())?;
+        let mut hidden = Vec::new();
+        for ((token_id, position), embedding) in token_ids
+            .iter()
+            .copied()
+            .zip(positions.iter().copied())
+            .zip(embedding_overrides.iter().copied())
+        {
+            hidden = match embedding {
+                Some(embedding) => {
+                    self.forward_embedding(runtime, weights, state, embedding.to_vec(), position)?
+                }
+                None => self.forward_token(runtime, weights, state, token_id, position)?,
+            };
+        }
+        Ok(hidden)
+    }
+
     fn forward_embedding(
         &self,
         runtime: &MetalRuntime,
@@ -1687,25 +1801,27 @@ impl NativeModel {
                 expected: self.config.hidden_size,
             });
         }
-        for (layer_index, layer) in self.layers.iter().enumerate() {
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             let normalized = rms_norm(&hidden, layer.input_norm(), self.config.rms_norm_eps)?;
-            let mixed = match layer {
-                LayerWeights::Linear(linear) => linear.forward(
+            let mixed = match (layer, layer_state) {
+                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => linear
+                    .forward(
+                        runtime,
+                        weights,
+                        &normalized,
+                        layer_state,
+                        self.config.rms_norm_eps,
+                    )?,
+                (LayerWeights::Full(full), LayerRuntimeState::Full(layer_state)) => full.forward(
                     runtime,
                     weights,
                     &normalized,
-                    &mut state.linear[layer_index],
-                    self.config.rms_norm_eps,
-                )?,
-                LayerWeights::Full(full) => full.forward(
-                    runtime,
-                    weights,
-                    &normalized,
-                    &mut state.full[layer_index],
+                    layer_state,
                     position,
                     self.config.rope(),
                     self.config.rms_norm_eps,
                 )?,
+                _ => unreachable!("layer weights and runtime state are constructed together"),
             };
             add_in_place(&mut hidden, &mixed)?;
             let post_norm = rms_norm(
@@ -1713,34 +1829,16 @@ impl NativeModel {
                 layer.post_attention_norm(),
                 self.config.rms_norm_eps,
             )?;
-            let gate = match layer {
-                LayerWeights::Linear(linear) => {
-                    weights.q4_affine_matvec(runtime, &linear.common.gate_proj, &post_norm)?
-                }
-                LayerWeights::Full(full) => {
-                    weights.q4_affine_matvec(runtime, &full.common.gate_proj, &post_norm)?
-                }
-            };
-            let up = match layer {
-                LayerWeights::Linear(linear) => {
-                    weights.q4_affine_matvec(runtime, &linear.common.up_proj, &post_norm)?
-                }
-                LayerWeights::Full(full) => {
-                    weights.q4_affine_matvec(runtime, &full.common.up_proj, &post_norm)?
-                }
-            };
+            let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
+            let mut gate_and_up =
+                weights.q4_affine_matvec_batch(runtime, &[gate_proj, up_proj], &post_norm)?;
+            let gate = gate_and_up.remove(0);
+            let up = gate_and_up.remove(0);
             let mut swiglu = Vec::with_capacity(gate.len());
             for (gate, up) in gate.into_iter().zip(up) {
                 swiglu.push(silu(gate) * up);
             }
-            let mlp = match layer {
-                LayerWeights::Linear(linear) => {
-                    weights.q4_affine_matvec(runtime, &linear.common.down_proj, &swiglu)?
-                }
-                LayerWeights::Full(full) => {
-                    weights.q4_affine_matvec(runtime, &full.common.down_proj, &swiglu)?
-                }
-            };
+            let mlp = weights.q4_affine_matvec(runtime, down_proj, &swiglu)?;
             add_in_place(&mut hidden, &mlp)?;
         }
         Ok(hidden)
@@ -1759,6 +1857,21 @@ impl LayerWeights {
         match self {
             Self::Linear(layer) => &layer.common.post_attention_norm,
             Self::Full(layer) => &layer.common.post_attention_norm,
+        }
+    }
+
+    fn mlp_projections(&self) -> (&Q4AffineMatrix, &Q4AffineMatrix, &Q4AffineMatrix) {
+        match self {
+            Self::Linear(layer) => (
+                &layer.common.gate_proj,
+                &layer.common.up_proj,
+                &layer.common.down_proj,
+            ),
+            Self::Full(layer) => (
+                &layer.common.gate_proj,
+                &layer.common.up_proj,
+                &layer.common.down_proj,
+            ),
         }
     }
 }
@@ -1780,172 +1893,76 @@ fn load_vector(
 }
 
 struct RuntimeState {
-    linear: Vec<LinearState>,
-    full: Vec<FullState>,
+    layers: Vec<LayerRuntimeState>,
 }
 
-struct LinearState {
-    conv: Vec<f32>,
-    recurrent: Vec<f32>,
-}
-
-struct FullState {
-    keys: Vec<u16>,
-    values: Vec<u16>,
+enum LayerRuntimeState {
+    Linear(MetalDeltaNetState),
+    Full(Q8KvState),
 }
 
 impl RuntimeState {
-    fn new(model: &NativeModel) -> Self {
-        // Keep state indexed by original layer index. Non-applicable entries are empty.
-        let mut linear_states = Vec::with_capacity(model.layers.len());
-        let mut full_states = Vec::with_capacity(model.layers.len());
-        for layer in model.layers.iter() {
+    fn new(model: &NativeModel, runtime: &MetalRuntime) -> Result<Self, NativeError> {
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
             match layer {
-                LayerWeights::Linear(layer) => linear_states.push(LinearState {
-                    conv: vec![0.0; layer.configured_conv_width() * (layer.conv_kernel_size() - 1)],
-                    recurrent: vec![0.0; layer.recurrent_len()],
-                }),
-                LayerWeights::Full(_) => linear_states.push(LinearState {
-                    conv: Vec::new(),
-                    recurrent: Vec::new(),
-                }),
-            }
-            match layer {
-                LayerWeights::Full(_) => full_states.push(FullState {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                }),
-                LayerWeights::Linear(_) => full_states.push(FullState {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                }),
+                LayerWeights::Linear(layer) => layers.push(LayerRuntimeState::Linear(
+                    runtime
+                        .create_deltanet_state(&layer.delta)
+                        .map_err(NativeError::Metal)?,
+                )),
+                LayerWeights::Full(layer) => layers.push(LayerRuntimeState::Full(
+                    runtime
+                        .create_q8_kv_state(layer.num_key_value_heads, layer.head_dim)
+                        .map_err(NativeError::Metal)?,
+                )),
             }
         }
-        Self {
-            linear: linear_states,
-            full: full_states,
+        Ok(Self { layers })
+    }
+
+    fn reserve_prefill(
+        &mut self,
+        runtime: &MetalRuntime,
+        token_count: usize,
+    ) -> Result<(), NativeError> {
+        for layer in &mut self.layers {
+            if let LayerRuntimeState::Full(state) = layer {
+                runtime
+                    .reserve_q8_kv_tokens(state, token_count)
+                    .map_err(NativeError::Metal)?;
+            }
         }
+        Ok(())
     }
 }
 
 impl LinearLayerWeights {
-    fn configured_conv_width(&self) -> usize {
-        self.in_proj_qkv.output_rows as usize
-    }
-
-    fn conv_kernel_size(&self) -> usize {
-        self.conv_weight.len() / self.in_proj_qkv.output_rows as usize
-    }
-
-    fn recurrent_len(&self) -> usize {
-        // q/k head dimension is derived from the qkv layout: qkv = 2*K + V.
-        let value_dim = self.in_proj_z.output_rows as usize;
-        let key_dim = (self.in_proj_qkv.output_rows as usize - value_dim) / 2;
-        let key_heads = key_dim / 128;
-        let value_heads = value_dim / 128;
-        value_heads * 128 * (key_dim / key_heads)
-    }
-
     fn forward(
         &self,
         runtime: &MetalRuntime,
         weights: &NativeWeights,
         input: &[f32],
-        state: &mut LinearState,
+        state: &mut MetalDeltaNetState,
         eps: f32,
     ) -> Result<Vec<f32>, NativeError> {
-        let qkv = weights.q4_affine_matvec(runtime, &self.in_proj_qkv, input)?;
-        let z = weights.q4_affine_matvec(runtime, &self.in_proj_z, input)?;
-        let b = weights.q4_affine_matvec(runtime, &self.in_proj_b, input)?;
-        let a = weights.q4_affine_matvec(runtime, &self.in_proj_a, input)?;
-        let mut conv_out = vec![0.0; qkv.len()];
-        let kernel_size = self.conv_kernel_size();
-        for channel in 0..qkv.len() {
-            let state_offset = channel * (kernel_size - 1);
-            let weight_offset = channel * kernel_size;
-            let mut value = 0.0;
-            for tap in 0..kernel_size - 1 {
-                value += self.conv_weight[weight_offset + tap] * state.conv[state_offset + tap];
-            }
-            value += self.conv_weight[weight_offset + kernel_size - 1] * qkv[channel];
-            conv_out[channel] = silu(value);
-            if kernel_size > 1 {
-                state.conv.copy_within(
-                    state_offset + 1..state_offset + kernel_size - 1,
-                    state_offset,
-                );
-                state.conv[state_offset + kernel_size - 2] = qkv[channel];
-            }
-        }
-        let key_dim = (qkv.len() - z.len()) / 2;
-        let value_dim = z.len();
-        let key_heads = 16;
-        let value_heads = value_dim / 128;
-        let key_head_dim = key_dim / key_heads;
-        let mut query = vec![0.0; key_dim];
-        let mut key = vec![0.0; key_dim];
-        let value = &conv_out[key_dim * 2..];
-        query.copy_from_slice(&conv_out[..key_dim]);
-        key.copy_from_slice(&conv_out[key_dim..key_dim * 2]);
-        let inv_scale = (key_head_dim as f32).sqrt().recip();
-        for head in 0..key_heads {
-            let start = head * key_head_dim;
-            let query_norm = rms_norm_slice(
-                &query[start..start + key_head_dim],
-                &vec![1.0; key_head_dim],
-                eps,
-            );
-            let key_norm = rms_norm_slice(
-                &key[start..start + key_head_dim],
-                &vec![1.0; key_head_dim],
-                eps,
-            );
-            query[start..start + key_head_dim]
-                .iter_mut()
-                .zip(query_norm)
-                .for_each(|(destination, value)| *destination = value * inv_scale * inv_scale);
-            key[start..start + key_head_dim]
-                .iter_mut()
-                .zip(key_norm)
-                .for_each(|(destination, value)| *destination = value * inv_scale);
-        }
-
-        let beta: Vec<f32> = b.into_iter().map(sigmoid).collect();
-        let mut decay = Vec::with_capacity(value_heads);
-        for (head, a_value) in a.iter().take(value_heads).enumerate() {
-            let gate = *a_value + self.dt_bias[head];
-            decay.push((-self.a_log[head].exp() * softplus(gate)).exp());
-        }
-        let mut output = vec![0.0; value_dim];
-        let repeat = value_heads / key_heads;
-        for value_head in 0..value_heads {
-            let key_head = value_head / repeat;
-            let q_offset = key_head * key_head_dim;
-            let v_offset = value_head * 128;
-            for value_index in 0..128 {
-                let state_offset = (value_head * 128 + value_index) * key_head_dim;
-                let mut kv_mem = 0.0;
-                for key_index in 0..key_head_dim {
-                    state.recurrent[state_offset + key_index] *= decay[value_head];
-                    kv_mem += state.recurrent[state_offset + key_index] * key[q_offset + key_index];
-                }
-                let delta = (value[v_offset + value_index] - kv_mem) * beta[value_head];
-                let mut output_value = 0.0;
-                for key_index in 0..key_head_dim {
-                    state.recurrent[state_offset + key_index] += key[q_offset + key_index] * delta;
-                    output_value +=
-                        state.recurrent[state_offset + key_index] * query[q_offset + key_index];
-                }
-                output[v_offset + value_index] = output_value;
-            }
-        }
-        for value_head in 0..value_heads {
-            let offset = value_head * 128;
-            let normalized = rms_norm_slice(&output[offset..offset + 128], &self.norm, eps);
-            for index in 0..128 {
-                output[offset + index] = normalized[index] * silu(z[offset + index]);
-            }
-        }
+        let mut projections = weights.q4_affine_matvec_batch(
+            runtime,
+            &[
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &self.in_proj_b,
+                &self.in_proj_a,
+            ],
+            input,
+        )?;
+        let qkv = projections.remove(0);
+        let z = projections.remove(0);
+        let b = projections.remove(0);
+        let a = projections.remove(0);
+        let output = runtime
+            .deltanet_step(&self.delta, state, &qkv, &z, &b, &a, eps)
+            .map_err(NativeError::Metal)?;
         let projected = weights.q4_affine_matvec(runtime, &self.out_proj, &output)?;
         Ok(projected)
     }
@@ -1958,16 +1975,21 @@ impl FullLayerWeights {
         runtime: &MetalRuntime,
         weights: &NativeWeights,
         input: &[f32],
-        state: &mut FullState,
+        state: &mut Q8KvState,
         position: MropePosition,
         rope: RopeParameters,
         eps: f32,
     ) -> Result<Vec<f32>, NativeError> {
-        let q_with_gate = weights.q4_affine_matvec(runtime, &self.q_proj, input)?;
+        let mut projections = weights.q4_affine_matvec_batch(
+            runtime,
+            &[&self.q_proj, &self.k_proj, &self.v_proj],
+            input,
+        )?;
+        let q_with_gate = projections.remove(0);
         let (mut query, gate) =
             split_query_and_gate(&q_with_gate, self.num_attention_heads, self.head_dim)?;
-        let mut key = weights.q4_affine_matvec(runtime, &self.k_proj, input)?;
-        let value = weights.q4_affine_matvec(runtime, &self.v_proj, input)?;
+        let mut key = projections.remove(0);
+        let value = projections.remove(0);
         let num_heads = self.num_attention_heads;
         let kv_heads = self.num_key_value_heads;
         let head_dim = self.head_dim;
@@ -2005,45 +2027,9 @@ impl FullLayerWeights {
             );
         }
 
-        state.keys.extend(key.into_iter().map(f32_to_bf16));
-        state.values.extend(value.into_iter().map(f32_to_bf16));
-        let sequence_length = state.keys.len() / (kv_heads * head_dim);
-        let mut attention_output = vec![0.0; num_heads * head_dim];
-        let scale = (head_dim as f32).sqrt().recip();
-        for head in 0..num_heads {
-            let kv_head = head * kv_heads / num_heads;
-            let q_offset = head * head_dim;
-            let mut scores = Vec::with_capacity(sequence_length);
-            for token in 0..sequence_length {
-                let key_offset = (token * kv_heads + kv_head) * head_dim;
-                let dot = (0..head_dim).fold(0.0, |sum, index| {
-                    sum + query[q_offset + index] * bf16_to_f32(state.keys[key_offset + index])
-                });
-                scores.push(dot * scale);
-            }
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut denominator = 0.0;
-            for score in &mut scores {
-                *score = (*score - max_score).exp();
-                denominator += *score;
-            }
-            let output_offset = head * head_dim;
-            for (token, probability) in scores.iter().enumerate().take(sequence_length) {
-                let probability = *probability / denominator.max(f32::MIN_POSITIVE);
-                let value_offset = (token * kv_heads + kv_head) * head_dim;
-                for index in 0..head_dim {
-                    attention_output[output_offset + index] +=
-                        probability * bf16_to_f32(state.values[value_offset + index]);
-                }
-            }
-        }
-        for head in 0..num_heads {
-            let offset = head * head_dim;
-            let gate_offset = head * head_dim;
-            for index in 0..head_dim {
-                attention_output[offset + index] *= sigmoid(gate[gate_offset + index]);
-            }
-        }
+        let attention_output = runtime
+            .gqa_attention_q8(state, &query, &gate, &key, &value, num_heads)
+            .map_err(NativeError::Metal)?;
         weights.q4_affine_matvec(runtime, &self.o_proj, &attention_output)
     }
 }
@@ -2263,33 +2249,8 @@ fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
 }
 
-fn sigmoid(value: f32) -> f32 {
-    if value >= 0.0 {
-        1.0 / (1.0 + (-value).exp())
-    } else {
-        let exp = value.exp();
-        exp / (1.0 + exp)
-    }
-}
-
-fn softplus(value: f32) -> f32 {
-    if value > 20.0 {
-        value
-    } else if value < -20.0 {
-        value.exp()
-    } else {
-        (1.0 + value.exp()).ln()
-    }
-}
-
 fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
 }
 
 fn sample_token(logits: &[f32], temperature: Option<f32>, top_p: Option<f32>, seed: u64) -> u32 {
@@ -2633,6 +2594,8 @@ pub enum NativeError {
         maximum: u32,
     },
     Unavailable(String),
+    Streaming(String),
+    Preflight(crate::preflight::PreflightError),
 }
 
 impl fmt::Display for NativeError {
@@ -2720,6 +2683,8 @@ impl fmt::Display for NativeError {
                 )
             }
             Self::Unavailable(message) => write!(formatter, "native model unavailable: {message}"),
+            Self::Streaming(message) => write!(formatter, "stream receiver unavailable: {message}"),
+            Self::Preflight(error) => write!(formatter, "cannot inspect MTP capability: {error}"),
         }
     }
 }
@@ -2749,10 +2714,12 @@ impl Error for NativeError {
             | Self::Image(_)
             | Self::TokenOutOfRange(_)
             | Self::ContextLimit { .. }
-            | Self::Unavailable(_) => None,
+            | Self::Unavailable(_)
+            | Self::Streaming(_) => None,
             Self::ConfigRead { source, .. } => Some(source),
             Self::ConfigJson(error) => Some(error),
             Self::GenerationConfigJson(error) => Some(error),
+            Self::Preflight(error) => Some(error),
         }
     }
 }

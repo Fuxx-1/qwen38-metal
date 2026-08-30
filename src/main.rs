@@ -92,7 +92,7 @@ fn print_help() {
          memory budget. `q4-probe` validates MLX Q4 Metal execution for one projection.\n\
          `preflight` detects native MTP weights. Native inference defaults to one generation\n\
          lane and a 64-request bounded queue; increase lanes only after measuring the target\n\
-         workload because this runtime does not yet use continuous batching."
+         workload because this runtime uses latency-oriented per-request state instead of continuous batching."
     );
 }
 

@@ -19,7 +19,7 @@ target/release/qwen38-metal serve \
 
 The server binds to `127.0.0.1:8000` by default. A non-loopback bind requires both `--allow-remote` and `--api-key` or `--api-key-env`, preventing an unprotected local model from being exposed accidentally.
 
-`--fixture-response` starts a protocol-only fixture server and never loads model weights. It is intended for CI and client integration tests, not production inference. `--generation-concurrency` controls how many requests may execute at once; `--max-queued-requests` includes active requests and bounds the waiting queue. Native Qwen defaults to one lane because it does not yet batch prefill or decode work. Increasing lanes is supported but must be measured for the target workload because it can reduce per-request throughput.
+`--fixture-response` starts a protocol-only fixture server and never loads model weights. It is intended for CI and client integration tests, not production inference. `--generation-concurrency` controls how many requests may execute at once; `--max-queued-requests` includes active requests and bounds the waiting queue. Native Qwen defaults to one lane because recurrent state is latency-oriented; it already batches same-input projections and keeps per-request state isolated. Increasing lanes is supported but must be measured for the target workload because it can reduce per-request throughput.
 
 ## Compatible endpoints
 
@@ -30,7 +30,7 @@ The server binds to `127.0.0.1:8000` by default. A non-loopback bind requires bo
 
 OpenAI accepts `system`, `developer`, `user`, `assistant`, and `tool` messages. Anthropic requires the `anthropic-version` header and accepts `system`, `user`, and `assistant` messages. Image inputs may be base64 data, or a public `http(s)` URL; downloads reject local and private network targets, cap compressed bytes at 16 MiB, and validate decoded dimensions before inference. Tool execution remains with the API client: the server emits a requested call, then accepts the client-provided result in a later request.
 
-Both APIs return standard SSE framing when `stream` is enabled. The present inference core completes a generation before the protocol layer emits its response chunks, so streaming is compatible with event-driven clients but does not yet reduce time-to-first-token. Token-forward streaming is part of the future batched scheduler work.
+Both APIs return standard SSE framing when `stream` is enabled. Native decoding forwards each decoded token immediately: OpenAI receives content/reasoning deltas, and Anthropic receives incremental `thinking_delta` or `text_delta` blocks. Tool-call markup is withheld until it has been parsed into a structured call, so clients never receive the model's internal XML protocol as visible text.
 
 Example OpenAI request:
 
@@ -68,13 +68,17 @@ curl http://127.0.0.1:8000/v1/messages \
 
 ## Runtime design
 
-Weights remain file-mapped rather than being expanded to floating point. The fast Q4 matvec kernel reads aligned `U32` and `BF16` safetensor regions directly. Safetensors headers are not required to leave their data region aligned, so the runtime automatically switches only affected projections to a byte-addressed Metal kernel. That path keeps the same mapped bytes and avoids a second copy of a multi-gigabyte shard.
+Weights remain file-mapped rather than being expanded to floating point. The fast Q4 matvec kernel reads aligned `U32` and `BF16` safetensor regions directly. Q/K/V, DeltaNet's four input projections, and MLP gate/up projections share one activation upload and command buffer; reusable shared buffers avoid steady-state allocation churn. Safetensors headers are not required to leave their data region aligned, so the runtime automatically switches only affected projections to a byte-addressed Metal kernel. That path keeps the same mapped bytes and avoids a second copy of a multi-gigabyte shard.
+
+DeltaNet convolution, q/k preparation, recurrent state update, and output gating run in the precompiled Metal library. Full GQA attention uses dynamically growing Q8 KV buffers with per-token/head scales and keeps attention score/value work on Metal. Prompt ingestion is an explicit prefill phase which reserves active KV capacity before its causal scan; it does not reserve 262K KV pages at request start.
+
+The published Qwen3.8 MLX 4-bit export declares one MTP layer but omits its tensors. The runtime therefore exposes speculative decoding as unavailable and executes verified standard decode. It will not claim MTP speedup until a matching verifier and proposer are loaded.
 
 ## Memory target
 
 The default profile is one 262,144-token stream with Q8 paged KV. For the currently configured Qwen3.8-27B geometry, the KV data is 8 GiB plus about 1 MiB of per-page FP32 scales. The budgeting model reserves 17 GiB for mixed Q4 weights, 3 GiB for workspace, and 12 GiB for macOS and application headroom, leaving about 8 GiB under the 48 GiB unified-memory budget.
 
-BF16 KV needs 16 GiB at the same context length and exceeds that planning budget. Q4 KV requires about 4 GiB before page scales, but is intended as an experimental capacity mode until its quality and kernel cost are measured. The plan is a capacity model, not a substitute for measuring the exact model, context length, and request shape before setting a production limit.
+BF16 KV needs 16 GiB at the same context length and exceeds that planning budget. Q4 KV requires about 4 GiB before page scales, but is intended as an experimental capacity mode until its quality and kernel cost are measured. The plan is a capacity model, not a substitute for measuring the exact model, context length, and request shape before setting a production limit. The native runtime begins with small Q8 allocations and doubles active KV capacity only when a sequence reaches the current bound.
 
 ## Commands
 

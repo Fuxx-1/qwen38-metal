@@ -258,3 +258,312 @@ kernel void qwen38_vision_attention_values(
     }
     output[(query * num_heads + head) * head_dim + dimension] = sum;
 }
+
+inline float qwen38_sigmoid(float value) {
+    return 1.0f / (1.0f + exp(-value));
+}
+
+inline float qwen38_silu(float value) {
+    return value * qwen38_sigmoid(value);
+}
+
+inline float qwen38_softplus(float value) {
+    if (value > 20.0f) {
+        return value;
+    }
+    if (value < -20.0f) {
+        return exp(value);
+    }
+    return log(1.0f + exp(value));
+}
+
+// DeltaNet first applies its depthwise causal convolution and keeps its short
+// history on the GPU. Every channel is independent at this stage.
+kernel void qwen38_deltanet_conv(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* history [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& channels [[buffer(4)]],
+    constant uint& kernel_size [[buffer(5)]],
+    uint channel [[thread_position_in_grid]]) {
+    if (channel >= channels) {
+        return;
+    }
+    const uint weight_base = channel * kernel_size;
+    const uint history_width = kernel_size - 1;
+    const uint history_base = channel * history_width;
+    float sum = weights[weight_base + history_width] * input[channel];
+    for (uint tap = 0; tap < history_width; ++tap) {
+        sum += weights[weight_base + tap] * history[history_base + tap];
+    }
+    output[channel] = qwen38_silu(sum);
+    if (history_width > 0) {
+        for (uint tap = 0; tap + 1 < history_width; ++tap) {
+            history[history_base + tap] = history[history_base + tap + 1];
+        }
+        history[history_base + history_width - 1] = input[channel];
+    }
+}
+
+// Qwen's linear-attention q/k vectors are normalized headwise after the
+// convolution. The normalized values replace the q/k portion in-place.
+kernel void qwen38_deltanet_prepare(
+    device float* convolved [[buffer(0)]],
+    constant uint& key_heads [[buffer(1)]],
+    constant uint& key_head_dim [[buffer(2)]],
+    constant float& epsilon [[buffer(3)]],
+    threadgroup float* query_partial [[threadgroup(0)]],
+    threadgroup float* key_partial [[threadgroup(1)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    if (head >= key_heads) {
+        return;
+    }
+    const uint key_elements = key_heads * key_head_dim;
+    const uint query_offset = head * key_head_dim;
+    const uint key_offset = key_elements + query_offset;
+    float query = 0.0f;
+    float key = 0.0f;
+    if (thread_index < key_head_dim) {
+        query = convolved[query_offset + thread_index];
+        key = convolved[key_offset + thread_index];
+    }
+    query_partial[thread_index] = query * query;
+    key_partial[thread_index] = key * key;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            query_partial[thread_index] += query_partial[thread_index + stride];
+            key_partial[thread_index] += key_partial[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index < key_head_dim) {
+        const float inverse_head_scale = rsqrt(float(key_head_dim));
+        const float query_scale = rsqrt(query_partial[0] / float(key_head_dim) + epsilon);
+        const float key_scale = rsqrt(key_partial[0] / float(key_head_dim) + epsilon);
+        convolved[query_offset + thread_index] = query * query_scale
+            * inverse_head_scale * inverse_head_scale;
+        convolved[key_offset + thread_index] = key * key_scale * inverse_head_scale;
+    }
+}
+
+// One threadgroup updates one DeltaNet value head. Each active SIMD lane owns
+// one value row and keeps its 128-element reduction private, avoiding 128
+// tiny threadgroups per head while preserving the recurrence order.
+kernel void qwen38_deltanet_recurrence(
+    device const float* convolved [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const float* b [[buffer(2)]],
+    device const float* a [[buffer(3)]],
+    device const float* a_log [[buffer(4)]],
+    device const float* dt_bias [[buffer(5)]],
+    device float* recurrent [[buffer(6)]],
+    device float* output [[buffer(7)]],
+    constant uint& key_heads [[buffer(8)]],
+    constant uint& value_heads [[buffer(9)]],
+    constant uint& key_head_dim [[buffer(10)]],
+    constant uint& value_head_dim [[buffer(11)]],
+    uint value_head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint value_index = thread_index;
+    if (value_head >= value_heads || value_index >= value_head_dim) {
+        return;
+    }
+    const uint key_elements = key_heads * key_head_dim;
+    const uint repeat = value_heads / key_heads;
+    const uint key_head = value_head / repeat;
+    const uint key_offset = key_elements + key_head * key_head_dim;
+    const uint query_offset = key_head * key_head_dim;
+    const uint state_base = (value_head * value_head_dim + value_index) * key_head_dim;
+    const float decay = exp(-exp(a_log[value_head])
+        * qwen38_softplus(a[value_head] + dt_bias[value_head]));
+    const float beta = qwen38_sigmoid(b[value_head]);
+    float kv_mem = 0.0f;
+    for (uint key_index = 0; key_index < key_head_dim; ++key_index) {
+        const uint state_index = state_base + key_index;
+        const float state_value = recurrent[state_index] * decay;
+        recurrent[state_index] = state_value;
+        kv_mem += state_value * convolved[key_offset + key_index];
+    }
+    const uint value_offset = 2 * key_elements + value_head * value_head_dim + value_index;
+    const float delta = (convolved[value_offset] - kv_mem) * beta;
+    float output_value = 0.0f;
+    for (uint key_index = 0; key_index < key_head_dim; ++key_index) {
+        const uint state_index = state_base + key_index;
+        const float state_value = recurrent[state_index]
+            + convolved[key_offset + key_index] * delta;
+        recurrent[state_index] = state_value;
+        output_value += state_value * convolved[query_offset + key_index];
+    }
+    output[value_head * value_head_dim + value_index] = output_value;
+}
+
+kernel void qwen38_deltanet_gate_norm(
+    device float* output [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const float* norm [[buffer(2)]],
+    constant uint& value_heads [[buffer(3)]],
+    constant uint& value_head_dim [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint value_head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    if (value_head >= value_heads) {
+        return;
+    }
+    const uint offset = value_head * value_head_dim;
+    const float value = thread_index < value_head_dim ? output[offset + thread_index] : 0.0f;
+    partial[thread_index] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            partial[thread_index] += partial[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index < value_head_dim) {
+        const float scale = rsqrt(partial[0] / float(value_head_dim) + epsilon);
+        output[offset + thread_index] = value * scale * norm[thread_index]
+            * qwen38_silu(z[offset + thread_index]);
+    }
+}
+
+// Full-attention KV is stored as Q8 plus a scale per token/head. Pages are
+// grown by the Rust runtime only when the active sequence crosses capacity.
+kernel void qwen38_q8_kv_append(
+    device const float* key_input [[buffer(0)]],
+    device const float* value_input [[buffer(1)]],
+    device char* keys [[buffer(2)]],
+    device char* values [[buffer(3)]],
+    device float* key_scales [[buffer(4)]],
+    device float* value_scales [[buffer(5)]],
+    constant uint& kv_heads [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    constant uint& token_index [[buffer(8)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint2 head_kind [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint head = head_kind.x;
+    const uint kind = head_kind.y;
+    if (head >= kv_heads || kind > 1) {
+        return;
+    }
+    const uint input_offset = head * head_dim;
+    const float value = thread_index < head_dim
+        ? (kind == 0 ? key_input[input_offset + thread_index]
+                     : value_input[input_offset + thread_index])
+        : 0.0f;
+    partial[thread_index] = abs(value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            partial[thread_index] = max(partial[thread_index], partial[thread_index + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = max(partial[0] / 127.0f, FLT_MIN);
+    const uint scale_index = token_index * kv_heads + head;
+    const uint output_offset = (token_index * kv_heads + head) * head_dim;
+    if (thread_index == 0) {
+        if (kind == 0) {
+            key_scales[scale_index] = scale;
+        } else {
+            value_scales[scale_index] = scale;
+        }
+    }
+    if (thread_index < head_dim) {
+        const char quantized = char(round(clamp(value / scale, -127.0f, 127.0f)));
+        if (kind == 0) {
+            keys[output_offset + thread_index] = quantized;
+        } else {
+            values[output_offset + thread_index] = quantized;
+        }
+    }
+}
+
+kernel void qwen38_gqa_q8_scores(
+    device const float* query [[buffer(0)]],
+    device const char* keys [[buffer(1)]],
+    device const float* key_scales [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    constant uint& sequence_length [[buffer(4)]],
+    constant uint& num_heads [[buffer(5)]],
+    constant uint& kv_heads [[buffer(6)]],
+    constant uint& head_dim [[buffer(7)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    if (head >= num_heads) {
+        return;
+    }
+    const uint kv_head = head * kv_heads / num_heads;
+    const uint query_offset = head * head_dim;
+    const uint score_offset = head * sequence_length;
+    float local_max = -INFINITY;
+    for (uint token = thread_index; token < sequence_length; token += 256) {
+        const uint key_offset = (token * kv_heads + kv_head) * head_dim;
+        const float scale = key_scales[token * kv_heads + kv_head];
+        float score = 0.0f;
+        for (uint dimension = 0; dimension < head_dim; ++dimension) {
+            score += query[query_offset + dimension] * float(keys[key_offset + dimension]) * scale;
+        }
+        score *= rsqrt(float(head_dim));
+        scores[score_offset + token] = score;
+        local_max = max(local_max, score);
+    }
+    partial[thread_index] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            partial[thread_index] = max(partial[thread_index], partial[thread_index + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float maximum = partial[0];
+    float local_sum = 0.0f;
+    for (uint token = thread_index; token < sequence_length; token += 256) {
+        const float probability = exp(scores[score_offset + token] - maximum);
+        scores[score_offset + token] = probability;
+        local_sum += probability;
+    }
+    partial[thread_index] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            partial[thread_index] += partial[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint token = thread_index; token < sequence_length; token += 256) {
+        scores[score_offset + token] /= max(partial[0], FLT_MIN);
+    }
+}
+
+kernel void qwen38_gqa_q8_values(
+    device const float* scores [[buffer(0)]],
+    device const char* values [[buffer(1)]],
+    device const float* value_scales [[buffer(2)]],
+    device const float* gate [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& sequence_length [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& kv_heads [[buffer(7)]],
+    constant uint& head_dim [[buffer(8)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint dimension [[thread_index_in_threadgroup]]) {
+    if (head >= num_heads || dimension >= head_dim) {
+        return;
+    }
+    const uint kv_head = head * kv_heads / num_heads;
+    const uint score_offset = head * sequence_length;
+    float sum = 0.0f;
+    for (uint token = 0; token < sequence_length; ++token) {
+        const uint value_offset = (token * kv_heads + kv_head) * head_dim + dimension;
+        sum += scores[score_offset + token] * float(values[value_offset])
+            * value_scales[token * kv_heads + kv_head];
+    }
+    const uint output_offset = head * head_dim + dimension;
+    output[output_offset] = sum * qwen38_sigmoid(gate[output_offset]);
+}

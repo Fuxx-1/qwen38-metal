@@ -1,5 +1,83 @@
+use crate::preflight::MtpSupport;
 use std::error::Error;
 use std::fmt;
+
+/// The decoder only enables speculative execution when it has an executable
+/// verifier and a matching proposer. Declaring MTP in config is not enough:
+/// MLX exports can omit the MTP tensors entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeculativeDecodeSupport {
+    Unavailable(SpeculativeUnavailableReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeculativeUnavailableReason {
+    NotDeclared,
+    WeightsMissing {
+        configured_layers: u32,
+    },
+    VerifierNotImplemented {
+        configured_layers: u32,
+        tensor_count: usize,
+    },
+}
+
+impl SpeculativeDecodeSupport {
+    pub fn from_mtp_support(support: &MtpSupport) -> Self {
+        Self::Unavailable(match support {
+            MtpSupport::NotDeclared => SpeculativeUnavailableReason::NotDeclared,
+            MtpSupport::DeclaredButWeightsMissing { configured_layers } => {
+                SpeculativeUnavailableReason::WeightsMissing {
+                    configured_layers: *configured_layers,
+                }
+            }
+            MtpSupport::Available {
+                configured_layers,
+                tensor_count,
+            } => SpeculativeUnavailableReason::VerifierNotImplemented {
+                configured_layers: *configured_layers,
+                tensor_count: *tensor_count,
+            },
+        })
+    }
+
+    /// Zero is intentional: callers must take the normal decode path instead
+    /// of advertising a speculative depth that cannot be verified.
+    pub fn proposal_depth(&self) -> u8 {
+        0
+    }
+
+    pub fn is_available(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Display for SpeculativeDecodeSupport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(reason) => write!(formatter, "unavailable: {reason}"),
+        }
+    }
+}
+
+impl fmt::Display for SpeculativeUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDeclared => write!(formatter, "the model does not declare MTP"),
+            Self::WeightsMissing { configured_layers } => write!(
+                formatter,
+                "the model declares {configured_layers} MTP layer(s), but their tensors are absent"
+            ),
+            Self::VerifierNotImplemented {
+                configured_layers,
+                tensor_count,
+            } => write!(
+                formatter,
+                "the model exposes {tensor_count} tensors for {configured_layers} MTP layer(s), but no verifier has been loaded"
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MtpController {
@@ -129,5 +207,16 @@ mod tests {
         let mut controller = MtpController::new(1, 3, 3).unwrap();
         assert_eq!(controller.observe(3, 0).unwrap(), 2);
         assert_eq!(controller.observe(2, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn missing_mtp_weights_never_advertise_speculation() {
+        let support =
+            SpeculativeDecodeSupport::from_mtp_support(&MtpSupport::DeclaredButWeightsMissing {
+                configured_layers: 1,
+            });
+        assert!(!support.is_available());
+        assert_eq!(support.proposal_depth(), 0);
+        assert!(support.to_string().contains("tensors are absent"));
     }
 }

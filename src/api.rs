@@ -13,6 +13,7 @@ use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     error::Error,
     fmt,
@@ -25,7 +26,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, sync::Semaphore, task};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, Semaphore},
+    task,
+};
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REMOTE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -197,12 +202,29 @@ pub struct Generation {
     pub finish_reason: FinishReason,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenerationEvent {
+    Started { input_tokens: u32 },
+    RawToken(String),
+    Finished(Generation),
+}
+
 pub trait InferenceEngine: Send + Sync + 'static {
     fn descriptor(&self) -> ModelDescriptor;
 
     fn estimate_prompt_tokens(&self, request: &GenerationRequest) -> Result<u32, EngineError>;
 
     fn generate(&self, request: GenerationRequest) -> Result<Generation, EngineError>;
+
+    fn generate_stream(
+        &self,
+        request: GenerationRequest,
+        callback: &mut dyn FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<Generation, EngineError> {
+        let generation = self.generate(request)?;
+        callback(GenerationEvent::Finished(generation.clone()))?;
+        Ok(generation)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +614,56 @@ impl ApiState {
         .map_err(|error| ApiFailure::internal(format!("inference worker failed: {error}")))?
         .map_err(ApiFailure::from_engine)
     }
+
+    async fn generate_stream(
+        &self,
+        request: GenerationRequest,
+    ) -> Result<mpsc::Receiver<Result<GenerationEvent, EngineError>>, ApiFailure> {
+        let queue_slot = self
+            .queue_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiFailure::busy())?;
+        let generation_lanes = self.generation_lanes.clone();
+        let engine = self.engine.clone();
+        let (sender, receiver) = mpsc::channel(32);
+        task::spawn(async move {
+            let _queue_slot = queue_slot;
+            let permit = match generation_lanes.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = sender
+                        .send(Err(EngineError::Unavailable(
+                            "generation scheduler stopped".to_owned(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let worker_sender = sender.clone();
+            let result = task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut callback = |event| {
+                    worker_sender.blocking_send(Ok(event)).map_err(|_| {
+                        EngineError::Unavailable("stream receiver disconnected".to_owned())
+                    })
+                };
+                engine.generate_stream(request, &mut callback)
+            })
+            .await;
+            let failure = match result {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(EngineError::Failure(format!(
+                    "inference worker failed: {error}"
+                ))),
+            };
+            if let Some(error) = failure {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Ok(receiver)
+    }
 }
 
 struct IdentifierSource {
@@ -748,23 +820,29 @@ async fn openai_chat_completions(
         Err(error) => return openai_error(error),
     };
 
-    let mut generation = match state.generate(request.generation).await {
-        Ok(generation) => generation,
-        Err(error) => return openai_error(error),
-    };
     let identifier = state.identifiers.next("chatcmpl");
     let created = unix_seconds();
-    assign_tool_call_ids(&mut generation, &identifier);
 
     if request.stream {
-        openai_stream(
+        let tools_enabled = !request.generation.tools.is_empty();
+        let receiver = match state.generate_stream(request.generation).await {
+            Ok(receiver) => receiver,
+            Err(error) => return openai_error(error),
+        };
+        openai_live_stream(
             identifier,
             created,
             state.descriptor().id,
-            generation,
+            receiver,
             request.include_usage,
+            tools_enabled,
         )
     } else {
+        let mut generation = match state.generate(request.generation).await {
+            Ok(generation) => generation,
+            Err(error) => return openai_error(error),
+        };
+        assign_tool_call_ids(&mut generation, &identifier);
         let finish_reason = generation.finish_reason.openai_label();
         let usage = OpenAiUsage::from_generation(&generation);
         Json(OpenAiChatResponse {
@@ -783,132 +861,367 @@ async fn openai_chat_completions(
     }
 }
 
-fn openai_stream(
+struct OpenAiStreamState {
+    receiver: mpsc::Receiver<Result<GenerationEvent, EngineError>>,
+    output: StreamingOutputParser,
+    pending: VecDeque<Event>,
     identifier: String,
     created: u64,
     model: String,
-    generation: Generation,
     include_usage: bool,
+    finished: bool,
+}
+
+fn openai_live_stream(
+    identifier: String,
+    created: u64,
+    model: String,
+    receiver: mpsc::Receiver<Result<GenerationEvent, EngineError>>,
+    include_usage: bool,
+    tools_enabled: bool,
 ) -> Response {
-    let mut events = Vec::new();
-    events.push(
-        Event::default().data(
-            json!({
-                "id": &identifier,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": &model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": Value::Null
-                }]
-            })
-            .to_string(),
-        ),
-    );
+    let mut pending = VecDeque::new();
+    pending.push_back(openai_chunk(
+        &identifier,
+        created,
+        &model,
+        json!({"role": "assistant"}),
+        Value::Null,
+    ));
+    let state = OpenAiStreamState {
+        receiver,
+        output: StreamingOutputParser::new(false, tools_enabled),
+        pending,
+        identifier,
+        created,
+        model,
+        include_usage,
+        finished: false,
+    };
+    Sse::new(stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                return Some((Ok::<Event, Infallible>(event), state));
+            }
+            if state.finished {
+                return None;
+            }
+            match state.receiver.recv().await {
+                Some(Ok(GenerationEvent::Started { .. })) => {}
+                Some(Ok(GenerationEvent::RawToken(raw))) => {
+                    for delta in state.output.push_raw(&raw) {
+                        state.pending.push_back(openai_delta_chunk(
+                            &state.identifier,
+                            state.created,
+                            &state.model,
+                            delta,
+                        ));
+                    }
+                }
+                Some(Ok(GenerationEvent::Finished(mut generation))) => {
+                    if !state.output.saw_raw() {
+                        for delta in generation_deltas(&generation) {
+                            state.pending.push_back(openai_delta_chunk(
+                                &state.identifier,
+                                state.created,
+                                &state.model,
+                                delta,
+                            ));
+                        }
+                    }
+                    for delta in state.output.finish() {
+                        state.pending.push_back(openai_delta_chunk(
+                            &state.identifier,
+                            state.created,
+                            &state.model,
+                            delta,
+                        ));
+                    }
+                    assign_tool_call_ids(&mut generation, &state.identifier);
+                    for (index, call) in generation.tool_calls.iter().enumerate() {
+                        let arguments =
+                            serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
+                        state.pending.push_back(openai_chunk(
+                            &state.identifier,
+                            state.created,
+                            &state.model,
+                            json!({"tool_calls": [{
+                                "index": index,
+                                "id": &call.id,
+                                "type": "function",
+                                "function": {"name": &call.name, "arguments": arguments}
+                            }]}),
+                            Value::Null,
+                        ));
+                    }
+                    state.pending.push_back(openai_chunk(
+                        &state.identifier,
+                        state.created,
+                        &state.model,
+                        json!({}),
+                        Value::String(generation.finish_reason.openai_label().to_owned()),
+                    ));
+                    if state.include_usage {
+                        state.pending.push_back(Event::default().data(
+                            json!({
+                                "id": &state.identifier,
+                                "object": "chat.completion.chunk",
+                                "created": state.created,
+                                "model": &state.model,
+                                "choices": [],
+                                "usage": OpenAiUsage::from_generation(&generation)
+                            })
+                            .to_string(),
+                        ));
+                    }
+                    state.pending.push_back(Event::default().data("[DONE]"));
+                    state.finished = true;
+                }
+                Some(Err(error)) => {
+                    state.pending.push_back(Event::default().data(
+                        json!({
+                            "error": {"message": error.to_string(), "type": "server_error"}
+                        })
+                        .to_string(),
+                    ));
+                    state.pending.push_back(Event::default().data("[DONE]"));
+                    state.finished = true;
+                }
+                None => {
+                    state.pending.push_back(Event::default().data(
+                        json!({
+                            "error": {"message": "generation stream ended unexpectedly", "type": "server_error"}
+                        })
+                        .to_string(),
+                    ));
+                    state.pending.push_back(Event::default().data("[DONE]"));
+                    state.finished = true;
+                }
+            }
+        }
+    }))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
+fn openai_chunk(
+    identifier: &str,
+    created: u64,
+    model: &str,
+    delta: Value,
+    finish_reason: Value,
+) -> Event {
+    Event::default().data(
+        json!({
+            "id": identifier,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn openai_delta_chunk(
+    identifier: &str,
+    created: u64,
+    model: &str,
+    delta: StreamOutputDelta,
+) -> Event {
+    let delta = match delta {
+        StreamOutputDelta::Reasoning(text) => json!({"reasoning_content": text}),
+        StreamOutputDelta::Text(text) => json!({"content": text}),
+    };
+    openai_chunk(identifier, created, model, delta, Value::Null)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutputMode {
+    Reasoning,
+    Text,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamOutputDelta {
+    Reasoning(String),
+    Text(String),
+}
+
+struct StreamingOutputParser {
+    mode: StreamOutputMode,
+    tools_enabled: bool,
+    pending: String,
+    initial_reasoning: bool,
+    trim_answer_newlines: usize,
+    saw_raw: bool,
+}
+
+impl StreamingOutputParser {
+    fn new(thinking_enabled: bool, tools_enabled: bool) -> Self {
+        Self {
+            mode: if thinking_enabled {
+                StreamOutputMode::Reasoning
+            } else {
+                StreamOutputMode::Text
+            },
+            tools_enabled,
+            pending: String::new(),
+            initial_reasoning: thinking_enabled,
+            trim_answer_newlines: 0,
+            saw_raw: false,
+        }
+    }
+
+    fn saw_raw(&self) -> bool {
+        self.saw_raw
+    }
+
+    fn push_raw(&mut self, raw: &str) -> Vec<StreamOutputDelta> {
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        self.saw_raw = true;
+        self.pending.push_str(raw);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Vec<StreamOutputDelta> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finished: bool) -> Vec<StreamOutputDelta> {
+        const OPEN_THINK: &str = "<think>\n";
+        const CLOSE_THINK: &str = "</think>";
+        const OPEN_TOOL: &str = "<tool_call>";
+        const CLOSE_TOOL: &str = "</tool_call>";
+
+        let mut deltas = Vec::new();
+        loop {
+            match self.mode {
+                StreamOutputMode::Reasoning => {
+                    if self.initial_reasoning {
+                        if self.pending.starts_with(OPEN_THINK) {
+                            self.pending.drain(..OPEN_THINK.len());
+                            self.initial_reasoning = false;
+                            continue;
+                        }
+                        if !finished && OPEN_THINK.starts_with(&self.pending) {
+                            break;
+                        }
+                        self.initial_reasoning = false;
+                    }
+                    if self.pending.starts_with(CLOSE_THINK) {
+                        self.pending.drain(..CLOSE_THINK.len());
+                        self.mode = StreamOutputMode::Text;
+                        self.trim_answer_newlines = 2;
+                        continue;
+                    }
+                    if !finished && CLOSE_THINK.starts_with(&self.pending) {
+                        break;
+                    }
+                    if let Some(end) = self.pending.find(CLOSE_THINK) {
+                        let text: String = self.pending.drain(..end).collect();
+                        if !text.is_empty() {
+                            deltas.push(StreamOutputDelta::Reasoning(text));
+                        }
+                        continue;
+                    }
+                    let hold = if finished {
+                        0
+                    } else {
+                        marker_suffix_len(&self.pending, CLOSE_THINK)
+                    };
+                    let emit_len = self.pending.len().saturating_sub(hold);
+                    if emit_len == 0 {
+                        break;
+                    }
+                    let text: String = self.pending.drain(..emit_len).collect();
+                    if !text.is_empty() {
+                        deltas.push(StreamOutputDelta::Reasoning(text));
+                    }
+                }
+                StreamOutputMode::Text => {
+                    while self.trim_answer_newlines > 0 && self.pending.starts_with('\n') {
+                        self.pending.remove(0);
+                        self.trim_answer_newlines -= 1;
+                    }
+                    if self.trim_answer_newlines > 0 && self.pending.is_empty() {
+                        break;
+                    }
+                    self.trim_answer_newlines = 0;
+                    if self.tools_enabled {
+                        if self.pending.starts_with(OPEN_TOOL) {
+                            self.pending.drain(..OPEN_TOOL.len());
+                            self.mode = StreamOutputMode::Tool;
+                            continue;
+                        }
+                        if !finished && OPEN_TOOL.starts_with(&self.pending) {
+                            break;
+                        }
+                        if let Some(start) = self.pending.find(OPEN_TOOL) {
+                            let text: String = self.pending.drain(..start).collect();
+                            if !text.is_empty() {
+                                deltas.push(StreamOutputDelta::Text(text));
+                            }
+                            continue;
+                        }
+                    }
+                    let hold = if finished || !self.tools_enabled {
+                        0
+                    } else {
+                        marker_suffix_len(&self.pending, OPEN_TOOL)
+                    };
+                    let emit_len = self.pending.len().saturating_sub(hold);
+                    if emit_len == 0 {
+                        break;
+                    }
+                    let text: String = self.pending.drain(..emit_len).collect();
+                    if !text.is_empty() {
+                        deltas.push(StreamOutputDelta::Text(text));
+                    }
+                }
+                StreamOutputMode::Tool => {
+                    let Some(end) = self.pending.find(CLOSE_TOOL) else {
+                        if finished {
+                            self.pending.clear();
+                        }
+                        break;
+                    };
+                    self.pending.drain(..end + CLOSE_TOOL.len());
+                    self.mode = StreamOutputMode::Text;
+                }
+            }
+        }
+        deltas
+    }
+}
+
+fn marker_suffix_len(value: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|length| value.ends_with(&marker[..*length]))
+        .unwrap_or(0)
+}
+
+fn generation_deltas(generation: &Generation) -> Vec<StreamOutputDelta> {
+    let mut deltas = Vec::new();
     if let Some(reasoning) = generation
         .reasoning
         .as_deref()
-        .filter(|text| !text.is_empty())
+        .filter(|reasoning| !reasoning.is_empty())
     {
-        events.push(
-            Event::default().data(
-                json!({
-                    "id": &identifier,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": &model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"reasoning_content": reasoning},
-                        "finish_reason": Value::Null
-                    }]
-                })
-                .to_string(),
-            ),
-        );
+        deltas.push(StreamOutputDelta::Reasoning(reasoning.to_owned()));
     }
     if !generation.text.is_empty() {
-        events.push(
-            Event::default().data(
-                json!({
-                    "id": &identifier,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": &model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": &generation.text},
-                        "finish_reason": Value::Null
-                    }]
-                })
-                .to_string(),
-            ),
-        );
+        deltas.push(StreamOutputDelta::Text(generation.text.clone()));
     }
-    for (index, call) in generation.tool_calls.iter().enumerate() {
-        let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
-        events.push(
-            Event::default().data(
-                json!({
-                    "id": &identifier,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": &model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"tool_calls": [{
-                            "index": index,
-                            "id": &call.id,
-                            "type": "function",
-                            "function": {"name": &call.name, "arguments": arguments}
-                        }]},
-                        "finish_reason": Value::Null
-                    }]
-                })
-                .to_string(),
-            ),
-        );
-    }
-    events.push(
-        Event::default().data(
-            json!({
-                "id": &identifier,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": &model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": generation.finish_reason.openai_label()
-                }]
-            })
-            .to_string(),
-        ),
-    );
-    if include_usage {
-        events.push(
-            Event::default().data(
-                json!({
-                    "id": identifier,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [],
-                    "usage": OpenAiUsage::from_generation(&generation)
-                })
-                .to_string(),
-            ),
-        );
-    }
-    events.push(Event::default().data("[DONE]"));
-
-    Sse::new(stream::iter(
-        events.into_iter().map(Ok::<Event, Infallible>),
-    ))
-    .keep_alive(KeepAlive::default())
-    .into_response()
+    deltas
 }
 
 #[derive(Debug, Deserialize)]
@@ -1679,16 +1992,28 @@ async fn anthropic_messages(
         Err(error) => return anthropic_error(error),
     };
 
-    let mut generation = match state.generate(request.generation).await {
-        Ok(generation) => generation,
-        Err(error) => return anthropic_error(error),
-    };
     let identifier = state.identifiers.next("msg");
-    assign_tool_call_ids(&mut generation, &identifier);
 
     if request.stream {
-        anthropic_stream(identifier, state.descriptor().id, generation)
+        let thinking_enabled = request.generation.thinking.enabled;
+        let tools_enabled = !request.generation.tools.is_empty();
+        let receiver = match state.generate_stream(request.generation).await {
+            Ok(receiver) => receiver,
+            Err(error) => return anthropic_error(error),
+        };
+        anthropic_live_stream(
+            identifier,
+            state.descriptor().id,
+            receiver,
+            thinking_enabled,
+            tools_enabled,
+        )
     } else {
+        let mut generation = match state.generate(request.generation).await {
+            Ok(generation) => generation,
+            Err(error) => return anthropic_error(error),
+        };
+        assign_tool_call_ids(&mut generation, &identifier);
         Json(anthropic_response(
             identifier,
             state.descriptor().id,
@@ -2271,143 +2596,254 @@ fn parse_anthropic_thinking(
     }
 }
 
-fn anthropic_stream(identifier: String, model: String, generation: Generation) -> Response {
-    let start = json!({
-        "type": "message_start",
-        "message": {
-            "id": &identifier,
-            "type": "message",
-            "role": "assistant",
-            "model": &model,
-            "content": [],
-            "stop_reason": Value::Null,
-            "stop_sequence": Value::Null,
-            "usage": {"input_tokens": generation.input_tokens, "output_tokens": 0}
-        }
-    });
-    let mut events = vec![Event::default()
-        .event("message_start")
-        .data(start.to_string())];
-    let mut index = 0_u32;
-    if let Some(thinking) = generation
-        .reasoning
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        events.push(
-            Event::default().event("content_block_start").data(
-                json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "thinking", "thinking": ""}
-                })
-                .to_string(),
-            ),
-        );
-        events.push(
-            Event::default().event("content_block_delta").data(
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "thinking_delta", "thinking": thinking}
-                })
-                .to_string(),
-            ),
-        );
-        events.push(Event::default().event("content_block_delta").data(
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "signature_delta", "signature": thinking_signature(&identifier)}
-            })
-            .to_string(),
-        ));
-        events.push(
-            Event::default()
-                .event("content_block_stop")
-                .data(json!({"type": "content_block_stop", "index": index}).to_string()),
-        );
-        index += 1;
-    }
-    if !generation.text.is_empty() {
-        events.push(
-            Event::default().event("content_block_start").data(
-                json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                })
-                .to_string(),
-            ),
-        );
-        events.push(
-            Event::default().event("content_block_delta").data(
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": &generation.text}
-                })
-                .to_string(),
-            ),
-        );
-        events.push(
-            Event::default()
-                .event("content_block_stop")
-                .data(json!({"type": "content_block_stop", "index": index}).to_string()),
-        );
-        index += 1;
-    }
-    for call in &generation.tool_calls {
-        events.push(Event::default().event("content_block_start").data(
-            json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "tool_use", "id": &call.id, "name": &call.name, "input": {}}
-            })
-            .to_string(),
-        ));
-        events.push(Event::default().event("content_block_delta").data(
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicBlockKind {
+    Thinking,
+    Text,
+}
+
+struct AnthropicStreamState {
+    receiver: mpsc::Receiver<Result<GenerationEvent, EngineError>>,
+    output: StreamingOutputParser,
+    pending: VecDeque<Event>,
+    identifier: String,
+    model: String,
+    started: bool,
+    current_block: Option<(u32, AnthropicBlockKind)>,
+    next_index: u32,
+    finished: bool,
+}
+
+fn anthropic_live_stream(
+    identifier: String,
+    model: String,
+    receiver: mpsc::Receiver<Result<GenerationEvent, EngineError>>,
+    thinking_enabled: bool,
+    tools_enabled: bool,
+) -> Response {
+    let state = AnthropicStreamState {
+        receiver,
+        output: StreamingOutputParser::new(thinking_enabled, tools_enabled),
+        pending: VecDeque::new(),
+        identifier,
+        model,
+        started: false,
+        current_block: None,
+        next_index: 0,
+        finished: false,
+    };
+    Sse::new(stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                return Some((Ok::<Event, Infallible>(event), state));
+            }
+            if state.finished {
+                return None;
+            }
+            match state.receiver.recv().await {
+                Some(Ok(GenerationEvent::Started { input_tokens })) => {
+                    ensure_anthropic_started(&mut state, input_tokens);
                 }
-            })
-            .to_string(),
-        ));
-        events.push(
-            Event::default()
-                .event("content_block_stop")
-                .data(json!({"type": "content_block_stop", "index": index}).to_string()),
-        );
-        index += 1;
+                Some(Ok(GenerationEvent::RawToken(raw))) => {
+                    ensure_anthropic_started(&mut state, 0);
+                    for delta in state.output.push_raw(&raw) {
+                        append_anthropic_delta(&mut state, delta);
+                    }
+                }
+                Some(Ok(GenerationEvent::Finished(mut generation))) => {
+                    ensure_anthropic_started(&mut state, generation.input_tokens);
+                    if !state.output.saw_raw() {
+                        for delta in generation_deltas(&generation) {
+                            append_anthropic_delta(&mut state, delta);
+                        }
+                    }
+                    for delta in state.output.finish() {
+                        append_anthropic_delta(&mut state, delta);
+                    }
+                    finish_anthropic_block(&mut state);
+                    assign_tool_call_ids(&mut generation, &state.identifier);
+                    for call in &generation.tool_calls {
+                        let index = state.next_index;
+                        state.next_index = state.next_index.saturating_add(1);
+                        state.pending.push_back(
+                            Event::default().event("content_block_start").data(
+                                json!({
+                                    "type": "content_block_start",
+                                    "index": index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": &call.id,
+                                        "name": &call.name,
+                                        "input": {}
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        );
+                        state.pending.push_back(
+                            Event::default().event("content_block_delta").data(
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": serde_json::to_string(&call.arguments)
+                                            .unwrap_or_else(|_| "{}".to_owned())
+                                    }
+                                })
+                                .to_string(),
+                            ),
+                        );
+                        state
+                            .pending
+                            .push_back(Event::default().event("content_block_stop").data(
+                                json!({"type": "content_block_stop", "index": index}).to_string(),
+                            ));
+                    }
+                    state.pending.push_back(
+                        Event::default().event("message_delta").data(
+                            json!({
+                                "type": "message_delta",
+                                "delta": {
+                                    "stop_reason": generation.finish_reason.anthropic_label(),
+                                    "stop_sequence": Value::Null
+                                },
+                                "usage": {"output_tokens": generation.output_tokens}
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    state.pending.push_back(
+                        Event::default()
+                            .event("message_stop")
+                            .data(json!({"type": "message_stop"}).to_string()),
+                    );
+                    state.finished = true;
+                }
+                Some(Err(error)) => {
+                    ensure_anthropic_started(&mut state, 0);
+                    finish_anthropic_block(&mut state);
+                    state.pending.push_back(
+                        Event::default().event("error").data(
+                            json!({
+                                "type": "error",
+                                "error": {"type": "api_error", "message": error.to_string()}
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    state.finished = true;
+                }
+                None => {
+                    ensure_anthropic_started(&mut state, 0);
+                    finish_anthropic_block(&mut state);
+                    state.pending.push_back(
+                        Event::default().event("error").data(
+                            json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": "generation stream ended unexpectedly"
+                                }
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    state.finished = true;
+                }
+            }
+        }
+    }))
+    .keep_alive(KeepAlive::default())
+    .into_response()
+}
+
+fn ensure_anthropic_started(state: &mut AnthropicStreamState, input_tokens: u32) {
+    if state.started {
+        return;
     }
-    events.push(
-        Event::default().event("message_delta").data(
+    state.started = true;
+    state.pending.push_back(
+        Event::default().event("message_start").data(
             json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": generation.finish_reason.anthropic_label(),
-                    "stop_sequence": Value::Null
-                },
-                "usage": {"output_tokens": generation.output_tokens}
+                "type": "message_start",
+                "message": {
+                    "id": &state.identifier,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": &state.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                }
             })
             .to_string(),
         ),
     );
-    events.push(
-        Event::default()
-            .event("message_stop")
-            .data(json!({"type": "message_stop"}).to_string()),
-    );
+}
 
-    Sse::new(stream::iter(
-        events.into_iter().map(Ok::<Event, Infallible>),
-    ))
-    .keep_alive(KeepAlive::default())
-    .into_response()
+fn append_anthropic_delta(state: &mut AnthropicStreamState, delta: StreamOutputDelta) {
+    let (kind, text) = match delta {
+        StreamOutputDelta::Reasoning(text) => (AnthropicBlockKind::Thinking, text),
+        StreamOutputDelta::Text(text) => (AnthropicBlockKind::Text, text),
+    };
+    if state.current_block.map(|(_, current)| current) != Some(kind) {
+        finish_anthropic_block(state);
+        let index = state.next_index;
+        state.next_index = state.next_index.saturating_add(1);
+        let block = match kind {
+            AnthropicBlockKind::Thinking => json!({"type": "thinking", "thinking": ""}),
+            AnthropicBlockKind::Text => json!({"type": "text", "text": ""}),
+        };
+        state.pending.push_back(
+            Event::default().event("content_block_start").data(
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": block
+                })
+                .to_string(),
+            ),
+        );
+        state.current_block = Some((index, kind));
+    }
+    let (index, _) = state.current_block.expect("content block is initialized");
+    let delta = match kind {
+        AnthropicBlockKind::Thinking => json!({"type": "thinking_delta", "thinking": text}),
+        AnthropicBlockKind::Text => json!({"type": "text_delta", "text": text}),
+    };
+    state.pending.push_back(
+        Event::default().event("content_block_delta").data(
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": delta
+            })
+            .to_string(),
+        ),
+    );
+}
+
+fn finish_anthropic_block(state: &mut AnthropicStreamState) {
+    let Some((index, kind)) = state.current_block.take() else {
+        return;
+    };
+    if kind == AnthropicBlockKind::Thinking {
+        state.pending.push_back(Event::default().event("content_block_delta").data(
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "signature_delta", "signature": thinking_signature(&state.identifier)}
+            })
+            .to_string(),
+        ));
+    }
+    state.pending.push_back(
+        Event::default()
+            .event("content_block_stop")
+            .data(json!({"type": "content_block_stop", "index": index}).to_string()),
+    );
 }
 
 fn anthropic_response(identifier: String, model: String, generation: &Generation) -> Value {
@@ -2945,6 +3381,40 @@ mod tests {
         assert!(body.contains("chat.completion.chunk"));
         assert!(body.contains("data: [DONE]"));
         assert!(body.contains("\"usage\""));
+    }
+
+    #[test]
+    fn streaming_parser_preserves_partial_thinking_and_text_boundaries() {
+        let mut parser = StreamingOutputParser::new(true, true);
+        assert!(parser.push_raw("<thi").is_empty());
+        assert_eq!(
+            parser.push_raw("nk>\nplan"),
+            vec![StreamOutputDelta::Reasoning("plan".to_owned())]
+        );
+        assert_eq!(
+            parser.push_raw("</think>\n\nans"),
+            vec![StreamOutputDelta::Text("ans".to_owned())]
+        );
+        assert_eq!(
+            parser.push_raw("wer"),
+            vec![StreamOutputDelta::Text("wer".to_owned())]
+        );
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn streaming_parser_hides_partial_tool_protocol_from_text_deltas() {
+        let mut parser = StreamingOutputParser::new(false, true);
+        assert_eq!(
+            parser.push_raw("before <tool"),
+            vec![StreamOutputDelta::Text("before ".to_owned())]
+        );
+        assert!(parser.push_raw("_call><function=x>").is_empty());
+        assert_eq!(
+            parser.push_raw("</tool_call>after"),
+            vec![StreamOutputDelta::Text("after".to_owned())]
+        );
+        assert_eq!(parser.finish(), Vec::<StreamOutputDelta>::new());
     }
 
     #[tokio::test]
