@@ -80,17 +80,19 @@ fn print_help() {
          Usage:\n\
            qwen38-metal doctor\n\
            qwen38-metal plan [--context TOKENS] [--kv bf16|q8|q4] [--page-tokens TOKENS]\n\
-           qwen38-metal serve --model MODEL_DIR [--model-id ID] [--host IP] [--port PORT]\n\
-           qwen38-metal serve --fixture-response TEXT [--model-id ID] [--host IP] [--port PORT]\n\
+           qwen38-metal serve --model MODEL_DIR [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
+           qwen38-metal serve --fixture-response TEXT [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
            qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT]\n\
            qwen38-metal inspect-model MODEL_DIR\n\
            qwen38-metal preflight MODEL_DIR\n\
            qwen38-metal version\n\n\
          `inspect-model` validates MLX safetensors headers and affine quantization groups.\n\
-         `serve --model` runs native Qwen inference and exposes OpenAI and Anthropic text APIs.\n\
+         `serve --model` runs native Qwen inference and exposes OpenAI and Anthropic APIs.\n\
          `--fixture-response` is only for protocol validation. `plan` reports a 48 GiB M4 Pro\n\
          memory budget. `q4-probe` validates MLX Q4 Metal execution for one projection.\n\
-         `preflight` detects native MTP weights."
+         `preflight` detects native MTP weights. Native inference defaults to one generation\n\
+         lane and a 64-request bounded queue; increase lanes only after measuring the target\n\
+         workload because this runtime does not yet use continuous batching."
     );
 }
 
@@ -165,6 +167,8 @@ fn serve(options: ServeOptions) -> Result<(), String> {
         max_output_tokens: options.max_output_tokens,
         api_key: options.api_key,
         max_request_bytes: 8 * 1024 * 1024,
+        generation_concurrency: options.generation_concurrency,
+        max_queued_requests: options.max_queued_requests,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -386,6 +390,8 @@ struct ServeOptions {
     api_key: Option<String>,
     fixture_response: Option<String>,
     allow_remote: bool,
+    generation_concurrency: usize,
+    max_queued_requests: usize,
 }
 
 impl Default for ServeOptions {
@@ -400,6 +406,8 @@ impl Default for ServeOptions {
             api_key: None,
             fixture_response: None,
             allow_remote: false,
+            generation_concurrency: 1,
+            max_queued_requests: 64,
         }
     }
 }
@@ -462,6 +470,14 @@ impl ServeOptions {
                     api_key_env = Some(value.clone());
                 }
                 "--fixture-response" => options.fixture_response = Some(value.clone()),
+                "--generation-concurrency" => {
+                    options.generation_concurrency =
+                        parse_positive_usize("--generation-concurrency", value)?
+                }
+                "--max-queued-requests" => {
+                    options.max_queued_requests =
+                        parse_positive_usize("--max-queued-requests", value)?
+                }
                 _ => return Err(format!("unknown serve option {flag:?}")),
             }
         }
@@ -483,8 +499,26 @@ impl ServeOptions {
                     .to_owned(),
             );
         }
+        if options.max_queued_requests < options.generation_concurrency {
+            return Err(
+                "--max-queued-requests must be at least --generation-concurrency because active requests count toward the queue limit"
+                    .to_owned(),
+            );
+        }
         Ok(options)
     }
+}
+
+fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} requires a positive unsigned integer, got {value:?}"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "{flag} requires a positive unsigned integer, got {value:?}"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug)]

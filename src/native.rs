@@ -1,10 +1,12 @@
 use crate::api::{
-    EngineError, ExecutionKind, FinishReason, Generation, GenerationRequest, InferenceEngine,
-    ModelDescriptor, PromptMessage, PromptRole,
+    parse_model_output, EngineError, ExecutionKind, FinishReason, Generation, GenerationRequest,
+    InferenceEngine, InputImage, ModelDescriptor, PromptPart, PromptRole, ToolChoice,
 };
 use crate::metal_runtime::{MappedWeightBuffers, MetalRuntime, MetalRuntimeError};
 use crate::model::{open_mlx_safetensors_dir, MlxTensor, MlxWeightStore};
+use image::imageops::FilterType;
 use serde::Deserialize;
+use serde_json::json;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -19,6 +21,28 @@ const END_OF_MESSAGE_TOKEN_ID: u32 = 248_046;
 struct RuntimeConfig {
     #[serde(default)]
     text_config: Option<TextRuntimeConfig>,
+    #[serde(default)]
+    vision_config: Option<VisionRuntimeConfig>,
+    #[serde(default)]
+    image_token_id: Option<u32>,
+    #[serde(default)]
+    vision_start_token_id: Option<u32>,
+    #[serde(default)]
+    vision_end_token_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct VisionRuntimeConfig {
+    depth: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_heads: usize,
+    num_position_embeddings: usize,
+    out_hidden_size: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+    in_channels: usize,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -76,6 +100,31 @@ struct RopeParameters {
     rope_theta: f32,
     #[serde(default = "default_partial_rotary_factor")]
     partial_rotary_factor: f32,
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MropePosition([u32; 3]);
+
+impl MropePosition {
+    fn text(position: u32) -> Self {
+        Self([position, position, position])
+    }
+
+    fn axis_for_frequency(self, frequency: usize, sections: Option<&[usize]>) -> u32 {
+        let Some(sections) = sections else {
+            return self.0[0];
+        };
+        if sections.len() != 3 {
+            return self.0[0];
+        }
+        match frequency % 3 {
+            1 if frequency / 3 < sections[1] => self.0[1],
+            2 if frequency / 3 < sections[2] => self.0[2],
+            _ => self.0[0],
+        }
+    }
 }
 
 fn default_rms_norm_eps() -> f32 {
@@ -122,6 +171,7 @@ impl TextRuntimeConfig {
         self.rope_parameters.clone().unwrap_or(RopeParameters {
             rope_theta: default_rope_theta(),
             partial_rotary_factor: default_partial_rotary_factor(),
+            mrope_section: None,
         })
     }
 
@@ -152,6 +202,10 @@ impl NativeWeights {
 
     pub fn q4_matrix(&self, tensor_name: &str) -> Result<Q4AffineMatrix, NativeError> {
         Q4AffineMatrix::from_store(&self.store, tensor_name)
+    }
+
+    fn bf16_matrix(&self, tensor_name: &str) -> Result<Bf16Matrix, NativeError> {
+        Bf16Matrix::from_store(&self.store, tensor_name)
     }
 
     pub fn q4_affine_matvec(
@@ -223,6 +277,33 @@ impl NativeWeights {
         self.mapped.shard_count()
     }
 
+    fn bf16_gemm(
+        &self,
+        runtime: &MetalRuntime,
+        matrix: &Bf16Matrix,
+        input: &[f32],
+    ) -> Result<Vec<f32>, NativeError> {
+        if input.len() % matrix.input_columns != 0 {
+            return Err(NativeError::InputDimension {
+                actual: input.len(),
+                expected: matrix.input_columns as u64,
+            });
+        }
+        let weight_buffer = self
+            .mapped
+            .buffer(matrix.weight.shard_index)
+            .ok_or(NativeError::MissingMappedShard(matrix.weight.shard_index))?;
+        runtime
+            .bf16_gemm_mapped(
+                input,
+                weight_buffer,
+                matrix.weight.byte_offset,
+                matrix.input_columns,
+                matrix.output_rows,
+            )
+            .map_err(NativeError::Metal)
+    }
+
     pub fn tensor_values_f32(&self, name: &str) -> Result<Vec<f32>, NativeError> {
         self.store
             .tensor_values_f32(name)
@@ -236,7 +317,16 @@ pub struct NativeEngine {
     weights: NativeWeights,
     tokenizer: Tokenizer,
     model: NativeModel,
+    vision: Option<NativeVisionModel>,
+    vision_tokens: Option<VisionTokenIds>,
     eos_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisionTokenIds {
+    image_pad: u32,
+    vision_start: u32,
+    vision_end: u32,
 }
 
 impl NativeEngine {
@@ -250,7 +340,14 @@ impl NativeEngine {
             })?;
         let config: RuntimeConfig =
             serde_json::from_slice(&config_bytes).map_err(NativeError::ConfigJson)?;
-        let text_config = config.text_config.ok_or(NativeError::MissingTextConfig)?;
+        let RuntimeConfig {
+            text_config,
+            vision_config,
+            image_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
+        } = config;
+        let text_config = text_config.ok_or(NativeError::MissingTextConfig)?;
         validate_runtime_config(&text_config)?;
 
         let tokenizer = Tokenizer::from_file(path.join("tokenizer.json"))
@@ -258,6 +355,31 @@ impl NativeEngine {
         let runtime = MetalRuntime::new().map_err(NativeError::Metal)?;
         let weights = NativeWeights::open(path, &runtime)?;
         let model = NativeModel::load(&weights, text_config.clone())?;
+        let vision = vision_config
+            .map(|config| {
+                validate_vision_runtime_config(&config)?;
+                NativeVisionModel::load(&weights, config)
+            })
+            .transpose()?;
+        let vision_tokens = if vision.is_some() {
+            Some(VisionTokenIds {
+                image_pad: image_token_id.ok_or_else(|| {
+                    NativeError::InvalidConfig("vision_config requires image_token_id".to_owned())
+                })?,
+                vision_start: vision_start_token_id.ok_or_else(|| {
+                    NativeError::InvalidConfig(
+                        "vision_config requires vision_start_token_id".to_owned(),
+                    )
+                })?,
+                vision_end: vision_end_token_id.ok_or_else(|| {
+                    NativeError::InvalidConfig(
+                        "vision_config requires vision_end_token_id".to_owned(),
+                    )
+                })?,
+            })
+        } else {
+            None
+        };
         let context_tokens = u32::try_from(text_config.max_context())
             .map_err(|_| NativeError::DimensionOverflow("max_position_embeddings".to_owned()))?;
         let eos_token_ids = load_eos_token_ids(path, text_config.eos_token_id())?;
@@ -272,6 +394,8 @@ impl NativeEngine {
             weights,
             tokenizer,
             model,
+            vision,
+            vision_tokens,
             eos_token_ids,
         })
     }
@@ -280,30 +404,171 @@ impl NativeEngine {
         self.weights.mapped_shard_count()
     }
 
-    fn render_prompt(&self, messages: &[PromptMessage]) -> Result<String, NativeError> {
-        if messages.is_empty() {
+    fn prepare_images(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<Vec<PreparedImage>, NativeError> {
+        let image_count = request
+            .messages
+            .iter()
+            .map(|message| message.image_count())
+            .sum::<usize>();
+        if image_count == 0 {
+            return Ok(Vec::new());
+        }
+        let vision = self.vision.as_ref().ok_or_else(|| {
+            NativeError::Unavailable(
+                "this model does not include a native vision encoder".to_owned(),
+            )
+        })?;
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                PromptPart::Image(image) => Some(image),
+                PromptPart::Text(_) => None,
+            })
+            .map(|image| PreparedImage::from_input(image, &vision.config))
+            .collect()
+    }
+
+    fn render_prompt(
+        &self,
+        request: &GenerationRequest,
+        image_token_counts: &[usize],
+    ) -> Result<String, NativeError> {
+        if request.messages.is_empty() {
             return Err(NativeError::EmptyPrompt);
         }
         let mut prompt = String::new();
-        for message in messages {
-            let role = match message.role {
-                PromptRole::System => "system",
-                PromptRole::User => "user",
-                PromptRole::Assistant => "assistant",
-            };
-            prompt.push_str("<|im_start|>");
-            prompt.push_str(role);
-            prompt.push('\n');
-            prompt.push_str(&message.content);
+        let mut image_token_counts = image_token_counts.iter().copied();
+        let first_is_system = request
+            .messages
+            .first()
+            .is_some_and(|message| message.role == PromptRole::System);
+        if !request.tools.is_empty() {
+            prompt.push_str("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            for tool in &request.tools {
+                let tool = json!({
+                    "type": "function",
+                    "function": {
+                        "name": &tool.name,
+                        "description": &tool.description,
+                        "parameters": &tool.input_schema,
+                    }
+                });
+                let encoded = serde_json::to_string(&tool).map_err(|error| {
+                    NativeError::Prompt(format!("cannot encode tool schema: {error}"))
+                })?;
+                prompt.push('\n');
+                prompt.push_str(&encoded);
+            }
+            prompt.push_str("\n</tools>");
+            match &request.tool_choice {
+                ToolChoice::Required => {
+                    prompt.push_str("\n\nYou must call one of the available functions.")
+                }
+                ToolChoice::Specific(name) => {
+                    prompt.push_str("\n\nYou must call the function `");
+                    prompt.push_str(name);
+                    prompt.push_str("`.");
+                }
+                ToolChoice::None | ToolChoice::Auto => {}
+            }
+            prompt.push_str("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n</IMPORTANT>");
+            if first_is_system {
+                let content = render_prompt_content(
+                    &request.messages[0].content,
+                    self.vision_tokens,
+                    &mut image_token_counts,
+                )?;
+                if !content.trim().is_empty() {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(content.trim());
+                }
+            }
             prompt.push_str("<|im_end|>\n");
         }
-        // The public API serves normal answers by closing the optional thinking block.
-        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+
+        for (index, message) in request.messages.iter().enumerate() {
+            if message.role == PromptRole::System && first_is_system && !request.tools.is_empty() {
+                continue;
+            }
+            match message.role {
+                PromptRole::System | PromptRole::User => {
+                    let role = if message.role == PromptRole::System {
+                        "system"
+                    } else {
+                        "user"
+                    };
+                    prompt.push_str("<|im_start|>");
+                    prompt.push_str(role);
+                    prompt.push('\n');
+                    prompt.push_str(&render_prompt_content(
+                        &message.content,
+                        self.vision_tokens,
+                        &mut image_token_counts,
+                    )?);
+                    prompt.push_str("<|im_end|>\n");
+                }
+                PromptRole::Assistant => {
+                    prompt.push_str("<|im_start|>assistant\n<think>\n");
+                    prompt.push_str(
+                        message
+                            .reasoning_content
+                            .as_deref()
+                            .unwrap_or_default()
+                            .trim(),
+                    );
+                    prompt.push_str("\n</think>\n\n");
+                    prompt.push_str(&render_prompt_content(
+                        &message.content,
+                        self.vision_tokens,
+                        &mut image_token_counts,
+                    )?);
+                    for call in &message.tool_calls {
+                        render_tool_call(&mut prompt, call)?;
+                    }
+                    prompt.push_str("<|im_end|>\n");
+                }
+                PromptRole::Tool => {
+                    if index == 0 || request.messages[index - 1].role != PromptRole::Tool {
+                        prompt.push_str("<|im_start|>user");
+                    }
+                    prompt.push_str("\n<tool_response>\n");
+                    prompt.push_str(&render_prompt_content(
+                        &message.content,
+                        self.vision_tokens,
+                        &mut image_token_counts,
+                    )?);
+                    prompt.push_str("\n</tool_response>");
+                    if index + 1 == request.messages.len()
+                        || request.messages[index + 1].role != PromptRole::Tool
+                    {
+                        prompt.push_str("<|im_end|>\n");
+                    }
+                }
+            }
+        }
+        prompt.push_str("<|im_start|>assistant\n<think>\n");
+        if !request.thinking.enabled {
+            prompt.push_str("\n</think>\n\n");
+        }
+        if image_token_counts.next().is_some() {
+            return Err(NativeError::Prompt(
+                "the number of rendered image spans does not match image inputs".to_owned(),
+            ));
+        }
         Ok(prompt)
     }
 
-    fn tokenize(&self, messages: &[PromptMessage]) -> Result<Vec<u32>, NativeError> {
-        let prompt = self.render_prompt(messages)?;
+    fn tokenize(
+        &self,
+        request: &GenerationRequest,
+        image_token_counts: &[usize],
+    ) -> Result<Vec<u32>, NativeError> {
+        let prompt = self.render_prompt(request, image_token_counts)?;
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -316,7 +581,12 @@ impl NativeEngine {
     }
 
     fn generate_native(&self, request: GenerationRequest) -> Result<Generation, NativeError> {
-        let prompt_ids = self.tokenize(&request.messages)?;
+        let images = self.prepare_images(&request)?;
+        let image_token_counts: Vec<usize> = images
+            .iter()
+            .map(PreparedImage::output_token_count)
+            .collect();
+        let prompt_ids = self.tokenize(&request, &image_token_counts)?;
         let input_tokens = u32::try_from(prompt_ids.len())
             .map_err(|_| NativeError::DimensionOverflow("prompt token count".to_owned()))?;
         let requested = input_tokens
@@ -329,21 +599,64 @@ impl NativeEngine {
             });
         }
 
+        let mut image_features = Vec::new();
+        if !images.is_empty() {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                NativeError::Unavailable("native vision encoder is unavailable".to_owned())
+            })?;
+            for image in &images {
+                image_features.extend(vision.encode(&self.runtime, &self.weights, image)?);
+            }
+        }
+        let positions = multimodal_positions(&prompt_ids, &images, self.vision_tokens)?;
+        if positions.len() != prompt_ids.len() {
+            return Err(NativeError::Prompt(
+                "the prompt and multimodal position sequences have different lengths".to_owned(),
+            ));
+        }
+
         let mut state = RuntimeState::new(&self.model);
         let mut hidden = Vec::new();
-        for (position, token_id) in prompt_ids.iter().copied().enumerate() {
-            hidden = self.model.forward_token(
-                &self.runtime,
-                &self.weights,
-                &mut state,
-                token_id,
-                position,
-            )?;
+        let mut image_feature_index = 0;
+        let image_pad = self.vision_tokens.map(|tokens| tokens.image_pad);
+        for (token_id, position) in prompt_ids.iter().copied().zip(positions.iter().copied()) {
+            hidden = if Some(token_id) == image_pad {
+                let feature = image_features.get(image_feature_index).ok_or_else(|| {
+                    NativeError::Prompt("image placeholders exceed visual feature count".to_owned())
+                })?;
+                image_feature_index += 1;
+                self.model.forward_embedding(
+                    &self.runtime,
+                    &self.weights,
+                    &mut state,
+                    feature.clone(),
+                    position,
+                )?
+            } else {
+                self.model.forward_token(
+                    &self.runtime,
+                    &self.weights,
+                    &mut state,
+                    token_id,
+                    position,
+                )?
+            };
+        }
+        if image_feature_index != image_features.len() {
+            return Err(NativeError::Prompt(
+                "visual features exceed image placeholders in the tokenized prompt".to_owned(),
+            ));
         }
 
         let mut generated_ids = Vec::new();
         let mut next_logits = self.model.logits(&self.runtime, &self.weights, &hidden)?;
         let mut finish_reason = FinishReason::Length;
+        let mut next_position = positions
+            .iter()
+            .flat_map(|position| position.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         for step in 0..request.max_tokens {
             let token_id = sample_token(
                 &next_logits,
@@ -356,14 +669,14 @@ impl NativeEngine {
                 break;
             }
             generated_ids.push(token_id);
-            let position = prompt_ids.len() + step as usize;
             hidden = self.model.forward_token(
                 &self.runtime,
                 &self.weights,
                 &mut state,
                 token_id,
-                position,
+                MropePosition::text(next_position),
             )?;
+            next_position = next_position.saturating_add(1);
             next_logits = self.model.logits(&self.runtime, &self.weights, &hidden)?;
             if let Some(stop_index) =
                 token_sequence_stop_index(&self.tokenizer, &generated_ids, &request.stop)?
@@ -377,14 +690,21 @@ impl NativeEngine {
             }
         }
 
-        let text = self
+        let raw = self
             .tokenizer
             .decode(&generated_ids, true)
             .map_err(|error| NativeError::Tokenizer(error.to_string()))?;
         let output_tokens = u32::try_from(generated_ids.len())
             .map_err(|_| NativeError::DimensionOverflow("output token count".to_owned()))?;
+        let parts = parse_model_output(&raw, request.thinking, &request.tools)
+            .map_err(|error| NativeError::Prompt(error.to_string()))?;
+        if !parts.tool_calls.is_empty() {
+            finish_reason = FinishReason::ToolCalls;
+        }
         Ok(Generation {
-            text,
+            text: parts.text,
+            reasoning: parts.reasoning,
+            tool_calls: parts.tool_calls,
             input_tokens,
             output_tokens,
             finish_reason,
@@ -392,29 +712,785 @@ impl NativeEngine {
     }
 }
 
+fn render_prompt_content(
+    content: &[PromptPart],
+    vision_tokens: Option<VisionTokenIds>,
+    image_token_counts: &mut impl Iterator<Item = usize>,
+) -> Result<String, NativeError> {
+    let mut rendered = String::new();
+    for part in content {
+        match part {
+            PromptPart::Text(text) => rendered.push_str(text),
+            PromptPart::Image(_) => {
+                vision_tokens.ok_or_else(|| {
+                    NativeError::Unavailable("this model does not support image inputs".to_owned())
+                })?;
+                let count = image_token_counts.next().ok_or_else(|| {
+                    NativeError::Prompt(
+                        "image token count is missing for an input image".to_owned(),
+                    )
+                })?;
+                rendered.push_str("<|vision_start|>");
+                for _ in 0..count {
+                    rendered.push_str("<|image_pad|>");
+                }
+                rendered.push_str("<|vision_end|>");
+            }
+        }
+    }
+    Ok(rendered)
+}
+
+fn render_tool_call(prompt: &mut String, call: &crate::api::ToolCall) -> Result<(), NativeError> {
+    prompt.push_str("\n<tool_call>\n<function=");
+    prompt.push_str(&call.name);
+    prompt.push_str(">\n");
+    let arguments = call.arguments.as_object().ok_or_else(|| {
+        NativeError::Prompt("tool call arguments must be a JSON object".to_owned())
+    })?;
+    for (name, value) in arguments {
+        prompt.push_str("<parameter=");
+        prompt.push_str(name);
+        prompt.push_str(">\n");
+        match value {
+            serde_json::Value::String(value) => prompt.push_str(value),
+            value => {
+                let encoded = serde_json::to_string(value).map_err(|error| {
+                    NativeError::Prompt(format!("cannot encode tool argument: {error}"))
+                })?;
+                prompt.push_str(&encoded);
+            }
+        }
+        prompt.push_str("\n</parameter>\n");
+    }
+    prompt.push_str("</function>\n</tool_call>");
+    Ok(())
+}
+
 impl InferenceEngine for NativeEngine {
     fn descriptor(&self) -> ModelDescriptor {
         self.descriptor.clone()
     }
 
-    fn estimate_prompt_tokens(&self, messages: &[PromptMessage]) -> Result<u32, EngineError> {
-        self.tokenize(messages)
+    fn estimate_prompt_tokens(&self, request: &GenerationRequest) -> Result<u32, EngineError> {
+        let images = self.prepare_images(request).map_err(native_engine_error)?;
+        let image_token_counts: Vec<usize> = images
+            .iter()
+            .map(PreparedImage::output_token_count)
+            .collect();
+        self.tokenize(request, &image_token_counts)
             .and_then(|ids| {
                 u32::try_from(ids.len())
                     .map_err(|_| NativeError::DimensionOverflow("prompt token count".to_owned()))
             })
-            .map_err(|error| EngineError::Failure(error.to_string()))
+            .map_err(native_engine_error)
     }
 
     fn generate(&self, request: GenerationRequest) -> Result<Generation, EngineError> {
-        self.generate_native(request).map_err(|error| match error {
-            NativeError::ContextLimit { requested, maximum } => {
-                EngineError::ContextLimit { requested, maximum }
+        self.generate_native(request).map_err(native_engine_error)
+    }
+}
+
+fn native_engine_error(error: NativeError) -> EngineError {
+    match error {
+        NativeError::ContextLimit { requested, maximum } => {
+            EngineError::ContextLimit { requested, maximum }
+        }
+        NativeError::Unavailable(message) => EngineError::Unavailable(message),
+        NativeError::Image(message) => EngineError::InvalidRequest(message),
+        other => EngineError::Failure(other.to_string()),
+    }
+}
+
+struct NativeVisionModel {
+    config: VisionRuntimeConfig,
+    patch_projection: Bf16Matrix,
+    patch_bias: Vec<f32>,
+    position_embeddings: Vec<f32>,
+    blocks: Vec<VisionBlockWeights>,
+    merger: VisionMergerWeights,
+}
+
+struct VisionBlockWeights {
+    norm1_weight: Vec<f32>,
+    norm1_bias: Vec<f32>,
+    qkv: Bf16Matrix,
+    qkv_bias: Vec<f32>,
+    projection: Bf16Matrix,
+    projection_bias: Vec<f32>,
+    norm2_weight: Vec<f32>,
+    norm2_bias: Vec<f32>,
+    mlp_in: Bf16Matrix,
+    mlp_in_bias: Vec<f32>,
+    mlp_out: Bf16Matrix,
+    mlp_out_bias: Vec<f32>,
+}
+
+struct VisionMergerWeights {
+    norm_weight: Vec<f32>,
+    norm_bias: Vec<f32>,
+    linear_fc1: Bf16Matrix,
+    linear_fc1_bias: Vec<f32>,
+    linear_fc2: Bf16Matrix,
+    linear_fc2_bias: Vec<f32>,
+}
+
+impl NativeVisionModel {
+    fn load(weights: &NativeWeights, config: VisionRuntimeConfig) -> Result<Self, NativeError> {
+        let patch_projection = weights.bf16_matrix("vision_tower.patch_embed.proj.weight")?;
+        let expected_patch_columns = config
+            .in_channels
+            .checked_mul(config.temporal_patch_size)
+            .and_then(|value| value.checked_mul(config.patch_size))
+            .and_then(|value| value.checked_mul(config.patch_size))
+            .ok_or_else(|| NativeError::DimensionOverflow("vision patch dimensions".to_owned()))?;
+        if patch_projection.input_columns != expected_patch_columns
+            || patch_projection.output_rows != config.hidden_size
+        {
+            return Err(NativeError::InvalidConfig(
+                "vision patch projection dimensions do not match vision_config".to_owned(),
+            ));
+        }
+        let patch_bias = load_vector(
+            weights,
+            "vision_tower.patch_embed.proj.bias",
+            config.hidden_size,
+        )?;
+        let position_embeddings = weights.tensor_values_f32("vision_tower.pos_embed.weight")?;
+        let expected_positions = config
+            .num_position_embeddings
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| {
+                NativeError::DimensionOverflow("vision position embeddings".to_owned())
+            })?;
+        if position_embeddings.len() != expected_positions {
+            return Err(NativeError::WrongVectorLength {
+                name: "vision_tower.pos_embed.weight".to_owned(),
+                actual: position_embeddings.len(),
+                expected: expected_positions,
+            });
+        }
+
+        let mut blocks = Vec::with_capacity(config.depth);
+        for index in 0..config.depth {
+            let prefix = format!("vision_tower.blocks.{index}");
+            let qkv = weights.bf16_matrix(&format!("{prefix}.attn.qkv.weight"))?;
+            let projection = weights.bf16_matrix(&format!("{prefix}.attn.proj.weight"))?;
+            let mlp_in = weights.bf16_matrix(&format!("{prefix}.mlp.linear_fc1.weight"))?;
+            let mlp_out = weights.bf16_matrix(&format!("{prefix}.mlp.linear_fc2.weight"))?;
+            if qkv.input_columns != config.hidden_size
+                || qkv.output_rows != config.hidden_size * 3
+                || projection.input_columns != config.hidden_size
+                || projection.output_rows != config.hidden_size
+                || mlp_in.input_columns != config.hidden_size
+                || mlp_in.output_rows != config.intermediate_size
+                || mlp_out.input_columns != config.intermediate_size
+                || mlp_out.output_rows != config.hidden_size
+            {
+                return Err(NativeError::InvalidConfig(format!(
+                    "vision block {index} has dimensions incompatible with vision_config"
+                )));
             }
-            NativeError::Unavailable(message) => EngineError::Unavailable(message),
-            other => EngineError::Failure(other.to_string()),
+            blocks.push(VisionBlockWeights {
+                norm1_weight: load_vector(
+                    weights,
+                    &format!("{prefix}.norm1.weight"),
+                    config.hidden_size,
+                )?,
+                norm1_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.norm1.bias"),
+                    config.hidden_size,
+                )?,
+                qkv,
+                qkv_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.attn.qkv.bias"),
+                    config.hidden_size * 3,
+                )?,
+                projection,
+                projection_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.attn.proj.bias"),
+                    config.hidden_size,
+                )?,
+                norm2_weight: load_vector(
+                    weights,
+                    &format!("{prefix}.norm2.weight"),
+                    config.hidden_size,
+                )?,
+                norm2_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.norm2.bias"),
+                    config.hidden_size,
+                )?,
+                mlp_in,
+                mlp_in_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.mlp.linear_fc1.bias"),
+                    config.intermediate_size,
+                )?,
+                mlp_out,
+                mlp_out_bias: load_vector(
+                    weights,
+                    &format!("{prefix}.mlp.linear_fc2.bias"),
+                    config.hidden_size,
+                )?,
+            });
+        }
+        let merger = VisionMergerWeights {
+            norm_weight: load_vector(
+                weights,
+                "vision_tower.merger.norm.weight",
+                config.hidden_size,
+            )?,
+            norm_bias: load_vector(weights, "vision_tower.merger.norm.bias", config.hidden_size)?,
+            linear_fc1: weights.bf16_matrix("vision_tower.merger.linear_fc1.weight")?,
+            linear_fc1_bias: load_vector(
+                weights,
+                "vision_tower.merger.linear_fc1.bias",
+                config.hidden_size * config.spatial_merge_size * config.spatial_merge_size,
+            )?,
+            linear_fc2: weights.bf16_matrix("vision_tower.merger.linear_fc2.weight")?,
+            linear_fc2_bias: load_vector(
+                weights,
+                "vision_tower.merger.linear_fc2.bias",
+                config.out_hidden_size,
+            )?,
+        };
+        let merged_size = config
+            .hidden_size
+            .checked_mul(config.spatial_merge_size)
+            .and_then(|value| value.checked_mul(config.spatial_merge_size))
+            .ok_or_else(|| {
+                NativeError::DimensionOverflow("vision merged hidden size".to_owned())
+            })?;
+        if merger.linear_fc1.input_columns != merged_size
+            || merger.linear_fc1.output_rows != merged_size
+            || merger.linear_fc2.input_columns != merged_size
+            || merger.linear_fc2.output_rows != config.out_hidden_size
+        {
+            return Err(NativeError::InvalidConfig(
+                "vision merger dimensions do not match vision_config".to_owned(),
+            ));
+        }
+        Ok(Self {
+            config,
+            patch_projection,
+            patch_bias,
+            position_embeddings,
+            blocks,
+            merger,
         })
     }
+
+    fn encode(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        image: &PreparedImage,
+    ) -> Result<Vec<Vec<f32>>, NativeError> {
+        let mut hidden = weights.bf16_gemm(runtime, &self.patch_projection, &image.patches)?;
+        add_bias_rows(&mut hidden, &self.patch_bias)?;
+        add_in_place(
+            &mut hidden,
+            &interpolated_position_embeddings(
+                &self.position_embeddings,
+                self.config.hidden_size,
+                self.config.num_position_embeddings,
+                image.grid_height,
+                image.grid_width,
+                self.config.spatial_merge_size,
+            )?,
+        )?;
+        for block in &self.blocks {
+            let normalized =
+                layer_norm_rows(&hidden, &block.norm1_weight, &block.norm1_bias, 1e-6)?;
+            let mut qkv = weights.bf16_gemm(runtime, &block.qkv, &normalized)?;
+            add_bias_rows(&mut qkv, &block.qkv_bias)?;
+            let (queries, keys, values) = split_vision_qkv(
+                &qkv,
+                self.config.hidden_size,
+                self.config.num_heads,
+                image.grid_height,
+                image.grid_width,
+                self.config.spatial_merge_size,
+            )?;
+            let attention = runtime
+                .vision_attention(
+                    &queries,
+                    &keys,
+                    &values,
+                    image.patch_count(),
+                    self.config.num_heads,
+                    self.config.hidden_size / self.config.num_heads,
+                )
+                .map_err(NativeError::Metal)?;
+            let mut projected = weights.bf16_gemm(runtime, &block.projection, &attention)?;
+            add_bias_rows(&mut projected, &block.projection_bias)?;
+            add_in_place(&mut hidden, &projected)?;
+            let normalized =
+                layer_norm_rows(&hidden, &block.norm2_weight, &block.norm2_bias, 1e-6)?;
+            let mut intermediate = weights.bf16_gemm(runtime, &block.mlp_in, &normalized)?;
+            add_bias_rows(&mut intermediate, &block.mlp_in_bias)?;
+            gelu_tanh_in_place(&mut intermediate);
+            let mut mlp = weights.bf16_gemm(runtime, &block.mlp_out, &intermediate)?;
+            add_bias_rows(&mut mlp, &block.mlp_out_bias)?;
+            add_in_place(&mut hidden, &mlp)?;
+        }
+
+        let normalized = layer_norm_rows(
+            &hidden,
+            &self.merger.norm_weight,
+            &self.merger.norm_bias,
+            1e-6,
+        )?;
+        let merged = merge_vision_patches(
+            &normalized,
+            image.grid_height,
+            image.grid_width,
+            self.config.hidden_size,
+            self.config.spatial_merge_size,
+        )?;
+        let mut projected = weights.bf16_gemm(runtime, &self.merger.linear_fc1, &merged)?;
+        add_bias_rows(&mut projected, &self.merger.linear_fc1_bias)?;
+        gelu_tanh_in_place(&mut projected);
+        let mut output = weights.bf16_gemm(runtime, &self.merger.linear_fc2, &projected)?;
+        add_bias_rows(&mut output, &self.merger.linear_fc2_bias)?;
+        rows_from_flat(output, self.config.out_hidden_size)
+    }
+}
+
+struct PreparedImage {
+    patches: Vec<f32>,
+    grid_height: usize,
+    grid_width: usize,
+    merge_size: usize,
+}
+
+impl PreparedImage {
+    fn from_input(input: &InputImage, config: &VisionRuntimeConfig) -> Result<Self, NativeError> {
+        let decoded = image::load_from_memory(&input.bytes)
+            .map_err(|error| NativeError::Image(format!("cannot decode image: {error}")))?
+            .to_rgb8();
+        let (width, height) = decoded.dimensions();
+        if width == 0 || height == 0 {
+            return Err(NativeError::Image(
+                "image dimensions must be non-zero".to_owned(),
+            ));
+        }
+        let factor = config
+            .patch_size
+            .checked_mul(config.spatial_merge_size)
+            .ok_or_else(|| NativeError::DimensionOverflow("image resize factor".to_owned()))?;
+        let (target_height, target_width) =
+            smart_resize(height as usize, width as usize, factor, 65_536, 262_144)?;
+        let resized = image::imageops::resize(
+            &decoded,
+            u32::try_from(target_width)
+                .map_err(|_| NativeError::DimensionOverflow("image width".to_owned()))?,
+            u32::try_from(target_height)
+                .map_err(|_| NativeError::DimensionOverflow("image height".to_owned()))?,
+            FilterType::CatmullRom,
+        );
+        let grid_height = target_height / config.patch_size;
+        let grid_width = target_width / config.patch_size;
+        let patch_elements = config
+            .in_channels
+            .checked_mul(config.temporal_patch_size)
+            .and_then(|value| value.checked_mul(config.patch_size))
+            .and_then(|value| value.checked_mul(config.patch_size))
+            .ok_or_else(|| NativeError::DimensionOverflow("image patch elements".to_owned()))?;
+        let patch_count = grid_height
+            .checked_mul(grid_width)
+            .ok_or_else(|| NativeError::DimensionOverflow("image patch count".to_owned()))?;
+        let mut patches = Vec::with_capacity(
+            patch_count
+                .checked_mul(patch_elements)
+                .ok_or_else(|| NativeError::DimensionOverflow("image patch bytes".to_owned()))?,
+        );
+        // The Qwen processor emits patches by temporal group, merge block,
+        // then pixels in row-major order. A static image is duplicated across
+        // the temporal dimension before this transform.
+        for block_y in 0..grid_height / config.spatial_merge_size {
+            for block_x in 0..grid_width / config.spatial_merge_size {
+                for intra_y in 0..config.spatial_merge_size {
+                    for intra_x in 0..config.spatial_merge_size {
+                        let patch_y =
+                            (block_y * config.spatial_merge_size + intra_y) * config.patch_size;
+                        let patch_x =
+                            (block_x * config.spatial_merge_size + intra_x) * config.patch_size;
+                        for channel in 0..config.in_channels {
+                            for _temporal in 0..config.temporal_patch_size {
+                                for y in 0..config.patch_size {
+                                    for x in 0..config.patch_size {
+                                        let pixel = resized.get_pixel(
+                                            u32::try_from(patch_x + x).map_err(|_| {
+                                                NativeError::DimensionOverflow("image x".to_owned())
+                                            })?,
+                                            u32::try_from(patch_y + y).map_err(|_| {
+                                                NativeError::DimensionOverflow("image y".to_owned())
+                                            })?,
+                                        );
+                                        patches.push((pixel[channel] as f32 / 255.0 - 0.5) / 0.5);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if patches.len() != patch_count * patch_elements {
+            return Err(NativeError::Image(
+                "image preprocessing produced an unexpected patch layout".to_owned(),
+            ));
+        }
+        Ok(Self {
+            patches,
+            grid_height,
+            grid_width,
+            merge_size: config.spatial_merge_size,
+        })
+    }
+
+    fn patch_count(&self) -> usize {
+        self.grid_height * self.grid_width
+    }
+
+    fn output_token_count(&self) -> usize {
+        self.patch_count() / (self.merge_size * self.merge_size)
+    }
+}
+
+fn smart_resize(
+    height: usize,
+    width: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize), NativeError> {
+    if factor == 0 {
+        return Err(NativeError::Image(format!(
+            "image resize factor {factor} must be greater than zero"
+        )));
+    }
+    if height.max(width) > height.min(width).saturating_mul(200) {
+        return Err(NativeError::Image(
+            "image aspect ratio must not exceed 200:1".to_owned(),
+        ));
+    }
+    let round_to_factor =
+        |value: usize| -> usize { ((value + factor / 2) / factor).max(1) * factor };
+    let mut target_height = round_to_factor(height);
+    let mut target_width = round_to_factor(width);
+    let pixels = target_height
+        .checked_mul(target_width)
+        .ok_or_else(|| NativeError::DimensionOverflow("image pixel count".to_owned()))?;
+    if pixels > max_pixels {
+        let scale = ((height * width) as f64 / max_pixels as f64).sqrt();
+        target_height = ((height as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
+        target_width = ((width as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
+    } else if pixels < min_pixels {
+        let scale = (min_pixels as f64 / (height * width) as f64).sqrt();
+        target_height = ((height as f64 * scale / factor as f64).ceil() as usize).max(1) * factor;
+        target_width = ((width as f64 * scale / factor as f64).ceil() as usize).max(1) * factor;
+    }
+    Ok((target_height, target_width))
+}
+
+fn multimodal_positions(
+    prompt_ids: &[u32],
+    images: &[PreparedImage],
+    tokens: Option<VisionTokenIds>,
+) -> Result<Vec<MropePosition>, NativeError> {
+    if images.is_empty() {
+        return Ok((0..prompt_ids.len())
+            .map(|position| MropePosition::text(position as u32))
+            .collect());
+    }
+    let tokens = tokens.ok_or_else(|| {
+        NativeError::Unavailable("this model does not include multimodal token ids".to_owned())
+    })?;
+    let mut positions = Vec::with_capacity(prompt_ids.len());
+    let mut image_index = 0;
+    let mut offset = 0_u32;
+    let mut cursor = 0;
+    while cursor < prompt_ids.len() {
+        if prompt_ids[cursor] != tokens.vision_start {
+            positions.push(MropePosition::text(offset));
+            offset = offset.saturating_add(1);
+            cursor += 1;
+            continue;
+        }
+        let image = images.get(image_index).ok_or_else(|| {
+            NativeError::Prompt("vision start token has no matching input image".to_owned())
+        })?;
+        positions.push(MropePosition::text(offset));
+        cursor += 1;
+        let expected = image.output_token_count();
+        let merged_width = image.grid_width / image.merge_size;
+        let merged_height = image.grid_height / image.merge_size;
+        for patch in 0..expected {
+            if prompt_ids.get(cursor).copied() != Some(tokens.image_pad) {
+                return Err(NativeError::Prompt(
+                    "image token expansion does not match the rendered visual span".to_owned(),
+                ));
+            }
+            let temporal = 0_u32;
+            let row = u32::try_from(patch / merged_width)
+                .map_err(|_| NativeError::DimensionOverflow("visual row position".to_owned()))?;
+            let column = u32::try_from(patch % merged_width)
+                .map_err(|_| NativeError::DimensionOverflow("visual column position".to_owned()))?;
+            if row as usize >= merged_height {
+                return Err(NativeError::Prompt(
+                    "visual grid position overflows image height".to_owned(),
+                ));
+            }
+            positions.push(MropePosition([
+                offset.saturating_add(1).saturating_add(temporal),
+                offset.saturating_add(1).saturating_add(row),
+                offset.saturating_add(1).saturating_add(column),
+            ]));
+            cursor += 1;
+        }
+        if prompt_ids.get(cursor).copied() != Some(tokens.vision_end) {
+            return Err(NativeError::Prompt(
+                "visual span is missing its vision end token".to_owned(),
+            ));
+        }
+        let next_text_position = offset
+            .saturating_add(1)
+            .saturating_add(u32::try_from(merged_height.max(merged_width)).map_err(|_| {
+                NativeError::DimensionOverflow("visual position offset".to_owned())
+            })?);
+        positions.push(MropePosition::text(next_text_position));
+        offset = next_text_position.saturating_add(1);
+        cursor += 1;
+        image_index += 1;
+    }
+    if image_index != images.len() {
+        return Err(NativeError::Prompt(
+            "input images do not all appear in the rendered prompt".to_owned(),
+        ));
+    }
+    Ok(positions)
+}
+
+fn add_bias_rows(values: &mut [f32], bias: &[f32]) -> Result<(), NativeError> {
+    if bias.is_empty() || values.len() % bias.len() != 0 {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: values.len(),
+            expected: bias.len(),
+        });
+    }
+    for row in values.chunks_exact_mut(bias.len()) {
+        for (value, bias) in row.iter_mut().zip(bias) {
+            *value += *bias;
+        }
+    }
+    Ok(())
+}
+
+fn layer_norm_rows(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>, NativeError> {
+    if weight.is_empty() || weight.len() != bias.len() || values.len() % weight.len() != 0 {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: values.len(),
+            expected: weight.len(),
+        });
+    }
+    let mut result = Vec::with_capacity(values.len());
+    for row in values.chunks_exact(weight.len()) {
+        let mean = row.iter().sum::<f32>() / row.len() as f32;
+        let variance = row
+            .iter()
+            .map(|value| {
+                let delta = *value - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / row.len() as f32;
+        let scale = (variance + eps).sqrt().recip();
+        result.extend(
+            row.iter()
+                .zip(weight)
+                .zip(bias)
+                .map(|((value, weight), bias)| (*value - mean) * scale * weight + bias),
+        );
+    }
+    Ok(result)
+}
+
+fn gelu_tanh_in_place(values: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    for value in values {
+        let original = *value;
+        *value = 0.5
+            * original
+            * (1.0 + (SQRT_2_OVER_PI * (original + 0.044_715 * original.powi(3))).tanh());
+    }
+}
+
+fn rows_from_flat(values: Vec<f32>, width: usize) -> Result<Vec<Vec<f32>>, NativeError> {
+    if width == 0 || values.len() % width != 0 {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: values.len(),
+            expected: width,
+        });
+    }
+    Ok(values.chunks_exact(width).map(|row| row.to_vec()).collect())
+}
+
+fn interpolated_position_embeddings(
+    table: &[f32],
+    hidden_size: usize,
+    position_count: usize,
+    grid_height: usize,
+    grid_width: usize,
+    merge_size: usize,
+) -> Result<Vec<f32>, NativeError> {
+    let source_side = (position_count as f64).sqrt() as usize;
+    if source_side * source_side != position_count || table.len() != position_count * hidden_size {
+        return Err(NativeError::InvalidConfig(
+            "vision positional embedding table is not square".to_owned(),
+        ));
+    }
+    let mut output = vec![0.0; grid_height * grid_width * hidden_size];
+    let interp = |coordinate: usize, destination: usize| -> (usize, usize, f32) {
+        if destination <= 1 {
+            return (0, 0, 0.0);
+        }
+        let value = coordinate as f32 * (source_side - 1) as f32 / (destination - 1) as f32;
+        let low = value.floor() as usize;
+        (low, (low + 1).min(source_side - 1), value - low as f32)
+    };
+    for block_y in 0..grid_height / merge_size {
+        for block_x in 0..grid_width / merge_size {
+            for intra_y in 0..merge_size {
+                for intra_x in 0..merge_size {
+                    let y = block_y * merge_size + intra_y;
+                    let x = block_x * merge_size + intra_x;
+                    let (y0, y1, dy) = interp(y, grid_height);
+                    let (x0, x1, dx) = interp(x, grid_width);
+                    let sources = [
+                        (y0 * source_side + x0, (1.0 - dy) * (1.0 - dx)),
+                        (y0 * source_side + x1, (1.0 - dy) * dx),
+                        (y1 * source_side + x0, dy * (1.0 - dx)),
+                        (y1 * source_side + x1, dy * dx),
+                    ];
+                    let output_index =
+                        ((block_y * (grid_width / merge_size) + block_x) * merge_size * merge_size
+                            + intra_y * merge_size
+                            + intra_x)
+                            * hidden_size;
+                    for (source, coefficient) in sources {
+                        let source_index = source * hidden_size;
+                        for feature in 0..hidden_size {
+                            output[output_index + feature] +=
+                                table[source_index + feature] * coefficient;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+type VisionQkv = (Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn split_vision_qkv(
+    values: &[f32],
+    hidden_size: usize,
+    num_heads: usize,
+    grid_height: usize,
+    grid_width: usize,
+    merge_size: usize,
+) -> Result<VisionQkv, NativeError> {
+    if values.len() % (hidden_size * 3) != 0 || hidden_size % num_heads != 0 {
+        return Err(NativeError::VectorLengthMismatch {
+            actual: values.len(),
+            expected: hidden_size * 3,
+        });
+    }
+    let sequence = values.len() / (hidden_size * 3);
+    let mut query = Vec::with_capacity(sequence * hidden_size);
+    let mut key = Vec::with_capacity(sequence * hidden_size);
+    let mut value = Vec::with_capacity(sequence * hidden_size);
+    let head_dim = hidden_size / num_heads;
+    for (token, row) in values.chunks_exact(hidden_size * 3).enumerate() {
+        // Input patches are already permuted into 2x2 spatial-merge blocks by
+        // the processor, so derive the original grid coordinate from that
+        // block-major order before applying visual RoPE.
+        let block_elements = merge_size * merge_size;
+        let blocks_per_row = grid_width / merge_size;
+        let block_index = token / block_elements;
+        let intra = token % block_elements;
+        let row_position = (block_index / blocks_per_row) * merge_size + intra / merge_size;
+        let column_position = (block_index % blocks_per_row) * merge_size + intra % merge_size;
+        for section in 0..3 {
+            let target = match section {
+                0 => &mut query,
+                1 => &mut key,
+                _ => &mut value,
+            };
+            for head in 0..num_heads {
+                let offset = section * hidden_size + head * head_dim;
+                let mut values = row[offset..offset + head_dim].to_vec();
+                if section < 2 {
+                    apply_vision_rope(&mut values, row_position, column_position);
+                }
+                target.extend(values);
+            }
+        }
+    }
+    if sequence != grid_height * grid_width {
+        return Err(NativeError::Prompt(
+            "vision qkv sequence does not match the image grid".to_owned(),
+        ));
+    }
+    Ok((query, key, value))
+}
+
+fn apply_vision_rope(values: &mut [f32], row: usize, column: usize) {
+    let half = values.len() / 2;
+    for index in 0..half {
+        let coordinate = if index < half / 2 { row } else { column };
+        let local = index % (half / 2).max(1);
+        let exponent = (2 * local) as f32 / half.max(1) as f32;
+        let angle = coordinate as f32 / 10_000.0_f32.powf(exponent);
+        let (sin, cos) = angle.sin_cos();
+        let left = values[index];
+        let right = values[index + half];
+        values[index] = left * cos - right * sin;
+        values[index + half] = right * cos + left * sin;
+    }
+}
+
+fn merge_vision_patches(
+    values: &[f32],
+    grid_height: usize,
+    grid_width: usize,
+    hidden_size: usize,
+    merge_size: usize,
+) -> Result<Vec<f32>, NativeError> {
+    if grid_height % merge_size != 0
+        || grid_width % merge_size != 0
+        || values.len() != grid_height * grid_width * hidden_size
+    {
+        return Err(NativeError::Prompt(
+            "vision features do not align with the configured spatial merge grid".to_owned(),
+        ));
+    }
+    // Preprocessing and positional interpolation already emit block-major
+    // patches. The merger's reshape(-1, hidden_size * merge_size^2) therefore
+    // only needs the existing contiguous groups, with no second permutation.
+    Ok(values.to_vec())
 }
 
 struct NativeModel {
@@ -588,12 +1664,29 @@ impl NativeModel {
         weights: &NativeWeights,
         state: &mut RuntimeState,
         token_id: u32,
-        position: usize,
+        position: MropePosition,
     ) -> Result<Vec<f32>, NativeError> {
         if token_id as usize >= self.config.vocab_size {
             return Err(NativeError::TokenOutOfRange(token_id));
         }
-        let mut hidden = dequantized_row(weights, &self.embed_tokens, token_id as usize)?;
+        let hidden = dequantized_row(weights, &self.embed_tokens, token_id as usize)?;
+        self.forward_embedding(runtime, weights, state, hidden, position)
+    }
+
+    fn forward_embedding(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        mut hidden: Vec<f32>,
+        position: MropePosition,
+    ) -> Result<Vec<f32>, NativeError> {
+        if hidden.len() != self.config.hidden_size {
+            return Err(NativeError::VectorLengthMismatch {
+                actual: hidden.len(),
+                expected: self.config.hidden_size,
+            });
+        }
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let normalized = rms_norm(&hidden, layer.input_norm(), self.config.rms_norm_eps)?;
             let mixed = match layer {
@@ -866,7 +1959,7 @@ impl FullLayerWeights {
         weights: &NativeWeights,
         input: &[f32],
         state: &mut FullState,
-        position: usize,
+        position: MropePosition,
         rope: RopeParameters,
         eps: f32,
     ) -> Result<Vec<f32>, NativeError> {
@@ -893,22 +1986,22 @@ impl FullLayerWeights {
             let offset = head * head_dim;
             let normalized = rms_norm_slice(&query[offset..offset + head_dim], &self.q_norm, eps);
             query[offset..offset + head_dim].copy_from_slice(&normalized);
-            apply_rope(
+            apply_mrope(
                 &mut query[offset..offset + head_dim],
                 position,
                 rotary_dim,
-                rope.rope_theta,
+                &rope,
             );
         }
         for head in 0..kv_heads {
             let offset = head * head_dim;
             let normalized = rms_norm_slice(&key[offset..offset + head_dim], &self.k_norm, eps);
             key[offset..offset + head_dim].copy_from_slice(&normalized);
-            apply_rope(
+            apply_mrope(
                 &mut key[offset..offset + head_dim],
                 position,
                 rotary_dim,
-                rope.rope_theta,
+                &rope,
             );
         }
 
@@ -1078,6 +2171,42 @@ fn validate_runtime_config(config: &TextRuntimeConfig) -> Result<(), NativeError
     Ok(())
 }
 
+fn validate_vision_runtime_config(config: &VisionRuntimeConfig) -> Result<(), NativeError> {
+    for (name, value) in [
+        ("vision.depth", config.depth),
+        ("vision.hidden_size", config.hidden_size),
+        ("vision.intermediate_size", config.intermediate_size),
+        ("vision.num_heads", config.num_heads),
+        (
+            "vision.num_position_embeddings",
+            config.num_position_embeddings,
+        ),
+        ("vision.out_hidden_size", config.out_hidden_size),
+        ("vision.patch_size", config.patch_size),
+        ("vision.temporal_patch_size", config.temporal_patch_size),
+        ("vision.spatial_merge_size", config.spatial_merge_size),
+        ("vision.in_channels", config.in_channels),
+    ] {
+        if value == 0 {
+            return Err(NativeError::InvalidConfig(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+    }
+    if config.hidden_size % config.num_heads != 0 {
+        return Err(NativeError::InvalidConfig(
+            "vision.hidden_size must be divisible by vision.num_heads".to_owned(),
+        ));
+    }
+    let side = (config.num_position_embeddings as f64).sqrt() as usize;
+    if side * side != config.num_position_embeddings {
+        return Err(NativeError::InvalidConfig(
+            "vision.num_position_embeddings must describe a square embedding table".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn add_in_place(destination: &mut [f32], source: &[f32]) -> Result<(), NativeError> {
     if destination.len() != source.len() {
         return Err(NativeError::VectorLengthMismatch {
@@ -1111,11 +2240,17 @@ fn rms_norm_slice(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
-fn apply_rope(values: &mut [f32], position: usize, rotary_dim: usize, theta: f32) {
+fn apply_mrope(
+    values: &mut [f32],
+    position: MropePosition,
+    rotary_dim: usize,
+    rope: &RopeParameters,
+) {
     let half = rotary_dim / 2;
     for index in 0..half {
         let exponent = (2 * index) as f32 / rotary_dim as f32;
-        let angle = position as f32 / theta.powf(exponent);
+        let axis_position = position.axis_for_frequency(index, rope.mrope_section.as_deref());
+        let angle = axis_position as f32 / rope.rope_theta.powf(exponent);
         let (sin, cos) = angle.sin_cos();
         let left = values[index];
         let right = values[index + half];
@@ -1247,6 +2382,59 @@ fn first_stop_index(text: &str, stop_sequences: &[String]) -> Option<usize> {
         .filter(|sequence| !sequence.is_empty())
         .filter_map(|sequence| text.find(sequence))
         .min()
+}
+
+/// A row-major BF16 tensor used by the visual encoder. MLX stores its dense
+/// linear and Conv3d projection weights in this layout, including the patch
+/// projection whose trailing dimensions are flattened into input columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bf16Matrix {
+    weight: MlxTensor,
+    name: String,
+    input_columns: usize,
+    output_rows: usize,
+}
+
+impl Bf16Matrix {
+    fn from_store(store: &MlxWeightStore, tensor_name: &str) -> Result<Self, NativeError> {
+        let weight = store
+            .tensor(tensor_name)
+            .ok_or_else(|| NativeError::MissingTensor(tensor_name.to_owned()))?
+            .clone();
+        if weight.dtype != "BF16" || weight.shape.len() < 2 {
+            return Err(NativeError::InvalidDenseWeight {
+                name: tensor_name.to_owned(),
+                dtype: weight.dtype,
+                shape: weight.shape,
+            });
+        }
+        let output_rows = usize::try_from(weight.shape[0])
+            .map_err(|_| NativeError::DimensionOverflow(tensor_name.to_owned()))?;
+        let input_columns = weight.shape[1..].iter().try_fold(1_usize, |total, value| {
+            let value = usize::try_from(*value)
+                .map_err(|_| NativeError::DimensionOverflow(tensor_name.to_owned()))?;
+            total
+                .checked_mul(value)
+                .ok_or_else(|| NativeError::DimensionOverflow(tensor_name.to_owned()))
+        })?;
+        let expected_bytes = output_rows
+            .checked_mul(input_columns)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| NativeError::DimensionOverflow(tensor_name.to_owned()))?;
+        if output_rows == 0 || input_columns == 0 || weight.byte_len != expected_bytes as u64 {
+            return Err(NativeError::InvalidDenseWeight {
+                name: tensor_name.to_owned(),
+                dtype: weight.dtype,
+                shape: weight.shape,
+            });
+        }
+        Ok(Self {
+            weight,
+            name: tensor_name.to_owned(),
+            input_columns,
+            output_rows,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1394,6 +2582,11 @@ pub enum NativeError {
         dtype: String,
         shape: Vec<u64>,
     },
+    InvalidDenseWeight {
+        name: String,
+        dtype: String,
+        shape: Vec<u64>,
+    },
     InvalidAffineTensor {
         weight: String,
         label: &'static str,
@@ -1420,6 +2613,7 @@ pub enum NativeError {
     GenerationConfigJson(serde_json::Error),
     MissingTextConfig,
     Tokenizer(String),
+    Prompt(String),
     EmptyPrompt,
     InvalidConfig(String),
     WrongVectorLength {
@@ -1432,6 +2626,7 @@ pub enum NativeError {
         expected: usize,
     },
     InvalidParameterBytes,
+    Image(String),
     TokenOutOfRange(u32),
     ContextLimit {
         requested: u32,
@@ -1455,6 +2650,10 @@ impl fmt::Display for NativeError {
             Self::InvalidQuantizedWeight { name, dtype, shape } => write!(
                 formatter,
                 "quantized tensor {name:?} must be U32 with two dimensions, got {dtype} {shape:?}"
+            ),
+            Self::InvalidDenseWeight { name, dtype, shape } => write!(
+                formatter,
+                "dense tensor {name:?} must be BF16 with at least two dimensions, got {dtype} {shape:?}"
             ),
             Self::InvalidAffineTensor {
                 weight,
@@ -1493,6 +2692,7 @@ impl fmt::Display for NativeError {
                 write!(formatter, "config.json does not contain text_config")
             }
             Self::Tokenizer(error) => write!(formatter, "cannot load tokenizer: {error}"),
+            Self::Prompt(error) => write!(formatter, "cannot render prompt: {error}"),
             Self::EmptyPrompt => write!(formatter, "prompt must contain at least one token"),
             Self::InvalidConfig(message) => write!(formatter, "invalid runtime config: {message}"),
             Self::WrongVectorLength {
@@ -1509,6 +2709,7 @@ impl fmt::Display for NativeError {
             Self::InvalidParameterBytes => {
                 write!(formatter, "tensor parameter bytes are truncated")
             }
+            Self::Image(message) => write!(formatter, "invalid image input: {message}"),
             Self::TokenOutOfRange(token) => {
                 write!(formatter, "token id {token} exceeds the vocabulary")
             }
@@ -1531,6 +2732,7 @@ impl Error for NativeError {
             Self::MissingTensor(_)
             | Self::NotQuantizedWeight(_)
             | Self::InvalidQuantizedWeight { .. }
+            | Self::InvalidDenseWeight { .. }
             | Self::InvalidAffineTensor { .. }
             | Self::TensorByteLength { .. }
             | Self::InputDimension { .. }
@@ -1538,11 +2740,13 @@ impl Error for NativeError {
             | Self::DimensionOverflow(_)
             | Self::MissingTextConfig
             | Self::Tokenizer(_)
+            | Self::Prompt(_)
             | Self::EmptyPrompt
             | Self::InvalidConfig(_)
             | Self::WrongVectorLength { .. }
             | Self::VectorLengthMismatch { .. }
             | Self::InvalidParameterBytes
+            | Self::Image(_)
             | Self::TokenOutOfRange(_)
             | Self::ContextLimit { .. }
             | Self::Unavailable(_) => None,

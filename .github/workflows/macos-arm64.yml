@@ -49,12 +49,12 @@ jobs:
           "$binary" doctor
           "$binary" plan --context 262144 --kv q8 --page-tokens 128
 
-      - name: Smoke-test OpenAI and Anthropic endpoints
+      - name: Smoke-test OpenAI and Anthropic protocol capabilities
         run: |
           binary=target/aarch64-apple-darwin/release/qwen38-metal
-          "$binary" serve --fixture-response "fixture answer" --model-id ci-fixture --port 18080 >server.log 2>&1 &
+          "$binary" serve --fixture-response "fixture answer" --model-id ci-fixture --port 18080 --generation-concurrency 2 --max-queued-requests 4 >server.log 2>&1 &
           server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          trap 'for pid in "${server_pid:-}" "${tool_server_pid:-}"; do if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; done' EXIT
 
           for attempt in {1..20}; do
             if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
@@ -74,6 +74,15 @@ jobs:
             -H 'anthropic-version: 2023-06-01' \
             -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8}' \
             http://127.0.0.1:18080/v1/messages | jq -e '.type == "message" and .content[0].text == "fixture answer"'
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="}}]}],"max_tokens":8}' \
+            http://127.0.0.1:18080/v1/chat/completions | jq -e '.usage.prompt_tokens >= 256'
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="}}]}],"max_tokens":8}' \
+            http://127.0.0.1:18080/v1/messages | jq -e '.usage.input_tokens >= 256'
 
           openai_stream="$(curl --fail --silent --no-buffer \
             -H 'content-type: application/json' \
@@ -87,6 +96,25 @@ jobs:
             -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}' \
             http://127.0.0.1:18080/v1/messages)"
           grep -F 'event: message_stop' <<<"$anthropic_stream"
+
+          tool_response=$'<tool_call>\n<function=get_weather>\n<parameter=location>\n"Shanghai"\n</parameter>\n</function>\n</tool_call>'
+          "$binary" serve --fixture-response "$tool_response" --model-id ci-tool-fixture --port 18081 >tool-server.log 2>&1 &
+          tool_server_pid=$!
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18081/health >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -d '{"model":"ci-tool-fixture","messages":[{"role":"user","content":"weather in Shanghai"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}],"tool_choice":"required","max_tokens":64}' \
+            http://127.0.0.1:18081/v1/chat/completions | jq -e '.choices[0].finish_reason == "tool_calls" and .choices[0].message.tool_calls[0].function.name == "get_weather"'
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"ci-tool-fixture","messages":[{"role":"user","content":"weather in Shanghai"}],"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}}}}],"tool_choice":{"type":"any"},"max_tokens":64}' \
+            http://127.0.0.1:18081/v1/messages | jq -e '.stop_reason == "tool_use" and .content[0].type == "tool_use"'
 
       - name: Package artifact
         run: |

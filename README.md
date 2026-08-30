@@ -2,7 +2,7 @@
 
 `qwen38-metal` is a native Apple Silicon runtime for Qwen3.8 MLX 4-bit models. It is written in Rust and embeds a build-time Metal library in one executable: no Python, MLX runtime, runtime shader compiler, or model-serving process is needed.
 
-The runtime loads Qwen3.8 MLX affine-Q4 safetensors, executes the hybrid DeltaNet/GQA model path on Metal, and serves native OpenAI Chat Completions and Anthropic Messages APIs. It is intentionally text-only: image, audio, tool/function calling, and Anthropic extended-thinking requests return explicit unsupported-request errors.
+The runtime loads Qwen3.8 MLX affine-Q4 safetensors, executes the hybrid DeltaNet/GQA model path on Metal, and serves native OpenAI Chat Completions and Anthropic Messages APIs. It accepts image inputs, client-managed function/tool calls, bounded concurrent requests, and Anthropic extended thinking. Audio input is not implemented.
 
 ## Run a native model
 
@@ -12,21 +12,25 @@ Build an ARM64 release binary, then point it at an MLX 4-bit Qwen3.8 model direc
 cargo build --release
 target/release/qwen38-metal serve \
   --model /path/to/Qwen3.8-27B-MLX-4bit \
-  --model-id qwen3.8-27b-native
+  --model-id qwen3.8-27b-native \
+  --generation-concurrency 1 \
+  --max-queued-requests 64
 ```
 
 The server binds to `127.0.0.1:8000` by default. A non-loopback bind requires both `--allow-remote` and `--api-key` or `--api-key-env`, preventing an unprotected local model from being exposed accidentally.
 
-`--fixture-response` starts a protocol-only fixture server and never loads model weights. It is intended for CI and client integration tests, not production inference.
+`--fixture-response` starts a protocol-only fixture server and never loads model weights. It is intended for CI and client integration tests, not production inference. `--generation-concurrency` controls how many requests may execute at once; `--max-queued-requests` includes active requests and bounds the waiting queue. Native Qwen defaults to one lane because it does not yet batch prefill or decode work. Increasing lanes is supported but must be measured for the target workload because it can reduce per-request throughput.
 
 ## Compatible endpoints
 
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/chat/completions`, including Server-Sent Events and `stream_options.include_usage`
-- `POST /v1/messages`, including Anthropic named Server-Sent Events
+- `POST /v1/chat/completions`, including Server-Sent Events, `stream_options.include_usage`, function tools, tool-result history, and user `image_url` blocks
+- `POST /v1/messages`, including Anthropic named Server-Sent Events, `text`, `image`, `tool_use`, `tool_result`, and extended `thinking` blocks
 
-OpenAI accepts `system`, `developer`, `user`, and `assistant` messages. Anthropic requires the `anthropic-version` header and accepts `system`, `user`, and `assistant` text content. Both interfaces accept string text and standard text-content arrays. Each server instance uses one generation lane, so a concurrent request receives a retryable `429` rather than competing for the model state.
+OpenAI accepts `system`, `developer`, `user`, `assistant`, and `tool` messages. Anthropic requires the `anthropic-version` header and accepts `system`, `user`, and `assistant` messages. Image inputs may be base64 data, or a public `http(s)` URL; downloads reject local and private network targets, cap compressed bytes at 16 MiB, and validate decoded dimensions before inference. Tool execution remains with the API client: the server emits a requested call, then accepts the client-provided result in a later request.
+
+Both APIs return standard SSE framing when `stream` is enabled. The present inference core completes a generation before the protocol layer emits its response chunks, so streaming is compatible with event-driven clients but does not yet reduce time-to-first-token. Token-forward streaming is part of the future batched scheduler work.
 
 Example OpenAI request:
 
@@ -43,6 +47,23 @@ curl http://127.0.0.1:8000/v1/messages \
   -H 'content-type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"qwen3.8-27b-native","max_tokens":32,"messages":[{"role":"user","content":"What is 2 plus 2?"}]}'
+```
+
+Example OpenAI tool request:
+
+```text
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3.8-27b-native","messages":[{"role":"user","content":"Weather in Shanghai?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}],"tool_choice":"required","max_tokens":128}'
+```
+
+Example Anthropic extended-thinking request:
+
+```text
+curl http://127.0.0.1:8000/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"qwen3.8-27b-native","max_tokens":256,"thinking":{"type":"enabled","budget_tokens":128},"messages":[{"role":"user","content":"Explain 2 plus 2 briefly."}]}'
 ```
 
 ## Runtime design
@@ -63,13 +84,14 @@ qwen38-metal plan --context 262144 --kv q8 --page-tokens 128
 qwen38-metal inspect-model /path/to/qwen38-mlx-model
 qwen38-metal preflight /path/to/qwen38-model
 qwen38-metal q4-probe /path/to/qwen38-mlx-model
+qwen38-metal serve --model /path/to/qwen38-mlx-model --generation-concurrency 2 --max-queued-requests 8
 ```
 
 `doctor` checks the embedded Metal library and prints the default budget. `plan` accepts `bf16`, `q8`, or `q4`. `inspect-model` validates MLX 4-bit affine safetensors metadata and reports its shard/tensor inventory. `preflight` expects a Qwen3.5-style `config.json` and `model.safetensors.index.json`; it reports the detected attention geometry and whether native MTP tensors are present. `q4-probe` runs one actual projection through the mapped Metal path.
 
 ## CI contract
 
-GitHub Actions runs on an ARM64 macOS runner. It formats, lints, tests both Metal Q4 paths, compiles Metal with `xcrun`, builds the release binary, checks the 262K/Q8 plan, and starts a fixture server to smoke-test the OpenAI and Anthropic HTTP/SSE contracts. Native model execution is additionally validated locally because model files are not part of the repository or CI artifact.
+GitHub Actions runs on an ARM64 macOS runner. It formats, lints, tests both Metal Q4 paths, compiles Metal with `xcrun`, builds the release binary, checks the 262K/Q8 plan, and starts fixture servers to smoke-test OpenAI and Anthropic text, SSE, images, tools, and thinking contracts. Native model execution is additionally validated locally because model files are not part of the repository or CI artifact.
 
 ## License
 

@@ -136,3 +136,125 @@ kernel void qwen38_q4_affine_matvec_unaligned(
         output[row] = partial_dot[0] + partial_sum[0];
     }
 }
+
+inline float qwen38_bf16_at(device const uchar* values, ulong byte_offset) {
+    const ushort bits = ushort(values[byte_offset]) | (ushort(values[byte_offset + 1ul]) << 8);
+    return qwen38_bf16_to_float(bits);
+}
+
+// Vision weights are BF16 rather than Q4. This deliberately keeps the
+// safetensors mapping zero-copy: only the small activation matrices move over
+// the CPU/GPU boundary. Each thread computes one output element; vision calls
+// use enough independent rows and columns to keep all GPU cores occupied.
+kernel void qwen38_bf16_gemm(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ulong& weight_byte_offset [[buffer(3)]],
+    constant uint& input_rows [[buffer(4)]],
+    constant uint& input_columns [[buffer(5)]],
+    constant uint& output_columns [[buffer(6)]],
+    uint2 index [[thread_position_in_grid]]) {
+    const uint column = index.x;
+    const uint row = index.y;
+    if (row >= input_rows || column >= output_columns) {
+        return;
+    }
+
+    float sum = 0.0f;
+    const uint input_base = row * input_columns;
+    const ulong weight_base = weight_byte_offset
+        + ulong(column) * ulong(input_columns) * 2ul;
+    for (uint element = 0; element < input_columns; ++element) {
+        sum += input[input_base + element]
+            * qwen38_bf16_at(weights, weight_base + ulong(element) * 2ul);
+    }
+    output[row * output_columns + column] = sum;
+}
+
+// A single threadgroup owns one (query, head) pair. It first normalizes the
+// complete score row and writes it to a temporary matrix shared by the value
+// projection kernel below. The visual encoder is bidirectional, unlike the
+// causal language attention path.
+kernel void qwen38_vision_attention_scores(
+    device const float* queries [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& sequence_length [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    threadgroup float* values [[threadgroup(0)]],
+    uint2 query_head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint query = query_head.x;
+    const uint head = query_head.y;
+    if (query >= sequence_length || head >= num_heads) {
+        return;
+    }
+
+    const uint score_base = (head * sequence_length + query) * sequence_length;
+    const uint query_base = (query * num_heads + head) * head_dim;
+    float local_max = -INFINITY;
+    for (uint key = thread_index; key < sequence_length; key += 256) {
+        const uint key_base = (key * num_heads + head) * head_dim;
+        float score = 0.0f;
+        for (uint dimension = 0; dimension < head_dim; ++dimension) {
+            score += queries[query_base + dimension] * keys[key_base + dimension];
+        }
+        score = score * rsqrt(float(head_dim));
+        scores[score_base + key] = score;
+        local_max = max(local_max, score);
+    }
+    values[thread_index] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            values[thread_index] = max(values[thread_index], values[thread_index + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_score = values[0];
+    float local_sum = 0.0f;
+    for (uint key = thread_index; key < sequence_length; key += 256) {
+        const float exp_score = exp(scores[score_base + key] - max_score);
+        scores[score_base + key] = exp_score;
+        local_sum += exp_score;
+    }
+    values[thread_index] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            values[thread_index] += values[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint key = thread_index; key < sequence_length; key += 256) {
+        scores[score_base + key] /= max(values[0], FLT_MIN);
+    }
+}
+
+kernel void qwen38_vision_attention_values(
+    device const float* scores [[buffer(0)]],
+    device const float* values [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& sequence_length [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    uint2 query_head [[threadgroup_position_in_grid]],
+    uint dimension [[thread_index_in_threadgroup]]) {
+    const uint query = query_head.x;
+    const uint head = query_head.y;
+    if (query >= sequence_length || head >= num_heads || dimension >= head_dim) {
+        return;
+    }
+
+    float sum = 0.0f;
+    const uint score_base = (head * sequence_length + query) * sequence_length;
+    for (uint key = 0; key < sequence_length; ++key) {
+        const uint value_offset = (key * num_heads + head) * head_dim + dimension;
+        sum += scores[score_base + key] * values[value_offset];
+    }
+    output[(query * num_heads + head) * head_dim + dimension] = sum;
+}
