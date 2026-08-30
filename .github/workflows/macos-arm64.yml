@@ -49,6 +49,45 @@ jobs:
           "$binary" doctor
           "$binary" plan --context 262144 --kv q8 --page-tokens 128
 
+      - name: Smoke-test OpenAI and Anthropic endpoints
+        run: |
+          binary=target/aarch64-apple-darwin/release/qwen38-metal
+          "$binary" serve --fixture-response "fixture answer" --model-id ci-fixture --port 18080 >server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          curl --fail --silent http://127.0.0.1:18080/health | jq -e '.status == "ready" and .execution == "fixture"'
+          curl --fail --silent http://127.0.0.1:18080/v1/models | jq -e '.data[0].id == "ci-fixture"'
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8}' \
+            http://127.0.0.1:18080/v1/chat/completions | jq -e '.object == "chat.completion" and .choices[0].message.content == "fixture answer"'
+          curl --fail --silent \
+            -H 'content-type: application/json' \
+            -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8}' \
+            http://127.0.0.1:18080/v1/messages | jq -e '.type == "message" and .content[0].text == "fixture answer"'
+
+          openai_stream="$(curl --fail --silent --no-buffer \
+            -H 'content-type: application/json' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}' \
+            http://127.0.0.1:18080/v1/chat/completions)"
+          grep -F 'data: [DONE]' <<<"$openai_stream"
+
+          anthropic_stream="$(curl --fail --silent --no-buffer \
+            -H 'content-type: application/json' \
+            -H 'anthropic-version: 2023-06-01' \
+            -d '{"model":"ci-fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}' \
+            http://127.0.0.1:18080/v1/messages)"
+          grep -F 'event: message_stop' <<<"$anthropic_stream"
+
       - name: Package artifact
         run: |
           mkdir -p dist
