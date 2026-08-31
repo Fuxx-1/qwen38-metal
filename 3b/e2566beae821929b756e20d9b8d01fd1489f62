@@ -1,0 +1,31 @@
+.gitignore
+  s_da61af4672b9a0::t_43877d9eba29cc 3
+src/model.rs
+  s_da61af4672b9a0::t_08fe34ea112f32 270-274,278,461-463,749-755,760-769,777-785
+  s_da61af4672b9a0::t_44e95620c90b55 464,756-759,788,905-917
+  s_da61af4672b9a0::t_5a0eb3c12ebd70 213,786
+  s_da61af4672b9a0::t_d2245644f5aa91 770-775
+  s_da61af4672b9a0::t_92e015038d5842 212
+  s_da61af4672b9a0::t_e6a60ee26f2c79 465,470-473,776,787,789-790,918,920,925,930
+src/preflight.rs
+  s_da61af4672b9a0::t_08fe34ea112f32 108-112,116,135-139,144-147,296-312,314
+  s_da61af4672b9a0::t_f74d8705da83b3 313,315-316
+README.md
+  s_da61af4672b9a0::t_5a0eb3c12ebd70 75-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3be2566beae821929b756e20d9b8d01fd1489f62",
+  "prompts": {},
+  "sessions": {
+    "s_da61af4672b9a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04e4a-c0cd-7010-a70c-2a80787db5dd",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
