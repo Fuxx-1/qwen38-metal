@@ -14,9 +14,11 @@ use crate::preflight::inspect_model_dir;
 use image::imageops::FilterType;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
@@ -24,6 +26,9 @@ const VALUES_PER_PACKED_WORD: u64 = 8;
 const AFFINE_GROUP_SIZE: u64 = 64;
 const DEFAULT_EOS_TOKEN_ID: u32 = 248_044;
 const END_OF_MESSAGE_TOKEN_ID: u32 = 248_046;
+const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 2;
+const DEFAULT_PREFIX_CACHE_TOKENS: usize = 65_536;
+const DEFAULT_PREFIX_CACHE_MIN_TOKENS: usize = 64;
 // Keeps MPS matrix work large enough to amortize Q4 expansion without
 // materializing an entire long prompt's MLP intermediates at once.
 const PREFILL_CHUNK_TOKENS: usize = 8_192;
@@ -389,6 +394,131 @@ impl NativeWeights {
     }
 }
 
+struct PrefixCacheEntry<S> {
+    token_ids: Vec<u32>,
+    hidden: Vec<f32>,
+    state: S,
+}
+
+struct PrefixCache<S> {
+    entries: VecDeque<PrefixCacheEntry<S>>,
+    total_tokens: usize,
+    max_entries: usize,
+    max_tokens: usize,
+    min_tokens: usize,
+}
+
+impl<S> PrefixCache<S> {
+    fn from_env() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            total_tokens: 0,
+            max_entries: prefix_cache_env(
+                "QWEN38_PREFIX_CACHE_MAX_ENTRIES",
+                DEFAULT_PREFIX_CACHE_ENTRIES,
+            ),
+            max_tokens: prefix_cache_env(
+                "QWEN38_PREFIX_CACHE_MAX_TOKENS",
+                DEFAULT_PREFIX_CACHE_TOKENS,
+            ),
+            min_tokens: prefix_cache_env(
+                "QWEN38_PREFIX_CACHE_MIN_TOKENS",
+                DEFAULT_PREFIX_CACHE_MIN_TOKENS,
+            ),
+        }
+    }
+
+    fn find_longest(&self, token_ids: &[u32]) -> Option<usize> {
+        longest_prefix_index(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index, entry.token_ids.as_slice())),
+            token_ids,
+        )
+    }
+
+    fn touch(&mut self, index: usize) {
+        if index > 0 {
+            self.entries.rotate_left(index);
+        }
+    }
+
+    fn can_store(&self, token_count: usize) -> bool {
+        self.max_entries > 0
+            && self.max_tokens > 0
+            && token_count >= self.min_tokens
+            && token_count <= self.max_tokens
+    }
+
+    fn insert(&mut self, token_ids: Vec<u32>, hidden: Vec<f32>, state: S) {
+        if self.max_entries == 0
+            || self.max_tokens == 0
+            || token_ids.len() < self.min_tokens
+            || token_ids.len() > self.max_tokens
+        {
+            return;
+        }
+
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.token_ids == token_ids)
+        {
+            let removed = self
+                .entries
+                .remove(index)
+                .expect("matching cache entry exists");
+            self.total_tokens = self.total_tokens.saturating_sub(removed.token_ids.len());
+        }
+
+        while self.entries.len() >= self.max_entries
+            || self.total_tokens.saturating_add(token_ids.len()) > self.max_tokens
+        {
+            let Some(removed) = self.entries.pop_back() else {
+                break;
+            };
+            self.total_tokens = self.total_tokens.saturating_sub(removed.token_ids.len());
+        }
+
+        self.total_tokens = self.total_tokens.saturating_add(token_ids.len());
+        self.entries.push_front(PrefixCacheEntry {
+            token_ids,
+            hidden,
+            state,
+        });
+    }
+}
+
+fn prefix_cache_env(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("warning: {name} must be a non-negative integer; using {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn longest_prefix_index<'a>(
+    entries: impl Iterator<Item = (usize, &'a [u32])>,
+    token_ids: &[u32],
+) -> Option<usize> {
+    entries
+        .filter(|(_, prefix)| prefix.len() <= token_ids.len() && token_ids.starts_with(prefix))
+        .max_by_key(|(_, prefix)| prefix.len())
+        .map(|(index, _)| index)
+}
+
+struct PrefixCacheHit {
+    token_count: usize,
+    hidden: Vec<f32>,
+    state: RuntimeState,
+}
+
 pub struct NativeEngine {
     descriptor: ModelDescriptor,
     runtime: MetalRuntime,
@@ -399,6 +529,7 @@ pub struct NativeEngine {
     vision_tokens: Option<VisionTokenIds>,
     eos_token_ids: Vec<u32>,
     speculative: SpeculativeDecodeSupport,
+    prefix_cache: Mutex<PrefixCache<Arc<RuntimeState>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -479,6 +610,7 @@ impl NativeEngine {
             vision_tokens,
             eos_token_ids,
             speculative,
+            prefix_cache: Mutex::new(PrefixCache::from_env()),
         })
     }
 
@@ -488,6 +620,60 @@ impl NativeEngine {
 
     pub fn speculative_decode_support(&self) -> &SpeculativeDecodeSupport {
         &self.speculative
+    }
+
+    fn lookup_prefix(&self, token_ids: &[u32]) -> Result<Option<PrefixCacheHit>, NativeError> {
+        let (token_count, hidden, state) = {
+            let mut cache = self
+                .prefix_cache
+                .lock()
+                .map_err(|_| NativeError::PrefixCachePoisoned)?;
+            let Some(index) = cache.find_longest(token_ids) else {
+                return Ok(None);
+            };
+            let entry = cache
+                .entries
+                .get(index)
+                .expect("prefix cache index came from find_longest");
+            let token_count = entry.token_ids.len();
+            let hidden = entry.hidden.clone();
+            let state = Arc::clone(&entry.state);
+            cache.touch(index);
+            (token_count, hidden, state)
+        };
+        // The cached state is immutable after insertion. Copy it outside the
+        // cache lock so a large Q8 KV prefix does not block other requests.
+        let state = state.fork(&self.model, &self.runtime)?;
+        Ok(Some(PrefixCacheHit {
+            token_count,
+            hidden,
+            state,
+        }))
+    }
+
+    fn store_prefix(
+        &self,
+        token_ids: &[u32],
+        hidden: &[f32],
+        state: &RuntimeState,
+    ) -> Result<(), NativeError> {
+        let should_store = {
+            let cache = self
+                .prefix_cache
+                .lock()
+                .map_err(|_| NativeError::PrefixCachePoisoned)?;
+            cache.can_store(token_ids.len())
+        };
+        if !should_store {
+            return Ok(());
+        }
+        let state = state.fork(&self.model, &self.runtime)?;
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .map_err(|_| NativeError::PrefixCachePoisoned)?;
+        cache.insert(token_ids.to_vec(), hidden.to_vec(), Arc::new(state));
+        Ok(())
     }
 
     fn prepare_images(
@@ -708,7 +894,6 @@ impl NativeEngine {
             ));
         }
 
-        let mut state = RuntimeState::new(&self.model, &self.runtime)?;
         let mut image_feature_index = 0;
         let image_pad = self.vision_tokens.map(|tokens| tokens.image_pad);
         let mut embedding_overrides = Vec::with_capacity(prompt_ids.len());
@@ -728,14 +913,49 @@ impl NativeEngine {
                 "visual features exceed image placeholders in the tokenized prompt".to_owned(),
             ));
         }
-        let mut hidden = self.model.prefill(
-            &self.runtime,
-            &self.weights,
-            &mut state,
-            &prompt_ids,
-            &positions,
-            &embedding_overrides,
-        )?;
+        // Image embeddings are request-local inputs and are intentionally not
+        // part of the token-only cache key. Text prompts can reuse the full
+        // recurrent/KV state; multimodal prompts always take the normal path.
+        let cacheable = images.is_empty();
+        let prefix_hit = if cacheable {
+            self.lookup_prefix(&prompt_ids)?
+        } else {
+            None
+        };
+        let (mut state, mut hidden) = match prefix_hit {
+            Some(hit) if hit.token_count == prompt_ids.len() => (hit.state, hit.hidden),
+            Some(hit) => {
+                let token_count = hit.token_count;
+                let mut state = hit.state;
+                let hidden = self.model.prefill(
+                    &self.runtime,
+                    &self.weights,
+                    &mut state,
+                    &prompt_ids[token_count..],
+                    &positions[token_count..],
+                    &embedding_overrides[token_count..],
+                )?;
+                if cacheable {
+                    self.store_prefix(&prompt_ids, &hidden, &state)?;
+                }
+                (state, hidden)
+            }
+            None => {
+                let mut state = RuntimeState::new(&self.model, &self.runtime)?;
+                let hidden = self.model.prefill(
+                    &self.runtime,
+                    &self.weights,
+                    &mut state,
+                    &prompt_ids,
+                    &positions,
+                    &embedding_overrides,
+                )?;
+                if cacheable {
+                    self.store_prefix(&prompt_ids, &hidden, &state)?;
+                }
+                (state, hidden)
+            }
+        };
 
         let mut generated_ids = Vec::new();
         let mut streamed_text = String::new();
@@ -2334,6 +2554,38 @@ impl RuntimeState {
         }
         Ok(())
     }
+
+    fn fork(&self, model: &NativeModel, runtime: &MetalRuntime) -> Result<Self, NativeError> {
+        if self.layers.len() != model.layers.len() {
+            return Err(NativeError::InvalidConfig(
+                "runtime state layer count does not match model".to_owned(),
+            ));
+        }
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            layers.push(match layer {
+                LayerRuntimeState::Linear(state) => LayerRuntimeState::Linear(
+                    runtime
+                        .clone_deltanet_state(state)
+                        .map_err(NativeError::Metal)?,
+                ),
+                LayerRuntimeState::Full(state) => LayerRuntimeState::Full(
+                    runtime
+                        .clone_q8_kv_state(state)
+                        .map_err(NativeError::Metal)?,
+                ),
+            });
+        }
+        Ok(Self {
+            layers,
+            // Decode scratch is request-local and contains no model state that
+            // needs to be copied. A fresh stream also prevents concurrent
+            // requests from aliasing activation buffers.
+            decode: runtime
+                .create_decode_state(model.config.hidden_size)
+                .map_err(NativeError::Metal)?,
+        })
+    }
 }
 
 impl LinearLayerWeights {
@@ -3305,6 +3557,7 @@ pub enum NativeError {
     Unavailable(String),
     Streaming(String),
     Preflight(crate::preflight::PreflightError),
+    PrefixCachePoisoned,
 }
 
 impl fmt::Display for NativeError {
@@ -3394,6 +3647,7 @@ impl fmt::Display for NativeError {
             Self::Unavailable(message) => write!(formatter, "native model unavailable: {message}"),
             Self::Streaming(message) => write!(formatter, "stream receiver unavailable: {message}"),
             Self::Preflight(error) => write!(formatter, "cannot inspect MTP capability: {error}"),
+            Self::PrefixCachePoisoned => write!(formatter, "prefix cache lock is poisoned"),
         }
     }
 }
@@ -3424,7 +3678,8 @@ impl Error for NativeError {
             | Self::TokenOutOfRange(_)
             | Self::ContextLimit { .. }
             | Self::Unavailable(_)
-            | Self::Streaming(_) => None,
+            | Self::Streaming(_)
+            | Self::PrefixCachePoisoned => None,
             Self::ConfigRead { source, .. } => Some(source),
             Self::ConfigJson(error) => Some(error),
             Self::GenerationConfigJson(error) => Some(error),
@@ -3484,5 +3739,95 @@ mod tests {
 
         assert_eq!(query, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(gate, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn selects_the_longest_matching_prefix() {
+        let prefixes = [vec![1, 2], vec![1, 2, 3, 4], vec![9, 9]];
+        let index = longest_prefix_index(
+            prefixes
+                .iter()
+                .enumerate()
+                .map(|(index, prefix)| (index, prefix.as_slice())),
+            &[1, 2, 3, 4, 5],
+        );
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn prefix_cache_admission_honors_limits() {
+        let cache = PrefixCache::<()> {
+            entries: VecDeque::new(),
+            total_tokens: 0,
+            max_entries: 2,
+            max_tokens: 128,
+            min_tokens: 8,
+        };
+        assert!(!cache.can_store(7));
+        assert!(cache.can_store(8));
+        assert!(cache.can_store(128));
+        assert!(!cache.can_store(129));
+    }
+
+    #[test]
+    fn prefix_cache_duplicate_replaces_without_double_counting() {
+        let mut cache = PrefixCache::<()> {
+            entries: VecDeque::new(),
+            total_tokens: 0,
+            max_entries: 3,
+            max_tokens: 32,
+            min_tokens: 1,
+        };
+        cache.insert(vec![1, 2, 3], vec![10.0], ());
+        cache.insert(vec![4, 5], vec![20.0], ());
+        cache.insert(vec![1, 2, 3], vec![30.0], ());
+
+        assert_eq!(cache.total_tokens, 5);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries.front().unwrap().token_ids, [1, 2, 3]);
+        assert_eq!(cache.entries.front().unwrap().hidden, [30.0]);
+    }
+
+    #[test]
+    fn prefix_cache_touch_makes_recent_entry_survive_lru_eviction() {
+        let mut cache = PrefixCache::<()> {
+            entries: VecDeque::new(),
+            total_tokens: 0,
+            max_entries: 2,
+            max_tokens: 32,
+            min_tokens: 1,
+        };
+        cache.insert(vec![1, 2], Vec::new(), ());
+        cache.insert(vec![10, 11], Vec::new(), ());
+
+        let index = cache.find_longest(&[1, 2, 99]).unwrap();
+        cache.touch(index);
+        cache.insert(vec![20, 21], Vec::new(), ());
+
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries.front().unwrap().token_ids, [20, 21]);
+        assert!(cache.entries.iter().any(|entry| entry.token_ids == [1, 2]));
+        assert!(!cache
+            .entries
+            .iter()
+            .any(|entry| entry.token_ids == [10, 11]));
+        assert_eq!(cache.total_tokens, 4);
+    }
+
+    #[test]
+    fn prefix_cache_evicts_until_total_token_budget_fits() {
+        let mut cache = PrefixCache::<()> {
+            entries: VecDeque::new(),
+            total_tokens: 0,
+            max_entries: 4,
+            max_tokens: 5,
+            min_tokens: 1,
+        };
+        cache.insert(vec![1, 2, 3], Vec::new(), ());
+        cache.insert(vec![4, 5, 6], Vec::new(), ());
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries.front().unwrap().token_ids, [4, 5, 6]);
+        assert_eq!(cache.total_tokens, 3);
     }
 }

@@ -3698,6 +3698,22 @@ impl MetalRuntime {
         })
     }
 
+    /// Copies a completed recurrent state into request-owned Metal buffers.
+    /// The state buffers use shared storage, so this is a bounded CPU memcpy
+    /// after the producer command buffer has completed. Keeping this operation
+    /// here prevents callers from accidentally aliasing mutable recurrent state
+    /// between a prefix-cache entry and a live request.
+    pub fn clone_deltanet_state(
+        &self,
+        source: &MetalDeltaNetState,
+    ) -> Result<MetalDeltaNetState, MetalRuntimeError> {
+        let conv = self.zeroed_shared_buffer(source.conv.length())?;
+        let recurrent = self.zeroed_shared_buffer(source.recurrent.length())?;
+        copy_buffer_bytes(&source.conv, &conv, source.conv.length())?;
+        copy_buffer_bytes(&source.recurrent, &recurrent, source.recurrent.length())?;
+        Ok(MetalDeltaNetState { conv, recurrent })
+    }
+
     pub fn create_q8_kv_state(
         &self,
         kv_heads: usize,
@@ -3717,6 +3733,46 @@ impl MetalRuntime {
             .checked_add(additional_tokens)
             .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV token capacity"))?;
         self.ensure_q8_kv_capacity(state, required_tokens)
+    }
+
+    /// Clones a request-local Q8 KV cache, including its allocated capacity and
+    /// active sequence length. Only the active prefix is copied; unused
+    /// capacity remains zeroed in the new buffers.
+    pub fn clone_q8_kv_state(&self, source: &Q8KvState) -> Result<Q8KvState, MetalRuntimeError> {
+        let mut cloned =
+            self.allocate_q8_kv_state(source.kv_heads, source.head_dim, source.capacity_tokens)?;
+        let active_elements = source
+            .sequence_length
+            .checked_mul(source.kv_heads)
+            .and_then(|value| value.checked_mul(source.head_dim))
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "active Q8 KV elements",
+            ))?;
+        let active_scales = source
+            .sequence_length
+            .checked_mul(source.kv_heads)
+            .ok_or(MetalRuntimeError::DimensionOverflow("active Q8 KV scales"))?;
+        copy_buffer_bytes(
+            &source.keys,
+            &cloned.keys,
+            u64::try_from(active_elements)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("active Q8 KV key bytes"))?,
+        )?;
+        copy_buffer_bytes(
+            &source.values,
+            &cloned.values,
+            u64::try_from(active_elements)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("active Q8 KV value bytes"))?,
+        )?;
+        let active_scale_bytes = checked_byte_len::<f32>(active_scales)?;
+        copy_buffer_bytes(&source.key_scales, &cloned.key_scales, active_scale_bytes)?;
+        copy_buffer_bytes(
+            &source.value_scales,
+            &cloned.value_scales,
+            active_scale_bytes,
+        )?;
+        cloned.sequence_length = source.sequence_length;
+        Ok(cloned)
     }
 
     fn allocate_q8_kv_state(
@@ -4927,6 +4983,30 @@ fn copy_slice_to_buffer<T>(buffer: &metal::Buffer, values: &[T]) {
             byte_len,
         );
     }
+}
+
+fn copy_buffer_bytes(
+    source: &metal::Buffer,
+    destination: &metal::Buffer,
+    byte_len: u64,
+) -> Result<(), MetalRuntimeError> {
+    if byte_len > source.length() || byte_len > destination.length() {
+        return Err(MetalRuntimeError::WrongLength {
+            name: "Metal state buffer copy",
+            actual: usize::try_from(byte_len).unwrap_or(usize::MAX),
+            expected: usize::try_from(source.length().min(destination.length()))
+                .unwrap_or(usize::MAX),
+        });
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            source.contents().cast::<u8>(),
+            destination.contents().cast::<u8>(),
+            usize::try_from(byte_len)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("Metal state copy bytes"))?,
+        );
+    }
+    Ok(())
 }
 
 fn ensure_language_slots(

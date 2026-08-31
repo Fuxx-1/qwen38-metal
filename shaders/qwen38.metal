@@ -2,9 +2,10 @@
 
 using namespace metal;
 
-// This library is built before the Rust binary is linked. Future kernels keep
-// Q4e dequantization, paged Q8 KV attention, Gated DeltaNet, and MTP verify in
-// this precompiled library rather than compiling source at runtime.
+// This library is built before the Rust binary is linked. Q4e dequantization,
+// paged Q8 KV attention, and Gated DeltaNet stay in this precompiled library;
+// MTP verification remains disabled until matching weights and rollback logic
+// are available for the loaded model.
 kernel void qwen38_warmup(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],

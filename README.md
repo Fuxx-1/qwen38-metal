@@ -80,6 +80,8 @@ The default profile is one 262,144-token stream with Q8 paged KV. For the curren
 
 BF16 KV needs 16 GiB at the same context length and exceeds that planning budget. Q4 KV requires about 4 GiB before page scales, but is intended as an experimental capacity mode until its quality and kernel cost are measured. The plan is a capacity model, not a substitute for measuring the exact model, context length, and request shape before setting a production limit. The native runtime begins with small Q8 allocations and doubles active KV capacity only when a sequence reaches the current bound.
 
+Text-only prompts also use an in-process longest-prefix cache. It stores up to two prefixes and 65,536 tokens in total by default, and only caches prefixes of at least 64 tokens. Cached entries own copies of the mutable DeltaNet and full-attention Q8 KV state, so a 65K-token entry costs roughly the Q8 KV footprint for that prefix (about 2 GiB for the published geometry). Set `QWEN38_PREFIX_CACHE_MAX_ENTRIES=0` to disable it, or tune `QWEN38_PREFIX_CACHE_MAX_ENTRIES`, `QWEN38_PREFIX_CACHE_MAX_TOKENS`, and `QWEN38_PREFIX_CACHE_MIN_TOKENS` for a tighter memory budget. Image requests bypass this token-only cache.
+
 ## Commands
 
 ```text
