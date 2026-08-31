@@ -1,0 +1,38 @@
+shaders/qwen38.metal
+  s_da61af4672b9a0::t_f12bd2eaf0a19e 5-8
+src/metal_runtime.rs
+  s_da61af4672b9a0::t_332dfeebdf5896 3701-3716,3738-3775
+  s_da61af4672b9a0::t_96091c8888cfa1 3776,4988-5011
+  s_da61af4672b9a0::t_31904ce90397e3 3777
+src/native.rs
+  s_da61af4672b9a0::t_c7f8cbd0b7ab84 416-427,432-438,468-471,504-513,2558
+  s_da61af4672b9a0::t_e5f0875cce1cdf 677,3759,3770-3832
+  s_da61af4672b9a0::t_58a4c71e4db325 3743-3758,3760-3769
+  s_da61af4672b9a0::t_ff735cdd13f801 17,29-31
+  s_da61af4672b9a0::t_dc3e15a81f996a 3560,3650,3681-3682
+  s_da61af4672b9a0::t_3e00e6779bbbc1 21,397,400,403-404,411,439-444,532,626-627,631-633,638-642,644-646,675
+  s_da61af4672b9a0::t_534647d7a9551a 916-958
+  s_da61af4672b9a0::t_84b9ff4f4b3441 447-453,613,625,628-630,634-637,643,647-674,676
+  s_da61af4672b9a0::t_3495e395c75e4a 2557,2559-2588
+  s_da61af4672b9a0::t_59b266a5440108 454
+  s_da61af4672b9a0::t_79aa9da206cb4c 398-399,401-402,405-410,412-415,428-431,445-446,455-467,472-503,514-521
+  s_da61af4672b9a0::t_95ec57ca44cfce 678
+README.md
+  s_da61af4672b9a0::t_b0cee1e7ebab45 83-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1046bcd896f3eb3c06700ff4c060111d59ac3470",
+  "prompts": {},
+  "sessions": {
+    "s_da61af4672b9a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04e4a-c0cd-7010-a70c-2a80787db5dd",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
