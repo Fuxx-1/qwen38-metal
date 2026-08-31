@@ -72,7 +72,17 @@ Weights remain file-mapped rather than being expanded to floating point. The fas
 
 DeltaNet convolution, q/k preparation, recurrent state update, and output gating run in the precompiled Metal library. Full GQA attention uses dynamically growing Q8 KV buffers with per-token/head scales and keeps attention score/value work on Metal. Prompt prefill is layer-major: tiled Q4 kernels process prompt-row and output-row blocks together, while the MLP's gate/up, SwiGLU, and down projection share one command buffer. DeltaNet and GQA advance the complete causal span in GPU kernels instead of submitting a command buffer for every position, and active KV capacity is reserved without allocating 262K pages at request start.
 
-The published Qwen3.8 MLX 4-bit export declares one MTP layer but omits its tensors. The runtime therefore exposes speculative decoding as unavailable and executes verified standard decode. It will not claim MTP speedup until a matching verifier and proposer are loaded.
+The published Qwen3.8 MLX 4-bit target export declares one MTP layer but omits its tensors. A matching standalone drafter is available as [`mlx-community/Qwen3.8-27B-MTP-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-4bit); it must be paired with the same Qwen3.8-27B target in `mlx-vlm`, for example:
+
+```text
+mlx_vlm.generate \
+  --model /path/to/Qwen3.8-27B-MLX-4bit \
+  --draft-model /path/to/Qwen3.8-27B-MTP-4bit \
+  --draft-kind mtp --draft-block-size 3 \
+  --prompt "Write a quicksort in Python." --max-tokens 256
+```
+
+`qwen38-metal inspect-model` and `preflight` recognize this adapter's generic `layers.0.*`/`fc.*` tensor names and report its weights as available. Native Rust inference still exposes speculative decoding as unavailable until its proposer, target verifier, and recurrent/KV state rollback path are implemented; it therefore continues to execute verified standard decode.
 
 ## Memory target
 

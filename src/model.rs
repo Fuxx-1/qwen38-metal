@@ -209,7 +209,8 @@ pub fn inspect_mlx_safetensors_dir(
         .text_config
         .ok_or(ModelFormatError::MissingTextConfig)?;
 
-    let model_type = if text.model_type.is_empty() {
+    let model_type = if is_mtp_adapter_model_type(&config.model_type) || text.model_type.is_empty()
+    {
         config.model_type.clone()
     } else {
         text.model_type.clone()
@@ -266,10 +267,15 @@ pub fn inspect_mlx_safetensors_dir(
     }
 
     let quantized_tensor_groups = validate_affine_groups(&index.weight_map)?;
+    // The MLX MTP export is a standalone adapter. Its index intentionally
+    // uses generic names (`layers.0.*`, `fc.*`) and identifies itself through
+    // the top-level `qwen3_5_mtp` model type instead of an `mtp` name prefix.
+    let is_mtp_adapter = is_mtp_adapter_model_type(&config.model_type)
+        || is_mtp_adapter_model_type(&text.model_type);
     let mtp_tensor_count = index
         .weight_map
         .keys()
-        .filter(|tensor| is_mtp_tensor(tensor))
+        .filter(|tensor| is_mtp_tensor(tensor, is_mtp_adapter))
         .count();
     let mtp_support = mtp_support(text.mtp_num_hidden_layers, mtp_tensor_count);
 
@@ -452,11 +458,17 @@ fn validate_affine_groups(
     Ok(groups)
 }
 
-fn is_mtp_tensor(name: &str) -> bool {
-    name.split('.')
-        .any(|segment| segment.eq_ignore_ascii_case("mtp"))
+fn is_mtp_tensor(name: &str, is_mtp_adapter: bool) -> bool {
+    is_mtp_adapter
+        || name
+            .split('.')
+            .any(|segment| segment.eq_ignore_ascii_case("mtp"))
         || name.contains("nextn")
         || name.contains("next_n")
+}
+
+fn is_mtp_adapter_model_type(model_type: &str) -> bool {
+    model_type.eq_ignore_ascii_case("qwen3_5_mtp")
 }
 
 fn mtp_support(configured_layers: u32, tensor_count: usize) -> MtpSupport {
@@ -735,6 +747,48 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_generic_mlx_mtp_adapter_tensor_names() {
+        let directory = fixture_dir("mtp-adapter");
+        write_fixture_config(&directory);
+        let config_path = directory.join("config.json");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(
+            config_path,
+            config.replace(
+                "\"model_type\": \"qwen3_5\"",
+                "\"model_type\": \"qwen3_5_mtp\"",
+            ),
+        )
+        .unwrap();
+        write_fixture_index(
+            &directory,
+            json!({
+                "layers.0.mlp.up_proj.weight": "model.safetensors",
+                "layers.0.mlp.up_proj.scales": "model.safetensors",
+                "layers.0.mlp.up_proj.biases": "model.safetensors"
+            }),
+        );
+        write_fixture_shard_with_names(
+            &directory.join("model.safetensors"),
+            "layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.up_proj.scales",
+            "layers.0.mlp.up_proj.biases",
+        );
+
+        let manifest = inspect_mlx_safetensors_dir(&directory).unwrap();
+
+        assert_eq!(
+            manifest.mtp_support,
+            MtpSupport::Available {
+                configured_layers: 1,
+                tensor_count: 3
+            }
+        );
+        assert_eq!(manifest.model_type, "qwen3_5_mtp");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn maps_safetensors_tensor_ranges_without_copying_them_to_the_heap() {
         let directory = fixture_dir("mapped-store");
         write_fixture_config(&directory);
@@ -848,18 +902,32 @@ mod tests {
     }
 
     fn write_fixture_shard(path: &Path) {
+        write_fixture_shard_with_names(
+            path,
+            "language_model.model.layers.0.mlp.up_proj.weight",
+            "language_model.model.layers.0.mlp.up_proj.scales",
+            "language_model.model.layers.0.mlp.up_proj.biases",
+        );
+    }
+
+    fn write_fixture_shard_with_names(
+        path: &Path,
+        weight_name: &str,
+        scales_name: &str,
+        biases_name: &str,
+    ) {
         let header = serde_json::to_vec(&json!({
-            "language_model.model.layers.0.mlp.up_proj.weight": {
+            weight_name: {
                 "dtype": "U8",
                 "shape": [4],
                 "data_offsets": [0, 4]
             },
-            "language_model.model.layers.0.mlp.up_proj.scales": {
+            scales_name: {
                 "dtype": "F16",
                 "shape": [2],
                 "data_offsets": [4, 8]
             },
-            "language_model.model.layers.0.mlp.up_proj.biases": {
+            biases_name: {
                 "dtype": "F16",
                 "shape": [2],
                 "data_offsets": [8, 12]

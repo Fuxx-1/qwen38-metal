@@ -1,5 +1,6 @@
 /target/
 /dist/
+.models/
 *.air
 *.metallib
 .DS_Store

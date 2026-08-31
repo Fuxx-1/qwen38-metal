@@ -105,10 +105,15 @@ pub fn inspect_json(
         full_attention_layers,
     )?;
 
+    // The MLX MTP export is a standalone adapter. Its index intentionally
+    // uses generic names (`layers.0.*`, `fc.*`) and identifies itself through
+    // the top-level `qwen3_5_mtp` model type instead of an `mtp` name prefix.
+    let is_mtp_adapter = is_mtp_adapter_model_type(&config.model_type)
+        || is_mtp_adapter_model_type(&text.model_type);
     let mtp_tensor_count = index
         .weight_map
         .keys()
-        .filter(|name| is_mtp_tensor(name))
+        .filter(|name| is_mtp_tensor(name, is_mtp_adapter))
         .count();
     let mtp_support = match (text.mtp_num_hidden_layers, mtp_tensor_count) {
         (0, _) => MtpSupport::NotDeclared,
@@ -127,11 +132,17 @@ pub fn inspect_json(
     })
 }
 
-fn is_mtp_tensor(name: &str) -> bool {
-    name.split('.')
-        .any(|segment| segment.eq_ignore_ascii_case("mtp"))
+fn is_mtp_tensor(name: &str, is_mtp_adapter: bool) -> bool {
+    is_mtp_adapter
+        || name
+            .split('.')
+            .any(|segment| segment.eq_ignore_ascii_case("mtp"))
         || name.contains("nextn")
         || name.contains("next_n")
+}
+
+fn is_mtp_adapter_model_type(model_type: &str) -> bool {
+    model_type.eq_ignore_ascii_case("qwen3_5_mtp")
 }
 
 fn non_zero(value: u32) -> Option<u32> {
@@ -281,5 +292,26 @@ mod tests {
         .unwrap();
 
         assert!(inspection.mtp_support.is_available());
+    }
+
+    #[test]
+    fn detects_generic_tensor_names_in_mlx_mtp_adapter() {
+        let config = CONFIG.replace(
+            "\"model_type\": \"qwen3_5\"",
+            "\"model_type\": \"qwen3_5_mtp\"",
+        );
+        let inspection = inspect_json(
+            &config,
+            r#"{"weight_map":{"layers.0.mlp.down_proj.weight":"model.safetensors","fc.weight":"model.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspection.mtp_support,
+            MtpSupport::Available {
+                configured_layers: 1,
+                tensor_count: 2
+            }
+        );
     }
 }
