@@ -8,6 +8,11 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculativeDecodeSupport {
     Unavailable(SpeculativeUnavailableReason),
+    Available {
+        configured_layers: u32,
+        tensor_count: usize,
+        draft_tokens: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +22,10 @@ pub enum SpeculativeUnavailableReason {
         configured_layers: u32,
     },
     VerifierNotImplemented {
+        configured_layers: u32,
+        tensor_count: usize,
+    },
+    AdapterNotConfigured {
         configured_layers: u32,
         tensor_count: usize,
     },
@@ -41,14 +50,60 @@ impl SpeculativeDecodeSupport {
         })
     }
 
+    /// Builds the advertised capability after both sides of a standalone
+    /// Qwen MTP pair have been loaded. The target export commonly declares
+    /// MTP but intentionally omits the adapter tensors, so target support by
+    /// itself is not sufficient to enable speculation.
+    pub fn from_loaded_adapter(target: &MtpSupport, adapter: &MtpSupport, block_size: u8) -> Self {
+        let target_layers = match target {
+            MtpSupport::NotDeclared => 0,
+            MtpSupport::DeclaredButWeightsMissing { configured_layers }
+            | MtpSupport::Available {
+                configured_layers, ..
+            } => *configured_layers,
+        };
+        let adapter_capability = match adapter {
+            MtpSupport::Available {
+                configured_layers,
+                tensor_count,
+            } => Some((*configured_layers, *tensor_count)),
+            _ => None,
+        };
+        if target_layers > 0 && block_size >= 2 {
+            if let Some((configured_layers, tensor_count)) = adapter_capability {
+                return Self::Available {
+                    configured_layers: configured_layers.min(target_layers),
+                    tensor_count,
+                    draft_tokens: block_size.saturating_sub(1),
+                };
+            }
+        }
+
+        let (configured_layers, tensor_count) = match target {
+            MtpSupport::Available {
+                configured_layers,
+                tensor_count,
+            } => (*configured_layers, *tensor_count),
+            MtpSupport::DeclaredButWeightsMissing { configured_layers } => (*configured_layers, 0),
+            MtpSupport::NotDeclared => (0, 0),
+        };
+        Self::Unavailable(SpeculativeUnavailableReason::AdapterNotConfigured {
+            configured_layers,
+            tensor_count,
+        })
+    }
+
     /// Zero is intentional: callers must take the normal decode path instead
     /// of advertising a speculative depth that cannot be verified.
     pub fn proposal_depth(&self) -> u8 {
-        0
+        match self {
+            Self::Available { draft_tokens, .. } => *draft_tokens,
+            Self::Unavailable(_) => 0,
+        }
     }
 
     pub fn is_available(&self) -> bool {
-        false
+        matches!(self, Self::Available { .. })
     }
 }
 
@@ -56,6 +111,14 @@ impl fmt::Display for SpeculativeDecodeSupport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(reason) => write!(formatter, "unavailable: {reason}"),
+            Self::Available {
+                configured_layers,
+                tensor_count,
+                draft_tokens,
+            } => write!(
+                formatter,
+                "available: {configured_layers} layer(s), {tensor_count} tensors, {draft_tokens} draft token(s)"
+            ),
         }
     }
 }
@@ -74,6 +137,13 @@ impl fmt::Display for SpeculativeUnavailableReason {
             } => write!(
                 formatter,
                 "the model exposes {tensor_count} tensors for {configured_layers} MTP layer(s), but no verifier has been loaded"
+            ),
+            Self::AdapterNotConfigured {
+                configured_layers,
+                tensor_count,
+            } => write!(
+                formatter,
+                "the target declares {configured_layers} MTP layer(s) ({tensor_count} inline tensors), but no matching standalone adapter is configured"
             ),
         }
     }
@@ -142,6 +212,21 @@ impl MtpController {
 
         Ok(self.current_depth)
     }
+}
+
+/// Returns the longest greedy prefix of draft tokens that agrees with the
+/// target verifier. The target row at that same index is the next bonus token.
+pub(crate) fn accepted_token_count(
+    draft_tokens: &[u32],
+    target_tokens: &[u32],
+    draft_count: usize,
+) -> usize {
+    draft_tokens
+        .iter()
+        .zip(target_tokens.iter())
+        .take(draft_count)
+        .take_while(|(draft, target)| draft == target)
+        .count()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,5 +303,45 @@ mod tests {
         assert!(!support.is_available());
         assert_eq!(support.proposal_depth(), 0);
         assert!(support.to_string().contains("tensors are absent"));
+    }
+
+    #[test]
+    fn loaded_adapter_advertises_matching_draft_depth() {
+        let support = SpeculativeDecodeSupport::from_loaded_adapter(
+            &MtpSupport::DeclaredButWeightsMissing {
+                configured_layers: 1,
+            },
+            &MtpSupport::Available {
+                configured_layers: 1,
+                tensor_count: 31,
+            },
+            3,
+        );
+        assert_eq!(support.proposal_depth(), 2);
+        assert!(support.is_available());
+        assert!(support.to_string().contains("31 tensors"));
+    }
+
+    #[test]
+    fn adapter_requires_a_two_token_block() {
+        let support = SpeculativeDecodeSupport::from_loaded_adapter(
+            &MtpSupport::DeclaredButWeightsMissing {
+                configured_layers: 1,
+            },
+            &MtpSupport::Available {
+                configured_layers: 1,
+                tensor_count: 31,
+            },
+            1,
+        );
+        assert!(!support.is_available());
+        assert_eq!(support.proposal_depth(), 0);
+    }
+
+    #[test]
+    fn accepted_tokens_stop_at_first_mismatch() {
+        assert_eq!(accepted_token_count(&[4, 5, 6], &[4, 9, 6, 7], 3), 1);
+        assert_eq!(accepted_token_count(&[4, 5], &[4, 5, 6], 2), 2);
+        assert_eq!(accepted_token_count(&[4, 5], &[4], 2), 1);
     }
 }

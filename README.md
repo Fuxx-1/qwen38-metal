@@ -82,7 +82,21 @@ mlx_vlm.generate \
   --prompt "Write a quicksort in Python." --max-tokens 256
 ```
 
-`qwen38-metal inspect-model` and `preflight` recognize this adapter's generic `layers.0.*`/`fc.*` tensor names and report its weights as available. Native Rust inference still exposes speculative decoding as unavailable until its proposer, target verifier, and recurrent/KV state rollback path are implemented; it therefore continues to execute verified standard decode.
+`qwen38-metal inspect-model` and `preflight` recognize this adapter's generic `layers.0.*`/`fc.*` tensor names and report its weights as available. Native Rust can load the standalone adapter with `--mtp-adapter` (or `QWEN38_MTP_ADAPTER`) and uses deterministic MTP speculation for greedy text-only decoding:
+
+```text
+target/release/qwen38-metal serve \
+  --model /path/to/Qwen3.8-27B-MLX-4bit \
+  --mtp-adapter /path/to/Qwen3.8-27B-MTP-4bit
+```
+
+Image requests, tool calls, Anthropic extended thinking, non-zero temperature, and a narrowed `top_p` continue to use the normal target path.
+
+Set `QWEN38_PROFILE=1` to print target prefill/decode timings and an MTP summary containing draft/accepted counts, acceptance ratio, stage timings, and generated-token throughput. `QWEN38_BATCH_TIMING=1` adds encoding, submission/wait, GPU, and host-readback timings for the normal verification graph; `QWEN38_BATCH_PROFILE=1` remains a slower per-layer diagnostic mode. The MTP path is intentionally limited to one adapter layer and `block_size >= 2`. Although the published adapter uses `block_size=3` and can propose two tokens, the native default verifies one draft token at a time: M4 Pro's Q4 batch-2 path has higher measured output throughput and needs less transient scratch/state snapshot memory. Set `QWEN38_MTP_MAX_DRAFT_TOKENS=2` to opt into the full two-draft adapter block for device-specific experiments.
+
+For the published two-token MTP adapter, batch-2 and batch-3 Q4 verification use a default 32-lane vector path that reuses each unpacked weight across target rows. The same path handles safetensor payloads with unaligned byte offsets without copying or repacking model shards. `QWEN38_PAIR_TRACE=1` prints the paired-projection dispatch selected for each verification projection. For controlled A/B measurements, set any of `QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR=1`, `QWEN38_DISABLE_BATCH3_WEIGHT_VECTOR=1`, `QWEN38_DISABLE_FUSED_PAIR=1`, `QWEN38_DISABLE_BATCH_SIMDGROUP=1`, or `QWEN38_DISABLE_SHORT_BATCH=1`; these switches progressively fall back to less specialized Q4 kernels and are diagnostic controls rather than production defaults.
+
+The adapter's MLP remains Q4 by default. `QWEN38_ENABLE_MTP_FP16_MLP=1` expands only that small adapter block into persistent FP16 Metal buffers (about 534 MiB of additional resident memory); on the tested M4 Pro 48 GiB system it measured about 15.3 tok/s versus about 20.4 tok/s for the default Q4 path, so it is an experimental option rather than the recommended profile. `QWEN38_DISABLE_MTP_MLX_FAST=1` disables the MTP-only MLX-style FC/LM-head dispatch for a controlled comparison, including when the global MLX decode experiment is enabled.
 
 ## Memory target
 

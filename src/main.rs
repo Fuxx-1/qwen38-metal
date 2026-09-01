@@ -80,7 +80,7 @@ fn print_help() {
          Usage:\n\
            qwen38-metal doctor\n\
            qwen38-metal plan [--context TOKENS] [--kv bf16|q8|q4] [--page-tokens TOKENS]\n\
-           qwen38-metal serve --model MODEL_DIR [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
+           qwen38-metal serve --model MODEL_DIR [--mtp-adapter ADAPTER_DIR] [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
            qwen38-metal serve --fixture-response TEXT [--model-id ID] [--host IP] [--port PORT] [--generation-concurrency COUNT] [--max-queued-requests COUNT]\n\
            qwen38-metal q4-probe MODEL_DIR [--tensor NAME] [--iterations COUNT] [--batch TOKENS]\n\
            qwen38-metal inspect-model MODEL_DIR\n\
@@ -90,7 +90,8 @@ fn print_help() {
          `serve --model` runs native Qwen inference and exposes OpenAI and Anthropic APIs.\n\
          `--fixture-response` is only for protocol validation. `plan` reports a 48 GiB M4 Pro\n\
          memory budget. `q4-probe` validates MLX Q4 Metal execution for one projection.\n\
-         `preflight` detects native MTP weights. Native inference defaults to one generation\n\
+         `preflight` detects native MTP weights. Set `--mtp-adapter` (or `QWEN38_MTP_ADAPTER`)\n\
+         to enable the matching standalone Qwen MTP drafter for deterministic decoding. Native inference defaults to one generation\n\
          lane and a 64-request bounded queue; increase lanes only after measuring the target\n\
          workload because this runtime uses latency-oriented per-request state instead of continuous batching."
     );
@@ -111,10 +112,8 @@ fn run_q4_probe(options: Q4ProbeOptions) -> Result<(), String> {
     let input: Vec<f32> = (0..input_len)
         .map(|index| ((index % 29) as f32 - 14.0) / 29.0)
         .collect();
-    let started = Instant::now();
-    let mut output = Vec::new();
-    for _ in 0..options.iterations {
-        output = if options.batch == 1 {
+    let run_projection = || -> Result<Vec<f32>, String> {
+        let output = if options.batch == 1 {
             weights
                 .q4_affine_matvec(&runtime, &matrix, &input)
                 .map_err(|error| error.to_string())?
@@ -124,6 +123,12 @@ fn run_q4_probe(options: Q4ProbeOptions) -> Result<(), String> {
                 .map_err(|error| error.to_string())?
                 .remove(0)
         };
+        Ok(output)
+    };
+    let started = Instant::now();
+    let mut output = Vec::new();
+    for _ in 0..options.iterations {
+        output = run_projection()?;
     }
     let elapsed = started.elapsed();
     let checksum = output.iter().map(|value| f64::from(*value)).sum::<f64>();
@@ -159,8 +164,15 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     }
     let (engine, execution_label): (Arc<dyn qwen38_metal::api::InferenceEngine>, &str) =
         if let Some(model_dir) = &options.model_dir {
-            let engine = NativeEngine::open(model_dir, options.model_id)
-                .map_err(|error| error.to_string())?;
+            let engine = match options.mtp_adapter.as_deref() {
+                Some(adapter) => NativeEngine::open_with_mtp(
+                    model_dir,
+                    options.model_id,
+                    Some(std::path::Path::new(adapter)),
+                ),
+                None => NativeEngine::open(model_dir, options.model_id),
+            }
+            .map_err(|error| error.to_string())?;
             (Arc::new(engine), "native")
         } else {
             let response = options.fixture_response.ok_or_else(|| {
@@ -398,6 +410,7 @@ struct ServeOptions {
     port: u16,
     model_id: String,
     model_dir: Option<String>,
+    mtp_adapter: Option<String>,
     context_tokens: u32,
     max_output_tokens: u32,
     api_key: Option<String>,
@@ -414,6 +427,7 @@ impl Default for ServeOptions {
             port: 8_000,
             model_id: "qwen3.8-27b".to_owned(),
             model_dir: None,
+            mtp_adapter: None,
             context_tokens: DEFAULT_CONTEXT_TOKENS,
             max_output_tokens: 4_096,
             api_key: None,
@@ -460,6 +474,12 @@ impl ServeOptions {
                     }
                 }
                 "--model" => options.model_dir = Some(value.clone()),
+                "--mtp-adapter" => {
+                    if value.is_empty() {
+                        return Err("--mtp-adapter cannot be empty".to_owned());
+                    }
+                    options.mtp_adapter = Some(value.clone());
+                }
                 "--model-id" => {
                     if value.is_empty() {
                         return Err("--model-id cannot be empty".to_owned());

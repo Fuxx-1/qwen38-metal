@@ -4,8 +4,8 @@ using namespace metal;
 
 // This library is built before the Rust binary is linked. Q4e dequantization,
 // paged Q8 KV attention, and Gated DeltaNet stay in this precompiled library;
-// MTP verification remains disabled until matching weights and rollback logic
-// are available for the loaded model.
+// MTP verification reuses these kernels, while acceptance and rollback are
+// coordinated by the native runtime.
 kernel void qwen38_warmup(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
@@ -40,6 +40,22 @@ inline float qwen38_q4_word_dot_values(
         float((packed >> 24u) & 0xFu),
         float((packed >> 28u) & 0xFu));
     return dot(values0, quantized0) + dot(values1, quantized1);
+}
+
+inline float4 qwen38_q4_low_values(uint packed) {
+    return float4(
+        float(packed & 0xFu),
+        float((packed >> 4u) & 0xFu),
+        float((packed >> 8u) & 0xFu),
+        float((packed >> 12u) & 0xFu));
+}
+
+inline float4 qwen38_q4_high_values(uint packed) {
+    return float4(
+        float((packed >> 16u) & 0xFu),
+        float((packed >> 20u) & 0xFu),
+        float((packed >> 24u) & 0xFu),
+        float((packed >> 28u) & 0xFu));
 }
 
 inline float qwen38_q4_word_dot(
@@ -84,6 +100,110 @@ inline float qwen38_q4_word_dot_threadgroup(
         float((packed >> 24u) & 0xFu),
         float((packed >> 28u) & 0xFu));
     return dot(values0, quantized0) + dot(values1, quantized1);
+}
+
+inline uint qwen38_load_u32(device const uchar* bytes, ulong address) {
+    return uint(bytes[address])
+        | (uint(bytes[address + 1ul]) << 8u)
+        | (uint(bytes[address + 2ul]) << 16u)
+        | (uint(bytes[address + 3ul]) << 24u);
+}
+
+inline ushort qwen38_load_u16(device const uchar* bytes, ulong address) {
+    return ushort(bytes[address])
+        | (ushort(bytes[address + 1ul]) << 8u);
+}
+
+// The default MTP round verifies one proposal. Once the target argmax is
+// available, this kernel selects the accepted target row and constructs the
+// next adapter FC input without sending a hidden vector or token ID through
+// the CPU. The embedding table stays in its mapped Q4 representation.
+kernel void qwen38_mtp_prepare_fc_input(
+    device const float* target_hidden [[buffer(0)]],
+    device uint* target_tokens [[buffer(1)]],
+    constant uint& draft_token [[buffer(2)]],
+    device const uchar* embedding_weights [[buffer(3)]],
+    device const uchar* embedding_scales [[buffer(4)]],
+    device const uchar* embedding_biases [[buffer(5)]],
+    device const float* embedding_norm [[buffer(6)]],
+    device const float* hidden_norm [[buffer(7)]],
+    device float* fc_input [[buffer(8)]],
+    constant uint& hidden_size [[buffer(9)]],
+    constant ulong& weight_byte_offset [[buffer(10)]],
+    constant ulong& scale_byte_offset [[buffer(11)]],
+    constant ulong& bias_byte_offset [[buffer(12)]],
+    constant float& epsilon [[buffer(13)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup uint selected_row;
+    threadgroup uint selected_token;
+    threadgroup float* embedding_partial = partial;
+    threadgroup float* hidden_partial = partial + 256u;
+
+    if (thread_index == 0u) {
+        selected_row = target_tokens[0] == draft_token ? 1u : 0u;
+        selected_token = target_tokens[selected_row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint packed_words_per_row = hidden_size / 8u;
+    const uint affine_groups_per_row = hidden_size / 64u;
+    float embedding_sum = 0.0f;
+    float hidden_sum = 0.0f;
+    for (uint index = thread_index; index < hidden_size; index += 256u) {
+        const ulong packed_address = weight_byte_offset
+            + (ulong(selected_token) * ulong(packed_words_per_row)
+                + ulong(index / 8u)) * 4ul;
+        const uint packed = qwen38_load_u32(embedding_weights, packed_address);
+        const float quantized = float((packed >> ((index % 8u) * 4u)) & 0xFu);
+        const ulong affine_index = ulong(selected_token) * ulong(affine_groups_per_row)
+            + ulong(index / 64u);
+        const float scale = qwen38_bf16_to_float(qwen38_load_u16(
+            embedding_scales,
+            scale_byte_offset + affine_index * 2ul));
+        const float bias = qwen38_bf16_to_float(qwen38_load_u16(
+            embedding_biases,
+            bias_byte_offset + affine_index * 2ul));
+        const float embedding = quantized * scale + bias;
+        const float hidden = target_hidden[selected_row * hidden_size + index];
+        embedding_sum += embedding * embedding;
+        hidden_sum += hidden * hidden;
+    }
+    embedding_partial[thread_index] = embedding_sum;
+    hidden_partial[thread_index] = hidden_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (thread_index < stride) {
+            embedding_partial[thread_index] += embedding_partial[thread_index + stride];
+            hidden_partial[thread_index] += hidden_partial[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float embedding_scale = rsqrt(embedding_partial[0] / float(hidden_size) + epsilon);
+    const float hidden_scale = rsqrt(hidden_partial[0] / float(hidden_size) + epsilon);
+    for (uint index = thread_index; index < hidden_size; index += 256u) {
+        const ulong packed_address = weight_byte_offset
+            + (ulong(selected_token) * ulong(packed_words_per_row)
+                + ulong(index / 8u)) * 4ul;
+        const uint packed = qwen38_load_u32(embedding_weights, packed_address);
+        const float quantized = float((packed >> ((index % 8u) * 4u)) & 0xFu);
+        const ulong affine_index = ulong(selected_token) * ulong(affine_groups_per_row)
+            + ulong(index / 64u);
+        const float scale = qwen38_bf16_to_float(qwen38_load_u16(
+            embedding_scales,
+            scale_byte_offset + affine_index * 2ul));
+        const float bias = qwen38_bf16_to_float(qwen38_load_u16(
+            embedding_biases,
+            bias_byte_offset + affine_index * 2ul));
+        fc_input[index] = (quantized * scale + bias) * embedding_scale * embedding_norm[index];
+        fc_input[hidden_size + index] = target_hidden[selected_row * hidden_size + index]
+            * hidden_scale * hidden_norm[index];
+    }
+    if (thread_index == 0u) {
+        target_tokens[0] = selected_row;
+        target_tokens[1] = selected_token;
+    }
 }
 
 // Decode-oriented path: one SIMD group owns one output row. The affine
@@ -1006,6 +1126,1924 @@ kernel void qwen38_q4_affine_matmul_unaligned(
     }
 }
 
+// Batch prefill/verification path for short rows. A 64-thread group contains
+// two SIMD groups; each SIMD group computes four output rows for one batch
+// row, so the input dimension is split across 32 lanes exactly as in the
+// single-token decode kernel. The batch dimension is carried by the grid and
+// never padded inside a threadgroup.
+#define QWEN38_BATCH_SIMD_OUTPUT_TILE 8u
+#define QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP 4u
+#define QWEN38_BATCH_SIMD_THREADS 64u
+#define QWEN38_BATCH_SIMD_VALUES_PER_LANE 16u
+#define QWEN38_BATCH_SIMD_VALUES_PER_BLOCK 512u
+
+kernel void qwen38_q4_affine_matmul_batch_simd(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint batch = tile.y;
+    const uint output_base = tile.x * QWEN38_BATCH_SIMD_OUTPUT_TILE;
+    const uint row0 = output_base + simd_group * QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+    const uint input_elements = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_batch_base = batch * input_elements;
+    const uint output_batch_base = batch * output_rows;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+    float result3 = 0.0f;
+
+    for (uint input_base = lane * QWEN38_BATCH_SIMD_VALUES_PER_LANE;
+         input_base < input_elements;
+         input_base += QWEN38_BATCH_SIMD_VALUES_PER_BLOCK) {
+        const float4 values0 = float4(
+            input[input_batch_base + input_base],
+            input[input_batch_base + input_base + 1u],
+            input[input_batch_base + input_base + 2u],
+            input[input_batch_base + input_base + 3u]);
+        const float4 values1 = float4(
+            input[input_batch_base + input_base + 4u],
+            input[input_batch_base + input_base + 5u],
+            input[input_batch_base + input_base + 6u],
+            input[input_batch_base + input_base + 7u]);
+        const float4 values2 = float4(
+            input[input_batch_base + input_base + 8u],
+            input[input_batch_base + input_base + 9u],
+            input[input_batch_base + input_base + 10u],
+            input[input_batch_base + input_base + 11u]);
+        const float4 values3 = float4(
+            input[input_batch_base + input_base + 12u],
+            input[input_batch_base + input_base + 13u],
+            input[input_batch_base + input_base + 14u],
+            input[input_batch_base + input_base + 15u]);
+        const float input_sum = values0.x + values0.y + values0.z + values0.w
+            + values1.x + values1.y + values1.z + values1.w
+            + values2.x + values2.y + values2.z + values2.w
+            + values3.x + values3.y + values3.z + values3.w;
+        const uint group = input_base / 64u;
+        const uint word = input_base / 8u;
+
+        if (row0 < output_rows) {
+            const uint weight_base = row0 * words_per_row + word;
+            const float scale = qwen38_bf16_to_float(scales[row0 * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases[row0 * groups_per_row + group]);
+            const float dot = qwen38_q4_word_dot_values(
+                    packed_weights[weight_base], values0, values1)
+                + qwen38_q4_word_dot_values(packed_weights[weight_base + 1u], values2, values3);
+            result0 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 1u < output_rows) {
+            const uint row = row0 + 1u;
+            const uint weight_base = row * words_per_row + word;
+            const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+            const float dot = qwen38_q4_word_dot_values(
+                    packed_weights[weight_base], values0, values1)
+                + qwen38_q4_word_dot_values(packed_weights[weight_base + 1u], values2, values3);
+            result1 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 2u < output_rows) {
+            const uint row = row0 + 2u;
+            const uint weight_base = row * words_per_row + word;
+            const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+            const float dot = qwen38_q4_word_dot_values(
+                    packed_weights[weight_base], values0, values1)
+                + qwen38_q4_word_dot_values(packed_weights[weight_base + 1u], values2, values3);
+            result2 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 3u < output_rows) {
+            const uint row = row0 + 3u;
+            const uint weight_base = row * words_per_row + word;
+            const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+            const float dot = qwen38_q4_word_dot_values(
+                    packed_weights[weight_base], values0, values1)
+                + qwen38_q4_word_dot_values(packed_weights[weight_base + 1u], values2, values3);
+            result3 += dot * scale + input_sum * bias;
+        }
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    result2 = simd_sum(result2);
+    result3 = simd_sum(result3);
+    if (lane == 0u) {
+        if (batch < batch_size && row0 < output_rows) {
+            output[output_batch_base + row0] = result0;
+        }
+        if (batch < batch_size && row0 + 1u < output_rows) {
+            output[output_batch_base + row0 + 1u] = result1;
+        }
+        if (batch < batch_size && row0 + 2u < output_rows) {
+            output[output_batch_base + row0 + 2u] = result2;
+        }
+        if (batch < batch_size && row0 + 3u < output_rows) {
+            output[output_batch_base + row0 + 3u] = result3;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_batch_simd_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    constant uint& batch_size [[buffer(10)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint batch = tile.y;
+    const uint output_base = tile.x * QWEN38_BATCH_SIMD_OUTPUT_TILE;
+    const uint row0 = output_base + simd_group * QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+    const uint input_elements = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_batch_base = batch * input_elements;
+    const uint output_batch_base = batch * output_rows;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+    float result3 = 0.0f;
+
+    for (uint input_base = lane * QWEN38_BATCH_SIMD_VALUES_PER_LANE;
+         input_base < input_elements;
+         input_base += QWEN38_BATCH_SIMD_VALUES_PER_BLOCK) {
+        const float4 values0 = float4(
+            input[input_batch_base + input_base],
+            input[input_batch_base + input_base + 1u],
+            input[input_batch_base + input_base + 2u],
+            input[input_batch_base + input_base + 3u]);
+        const float4 values1 = float4(
+            input[input_batch_base + input_base + 4u],
+            input[input_batch_base + input_base + 5u],
+            input[input_batch_base + input_base + 6u],
+            input[input_batch_base + input_base + 7u]);
+        const float4 values2 = float4(
+            input[input_batch_base + input_base + 8u],
+            input[input_batch_base + input_base + 9u],
+            input[input_batch_base + input_base + 10u],
+            input[input_batch_base + input_base + 11u]);
+        const float4 values3 = float4(
+            input[input_batch_base + input_base + 12u],
+            input[input_batch_base + input_base + 13u],
+            input[input_batch_base + input_base + 14u],
+            input[input_batch_base + input_base + 15u]);
+        const float input_sum = values0.x + values0.y + values0.z + values0.w
+            + values1.x + values1.y + values1.z + values1.w
+            + values2.x + values2.y + values2.z + values2.w
+            + values3.x + values3.y + values3.z + values3.w;
+        const uint group = input_base / 64u;
+        const uint word = input_base / 8u;
+
+        if (row0 < output_rows) {
+            const ulong parameter = ulong(row0 * groups_per_row + group) * 2ul;
+            const ulong weight_base = weight_byte_offset
+                + ulong(row0 * words_per_row + word) * 4ul;
+            const float scale = qwen38_bf16_to_float(
+                ushort(scales[scale_byte_offset + parameter])
+                    | (ushort(scales[scale_byte_offset + parameter + 1ul]) << 8u));
+            const float bias = qwen38_bf16_to_float(
+                ushort(biases[bias_byte_offset + parameter])
+                    | (ushort(biases[bias_byte_offset + parameter + 1ul]) << 8u));
+            const float dot = qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base), values0, values1)
+                + qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base + 4ul), values2, values3);
+            result0 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 1u < output_rows) {
+            const uint row = row0 + 1u;
+            const ulong parameter = ulong(row * groups_per_row + group) * 2ul;
+            const ulong weight_base = weight_byte_offset
+                + ulong(row * words_per_row + word) * 4ul;
+            const float scale = qwen38_bf16_to_float(
+                ushort(scales[scale_byte_offset + parameter])
+                    | (ushort(scales[scale_byte_offset + parameter + 1ul]) << 8u));
+            const float bias = qwen38_bf16_to_float(
+                ushort(biases[bias_byte_offset + parameter])
+                    | (ushort(biases[bias_byte_offset + parameter + 1ul]) << 8u));
+            const float dot = qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base), values0, values1)
+                + qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base + 4ul), values2, values3);
+            result1 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 2u < output_rows) {
+            const uint row = row0 + 2u;
+            const ulong parameter = ulong(row * groups_per_row + group) * 2ul;
+            const ulong weight_base = weight_byte_offset
+                + ulong(row * words_per_row + word) * 4ul;
+            const float scale = qwen38_bf16_to_float(
+                ushort(scales[scale_byte_offset + parameter])
+                    | (ushort(scales[scale_byte_offset + parameter + 1ul]) << 8u));
+            const float bias = qwen38_bf16_to_float(
+                ushort(biases[bias_byte_offset + parameter])
+                    | (ushort(biases[bias_byte_offset + parameter + 1ul]) << 8u));
+            const float dot = qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base), values0, values1)
+                + qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base + 4ul), values2, values3);
+            result2 += dot * scale + input_sum * bias;
+        }
+        if (row0 + 3u < output_rows) {
+            const uint row = row0 + 3u;
+            const ulong parameter = ulong(row * groups_per_row + group) * 2ul;
+            const ulong weight_base = weight_byte_offset
+                + ulong(row * words_per_row + word) * 4ul;
+            const float scale = qwen38_bf16_to_float(
+                ushort(scales[scale_byte_offset + parameter])
+                    | (ushort(scales[scale_byte_offset + parameter + 1ul]) << 8u));
+            const float bias = qwen38_bf16_to_float(
+                ushort(biases[bias_byte_offset + parameter])
+                    | (ushort(biases[bias_byte_offset + parameter + 1ul]) << 8u));
+            const float dot = qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base), values0, values1)
+                + qwen38_q4_word_dot_values(
+                    qwen38_load_u32(packed_weights, weight_base + 4ul), values2, values3);
+            result3 += dot * scale + input_sum * bias;
+        }
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    result2 = simd_sum(result2);
+    result3 = simd_sum(result3);
+    if (lane == 0u) {
+        if (batch < batch_size && row0 < output_rows) {
+            output[output_batch_base + row0] = result0;
+        }
+        if (batch < batch_size && row0 + 1u < output_rows) {
+            output[output_batch_base + row0 + 1u] = result1;
+        }
+        if (batch < batch_size && row0 + 2u < output_rows) {
+            output[output_batch_base + row0 + 2u] = result2;
+        }
+        if (batch < batch_size && row0 + 3u < output_rows) {
+            output[output_batch_base + row0 + 3u] = result3;
+        }
+    }
+}
+
+// Fused short-batch pair path. Each SIMD group computes four rows from both
+// matrices while loading the shared activation panel only once. This keeps
+// the input traffic of qkv/z and gate/up pairs close to a single projection.
+kernel void qwen38_q4_affine_matmul_pair_batch_simd(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights_a [[buffer(1)]],
+    device const ushort* scales_a [[buffer(2)]],
+    device const ushort* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    device const uint* packed_weights_b [[buffer(6)]],
+    device const ushort* scales_b [[buffer(7)]],
+    device const ushort* biases_b [[buffer(8)]],
+    device float* output_b [[buffer(9)]],
+    constant uint& output_rows_b [[buffer(10)]],
+    constant uint& words_per_row [[buffer(11)]],
+    constant uint& batch_size [[buffer(12)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint batch = tile.y;
+    const uint output_base = tile.x * QWEN38_BATCH_SIMD_OUTPUT_TILE;
+    const uint row0 = output_base + simd_group * QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+    const uint input_elements = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_batch_base = batch * input_elements;
+    const uint output_batch_base_a = batch * output_rows_a;
+    const uint output_batch_base_b = batch * output_rows_b;
+    float result_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float result_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint input_base = lane * QWEN38_BATCH_SIMD_VALUES_PER_LANE;
+         input_base < input_elements;
+         input_base += QWEN38_BATCH_SIMD_VALUES_PER_BLOCK) {
+        const float4 values0 = float4(
+            input[input_batch_base + input_base],
+            input[input_batch_base + input_base + 1u],
+            input[input_batch_base + input_base + 2u],
+            input[input_batch_base + input_base + 3u]);
+        const float4 values1 = float4(
+            input[input_batch_base + input_base + 4u],
+            input[input_batch_base + input_base + 5u],
+            input[input_batch_base + input_base + 6u],
+            input[input_batch_base + input_base + 7u]);
+        const float4 values2 = float4(
+            input[input_batch_base + input_base + 8u],
+            input[input_batch_base + input_base + 9u],
+            input[input_batch_base + input_base + 10u],
+            input[input_batch_base + input_base + 11u]);
+        const float4 values3 = float4(
+            input[input_batch_base + input_base + 12u],
+            input[input_batch_base + input_base + 13u],
+            input[input_batch_base + input_base + 14u],
+            input[input_batch_base + input_base + 15u]);
+        const float input_sum = values0.x + values0.y + values0.z + values0.w
+            + values1.x + values1.y + values1.z + values1.w
+            + values2.x + values2.y + values2.z + values2.w
+            + values3.x + values3.y + values3.z + values3.w;
+        const uint group = input_base / 64u;
+        const uint word = input_base / 8u;
+
+        for (uint row_offset = 0; row_offset < QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+             ++row_offset) {
+            const uint row = row0 + row_offset;
+            if (row < output_rows_a) {
+                const uint weight_base = row * words_per_row + word;
+                const float scale = qwen38_bf16_to_float(
+                    scales_a[row * groups_per_row + group]);
+                const float bias = qwen38_bf16_to_float(
+                    biases_a[row * groups_per_row + group]);
+                const float dot = qwen38_q4_word_dot_values(
+                        packed_weights_a[weight_base], values0, values1)
+                    + qwen38_q4_word_dot_values(
+                        packed_weights_a[weight_base + 1u], values2, values3);
+                result_a[row_offset] += dot * scale + input_sum * bias;
+            }
+            if (row < output_rows_b) {
+                const uint weight_base = row * words_per_row + word;
+                const float scale = qwen38_bf16_to_float(
+                    scales_b[row * groups_per_row + group]);
+                const float bias = qwen38_bf16_to_float(
+                    biases_b[row * groups_per_row + group]);
+                const float dot = qwen38_q4_word_dot_values(
+                        packed_weights_b[weight_base], values0, values1)
+                    + qwen38_q4_word_dot_values(
+                        packed_weights_b[weight_base + 1u], values2, values3);
+                result_b[row_offset] += dot * scale + input_sum * bias;
+            }
+        }
+    }
+
+    for (uint row_offset = 0; row_offset < QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+         ++row_offset) {
+        result_a[row_offset] = simd_sum(result_a[row_offset]);
+        result_b[row_offset] = simd_sum(result_b[row_offset]);
+    }
+    if (lane == 0u) {
+        for (uint row_offset = 0; row_offset < QWEN38_BATCH_SIMD_ROWS_PER_SIMDGROUP;
+             ++row_offset) {
+            const uint row = row0 + row_offset;
+            if (batch < batch_size && row < output_rows_a) {
+                output_a[output_batch_base_a + row] = result_a[row_offset];
+            }
+            if (batch < batch_size && row < output_rows_b) {
+                output_b[output_batch_base_b + row] = result_b[row_offset];
+            }
+        }
+    }
+}
+
+// Batch-3 MTP verification carries all three target rows through one SIMD
+// group. Each lane loads and unpacks a Q4 word once, then applies it to the
+// three independent activation rows without threadgroup staging or barriers.
+#define QWEN38_BATCH3_VECTOR_THREADS 32u
+
+kernel void qwen38_q4_affine_matmul_batch3_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    const uint third_input = input_elements * 2u;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+        const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float input_sum2 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = packed_weights[word_base + word];
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            const float4 values20 = float4(
+                input[third_input + offset], input[third_input + offset + 1u],
+                input[third_input + offset + 2u], input[third_input + offset + 3u]);
+            const float4 values21 = float4(
+                input[third_input + offset + 4u], input[third_input + offset + 5u],
+                input[third_input + offset + 6u], input[third_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            dot2 += dot(values20, quantized0) + dot(values21, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            input_sum2 += values20.x + values20.y + values20.z + values20.w
+                + values21.x + values21.y + values21.z + values21.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+        result2 += dot2 * scale + input_sum2 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    result2 = simd_sum(result2);
+    if (lane == 0u) {
+        output[row] = result0;
+        output[output_rows + row] = result1;
+        output[output_rows * 2u + row] = result2;
+    }
+}
+
+// Safetensors headers are not required to align every tensor payload to the
+// native Metal element type. Keep the same three-row reuse strategy for those
+// mapped ranges, but load the packed words and BF16 parameters by byte offset.
+kernel void qwen38_q4_affine_matmul_batch3_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    const uint third_input = input_elements * 2u;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+    float result2 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const ulong parameter_offset =
+            (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+        const float scale = qwen38_bf16_to_float(
+            qwen38_load_u16(scales, scale_byte_offset + parameter_offset));
+        const float bias = qwen38_bf16_to_float(
+            qwen38_load_u16(biases, bias_byte_offset + parameter_offset));
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float input_sum2 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = qwen38_load_u32(
+                packed_weights, weight_byte_offset + ulong(word_base + word) * 4ul);
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            const float4 values20 = float4(
+                input[third_input + offset], input[third_input + offset + 1u],
+                input[third_input + offset + 2u], input[third_input + offset + 3u]);
+            const float4 values21 = float4(
+                input[third_input + offset + 4u], input[third_input + offset + 5u],
+                input[third_input + offset + 6u], input[third_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            dot2 += dot(values20, quantized0) + dot(values21, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            input_sum2 += values20.x + values20.y + values20.z + values20.w
+                + values21.x + values21.y + values21.z + values21.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+        result2 += dot2 * scale + input_sum2 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    result2 = simd_sum(result2);
+    if (lane == 0u) {
+        output[row] = result0;
+        output[output_rows + row] = result1;
+        output[output_rows * 2u + row] = result2;
+    }
+}
+
+// The paired form retains the input and Q4 unpack reuse of the single-matrix
+// kernel for qkv/z and gate/up verification projections.
+kernel void qwen38_q4_affine_matmul_pair_batch3_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights_a [[buffer(1)]],
+    device const ushort* scales_a [[buffer(2)]],
+    device const ushort* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    device const uint* packed_weights_b [[buffer(6)]],
+    device const ushort* scales_b [[buffer(7)]],
+    device const ushort* biases_b [[buffer(8)]],
+    device float* output_b [[buffer(9)]],
+    constant uint& output_rows_b [[buffer(10)]],
+    constant uint& words_per_row [[buffer(11)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows_a && row >= output_rows_b) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    const uint third_input = input_elements * 2u;
+    float result_a0 = 0.0f;
+    float result_a1 = 0.0f;
+    float result_a2 = 0.0f;
+    float result_b0 = 0.0f;
+    float result_b1 = 0.0f;
+    float result_b2 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float input_sum2 = 0.0f;
+        float dot_a0 = 0.0f;
+        float dot_a1 = 0.0f;
+        float dot_a2 = 0.0f;
+        float dot_b0 = 0.0f;
+        float dot_b1 = 0.0f;
+        float dot_b2 = 0.0f;
+        const bool active_a = row < output_rows_a;
+        const bool active_b = row < output_rows_b;
+        const uint word_base = row * words_per_row + group * 8u;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            const float4 values20 = float4(
+                input[third_input + offset], input[third_input + offset + 1u],
+                input[third_input + offset + 2u], input[third_input + offset + 3u]);
+            const float4 values21 = float4(
+                input[third_input + offset + 4u], input[third_input + offset + 5u],
+                input[third_input + offset + 6u], input[third_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            input_sum2 += values20.x + values20.y + values20.z + values20.w
+                + values21.x + values21.y + values21.z + values21.w;
+            if (active_a) {
+                const uint packed = packed_weights_a[word_base + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a1 += dot(values10, quantized0) + dot(values11, quantized1);
+                dot_a2 += dot(values20, quantized0) + dot(values21, quantized1);
+            }
+            if (active_b) {
+                const uint packed = packed_weights_b[word_base + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b1 += dot(values10, quantized0) + dot(values11, quantized1);
+                dot_b2 += dot(values20, quantized0) + dot(values21, quantized1);
+            }
+        }
+        if (active_a) {
+            const float scale = qwen38_bf16_to_float(scales_a[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_a[row * groups_per_row + group]);
+            result_a0 += dot_a0 * scale + input_sum0 * bias;
+            result_a1 += dot_a1 * scale + input_sum1 * bias;
+            result_a2 += dot_a2 * scale + input_sum2 * bias;
+        }
+        if (active_b) {
+            const float scale = qwen38_bf16_to_float(scales_b[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_b[row * groups_per_row + group]);
+            result_b0 += dot_b0 * scale + input_sum0 * bias;
+            result_b1 += dot_b1 * scale + input_sum1 * bias;
+            result_b2 += dot_b2 * scale + input_sum2 * bias;
+        }
+    }
+
+    result_a0 = simd_sum(result_a0);
+    result_a1 = simd_sum(result_a1);
+    result_a2 = simd_sum(result_a2);
+    result_b0 = simd_sum(result_b0);
+    result_b1 = simd_sum(result_b1);
+    result_b2 = simd_sum(result_b2);
+    if (lane == 0u) {
+        if (row < output_rows_a) {
+            output_a[row] = result_a0;
+            output_a[output_rows_a + row] = result_a1;
+            output_a[output_rows_a * 2u + row] = result_a2;
+        }
+        if (row < output_rows_b) {
+            output_b[row] = result_b0;
+            output_b[output_rows_b + row] = result_b1;
+            output_b[output_rows_b * 2u + row] = result_b2;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_pair_batch3_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights_a [[buffer(1)]],
+    device const uchar* scales_a [[buffer(2)]],
+    device const uchar* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    constant ulong& weight_byte_offset_a [[buffer(6)]],
+    constant ulong& scale_byte_offset_a [[buffer(7)]],
+    constant ulong& bias_byte_offset_a [[buffer(8)]],
+    device const uchar* packed_weights_b [[buffer(9)]],
+    device const uchar* scales_b [[buffer(10)]],
+    device const uchar* biases_b [[buffer(11)]],
+    device float* output_b [[buffer(12)]],
+    constant uint& output_rows_b [[buffer(13)]],
+    constant ulong& weight_byte_offset_b [[buffer(14)]],
+    constant ulong& scale_byte_offset_b [[buffer(15)]],
+    constant ulong& bias_byte_offset_b [[buffer(16)]],
+    constant uint& words_per_row [[buffer(17)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows_a && row >= output_rows_b) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    const uint third_input = input_elements * 2u;
+    float result_a0 = 0.0f;
+    float result_a1 = 0.0f;
+    float result_a2 = 0.0f;
+    float result_b0 = 0.0f;
+    float result_b1 = 0.0f;
+    float result_b2 = 0.0f;
+    const bool active_a = row < output_rows_a;
+    const bool active_b = row < output_rows_b;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float input_sum2 = 0.0f;
+        float dot_a0 = 0.0f;
+        float dot_a1 = 0.0f;
+        float dot_a2 = 0.0f;
+        float dot_b0 = 0.0f;
+        float dot_b1 = 0.0f;
+        float dot_b2 = 0.0f;
+        const uint word_base = row * words_per_row + group * 8u;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            const float4 values20 = float4(
+                input[third_input + offset], input[third_input + offset + 1u],
+                input[third_input + offset + 2u], input[third_input + offset + 3u]);
+            const float4 values21 = float4(
+                input[third_input + offset + 4u], input[third_input + offset + 5u],
+                input[third_input + offset + 6u], input[third_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            input_sum2 += values20.x + values20.y + values20.z + values20.w
+                + values21.x + values21.y + values21.z + values21.w;
+            if (active_a) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_a, weight_byte_offset_a + ulong(word_base + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a1 += dot(values10, quantized0) + dot(values11, quantized1);
+                dot_a2 += dot(values20, quantized0) + dot(values21, quantized1);
+            }
+            if (active_b) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_b, weight_byte_offset_b + ulong(word_base + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b1 += dot(values10, quantized0) + dot(values11, quantized1);
+                dot_b2 += dot(values20, quantized0) + dot(values21, quantized1);
+            }
+        }
+        if (active_a) {
+            const ulong parameter_offset =
+                (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_a, scale_byte_offset_a + parameter_offset));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_a, bias_byte_offset_a + parameter_offset));
+            result_a0 += dot_a0 * scale + input_sum0 * bias;
+            result_a1 += dot_a1 * scale + input_sum1 * bias;
+            result_a2 += dot_a2 * scale + input_sum2 * bias;
+        }
+        if (active_b) {
+            const ulong parameter_offset =
+                (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_b, scale_byte_offset_b + parameter_offset));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_b, bias_byte_offset_b + parameter_offset));
+            result_b0 += dot_b0 * scale + input_sum0 * bias;
+            result_b1 += dot_b1 * scale + input_sum1 * bias;
+            result_b2 += dot_b2 * scale + input_sum2 * bias;
+        }
+    }
+
+    result_a0 = simd_sum(result_a0);
+    result_a1 = simd_sum(result_a1);
+    result_a2 = simd_sum(result_a2);
+    result_b0 = simd_sum(result_b0);
+    result_b1 = simd_sum(result_b1);
+    result_b2 = simd_sum(result_b2);
+    if (lane == 0u) {
+        if (row < output_rows_a) {
+            output_a[row] = result_a0;
+            output_a[output_rows_a + row] = result_a1;
+            output_a[output_rows_a * 2u + row] = result_a2;
+        }
+        if (row < output_rows_b) {
+            output_b[row] = result_b0;
+            output_b[output_rows_b + row] = result_b1;
+            output_b[output_rows_b * 2u + row] = result_b2;
+        }
+    }
+}
+
+// Batch-2 is the MTP tail shape when one draft token remains. Keep it
+// specialized instead of carrying an unused third accumulator through the
+// batch-3 kernel or falling back to a per-row batch-SIMD launch.
+kernel void qwen38_q4_affine_matmul_batch2_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+        const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = packed_weights[word_base + word];
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    if (lane == 0u) {
+        output[row] = result0;
+        output[output_rows + row] = result1;
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_batch2_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const ulong parameter_offset =
+            (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+        const float scale = qwen38_bf16_to_float(
+            qwen38_load_u16(scales, scale_byte_offset + parameter_offset));
+        const float bias = qwen38_bf16_to_float(
+            qwen38_load_u16(biases, bias_byte_offset + parameter_offset));
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = qwen38_load_u32(
+                packed_weights, weight_byte_offset + ulong(word_base + word) * 4ul);
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    if (lane == 0u) {
+        output[row] = result0;
+        output[output_rows + row] = result1;
+    }
+}
+
+// Batch-2 residual form. The projection result is accumulated directly into
+// the row-major residual stream, avoiding a temporary output matrix and a
+// separate add_rows dispatch for attention/MLP residuals.
+kernel void qwen38_q4_affine_matmul_batch2_vector_add(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* destination [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+        const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = packed_weights[word_base + word];
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    if (lane == 0u) {
+        destination[row] += result0;
+        destination[output_rows + row] += result1;
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_batch2_vector_add_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* destination [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result0 = 0.0f;
+    float result1 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const ulong parameter_offset =
+            (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+        const float scale = qwen38_bf16_to_float(
+            qwen38_load_u16(scales, scale_byte_offset + parameter_offset));
+        const float bias = qwen38_bf16_to_float(
+            qwen38_load_u16(biases, bias_byte_offset + parameter_offset));
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const uint packed = qwen38_load_u32(
+                packed_weights, weight_byte_offset + ulong(word_base + word) * 4ul);
+            const float4 quantized0 = qwen38_q4_low_values(packed);
+            const float4 quantized1 = qwen38_q4_high_values(packed);
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            dot0 += dot(values00, quantized0) + dot(values01, quantized1);
+            dot1 += dot(values10, quantized0) + dot(values11, quantized1);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+        }
+        result0 += dot0 * scale + input_sum0 * bias;
+        result1 += dot1 * scale + input_sum1 * bias;
+    }
+
+    result0 = simd_sum(result0);
+    result1 = simd_sum(result1);
+    if (lane == 0u) {
+        destination[row] += result0;
+        destination[output_rows + row] += result1;
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_pair_batch2_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights_a [[buffer(1)]],
+    device const ushort* scales_a [[buffer(2)]],
+    device const ushort* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    device const uint* packed_weights_b [[buffer(6)]],
+    device const ushort* scales_b [[buffer(7)]],
+    device const ushort* biases_b [[buffer(8)]],
+    device float* output_b [[buffer(9)]],
+    constant uint& output_rows_b [[buffer(10)]],
+    constant uint& words_per_row [[buffer(11)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows_a && row >= output_rows_b) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result_a0 = 0.0f;
+    float result_a1 = 0.0f;
+    float result_b0 = 0.0f;
+    float result_b1 = 0.0f;
+    const bool active_a = row < output_rows_a;
+    const bool active_b = row < output_rows_b;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float dot_a0 = 0.0f;
+        float dot_a1 = 0.0f;
+        float dot_b0 = 0.0f;
+        float dot_b1 = 0.0f;
+        const uint word_base = row * words_per_row + group * 8u;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            if (active_a) {
+                const uint packed = packed_weights_a[word_base + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a1 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b) {
+                const uint packed = packed_weights_b[word_base + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b1 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+        }
+        if (active_a) {
+            const float scale = qwen38_bf16_to_float(scales_a[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_a[row * groups_per_row + group]);
+            result_a0 += dot_a0 * scale + input_sum0 * bias;
+            result_a1 += dot_a1 * scale + input_sum1 * bias;
+        }
+        if (active_b) {
+            const float scale = qwen38_bf16_to_float(scales_b[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_b[row * groups_per_row + group]);
+            result_b0 += dot_b0 * scale + input_sum0 * bias;
+            result_b1 += dot_b1 * scale + input_sum1 * bias;
+        }
+    }
+
+    result_a0 = simd_sum(result_a0);
+    result_a1 = simd_sum(result_a1);
+    result_b0 = simd_sum(result_b0);
+    result_b1 = simd_sum(result_b1);
+    if (lane == 0u) {
+        if (active_a) {
+            output_a[row] = result_a0;
+            output_a[output_rows_a + row] = result_a1;
+        }
+        if (active_b) {
+            output_b[row] = result_b0;
+            output_b[output_rows_b + row] = result_b1;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_pair_batch2_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights_a [[buffer(1)]],
+    device const uchar* scales_a [[buffer(2)]],
+    device const uchar* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    constant ulong& weight_byte_offset_a [[buffer(6)]],
+    constant ulong& scale_byte_offset_a [[buffer(7)]],
+    constant ulong& bias_byte_offset_a [[buffer(8)]],
+    device const uchar* packed_weights_b [[buffer(9)]],
+    device const uchar* scales_b [[buffer(10)]],
+    device const uchar* biases_b [[buffer(11)]],
+    device float* output_b [[buffer(12)]],
+    constant uint& output_rows_b [[buffer(13)]],
+    constant ulong& weight_byte_offset_b [[buffer(14)]],
+    constant ulong& scale_byte_offset_b [[buffer(15)]],
+    constant ulong& bias_byte_offset_b [[buffer(16)]],
+    constant uint& words_per_row [[buffer(17)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= output_rows_a && row >= output_rows_b) {
+        return;
+    }
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result_a0 = 0.0f;
+    float result_a1 = 0.0f;
+    float result_b0 = 0.0f;
+    float result_b1 = 0.0f;
+    const bool active_a = row < output_rows_a;
+    const bool active_b = row < output_rows_b;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        float dot_a0 = 0.0f;
+        float dot_a1 = 0.0f;
+        float dot_b0 = 0.0f;
+        float dot_b1 = 0.0f;
+        const uint word_base = row * words_per_row + group * 8u;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            if (active_a) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_a, weight_byte_offset_a + ulong(word_base + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a1 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_b, weight_byte_offset_b + ulong(word_base + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b0 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b1 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+        }
+        if (active_a) {
+            const ulong parameter_offset =
+                (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_a, scale_byte_offset_a + parameter_offset));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_a, bias_byte_offset_a + parameter_offset));
+            result_a0 += dot_a0 * scale + input_sum0 * bias;
+            result_a1 += dot_a1 * scale + input_sum1 * bias;
+        }
+        if (active_b) {
+            const ulong parameter_offset =
+                (ulong(row) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_b, scale_byte_offset_b + parameter_offset));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_b, bias_byte_offset_b + parameter_offset));
+            result_b0 += dot_b0 * scale + input_sum0 * bias;
+            result_b1 += dot_b1 * scale + input_sum1 * bias;
+        }
+    }
+
+    result_a0 = simd_sum(result_a0);
+    result_a1 = simd_sum(result_a1);
+    result_b0 = simd_sum(result_b0);
+    result_b1 = simd_sum(result_b1);
+    if (lane == 0u) {
+        if (active_a) {
+            output_a[row] = result_a0;
+            output_a[output_rows_a + row] = result_a1;
+        }
+        if (active_b) {
+            output_b[row] = result_b0;
+            output_b[output_rows_b + row] = result_b1;
+        }
+    }
+}
+
+// Short speculative batches have too few rows to fill the 8x32 prefill tile.
+// One SIMD group owns one output row and accumulates up to eight prompt rows
+// at once. Q4 weights and affine parameters are loaded once per 64-value
+// group, then reused for every batch row; there are no threadgroup barriers or
+// padded batch lanes in this path.
+#define QWEN38_SHORT_BATCH_MAX 8u
+
+kernel void qwen38_q4_affine_matmul_short(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    float accum[QWEN38_SHORT_BATCH_MAX] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    for (uint group = lane; group < groups_per_row; group += 32u) {
+        const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+        const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+        const uint word_base = row * words_per_row + group * 8u;
+        const uint input_base = group * 64u;
+
+        for (uint word = 0; word < 8u; ++word) {
+            const uint packed = packed_weights[word_base + word];
+            const uint offset = input_base + word * 8u;
+            for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+                if (batch < batch_size) {
+                    const uint batch_offset = batch * input_width + offset;
+                    const float dot = qwen38_q4_word_dot(packed, input, batch_offset);
+                    const float input_sum = input[batch_offset]
+                        + input[batch_offset + 1u]
+                        + input[batch_offset + 2u]
+                        + input[batch_offset + 3u]
+                        + input[batch_offset + 4u]
+                        + input[batch_offset + 5u]
+                        + input[batch_offset + 6u]
+                        + input[batch_offset + 7u];
+                    accum[batch] += dot * scale + input_sum * bias;
+                }
+            }
+        }
+    }
+
+    for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+        accum[batch] = simd_sum(accum[batch]);
+    }
+    if (lane == 0u) {
+        for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+            if (batch < batch_size) {
+                output[batch * output_rows + row] = accum[batch];
+            }
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_short_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    constant uint& batch_size [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= output_rows) {
+        return;
+    }
+
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    float accum[QWEN38_SHORT_BATCH_MAX] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    for (uint group = lane; group < groups_per_row; group += 32u) {
+        const ulong parameter_offset = ulong(row * groups_per_row + group) * 2ul;
+        const ushort scale_bits = ushort(scales[scale_byte_offset + parameter_offset])
+            | (ushort(scales[scale_byte_offset + parameter_offset + 1ul]) << 8u);
+        const ushort bias_bits = ushort(biases[bias_byte_offset + parameter_offset])
+            | (ushort(biases[bias_byte_offset + parameter_offset + 1ul]) << 8u);
+        const float scale = qwen38_bf16_to_float(scale_bits);
+        const float bias = qwen38_bf16_to_float(bias_bits);
+        const ulong word_base = weight_byte_offset
+            + ulong(row * words_per_row + group * 8u) * 4ul;
+        const uint input_base = group * 64u;
+
+        for (uint word = 0; word < 8u; ++word) {
+            const ulong address = word_base + ulong(word) * 4ul;
+            const uint packed = uint(packed_weights[address])
+                | (uint(packed_weights[address + 1ul]) << 8u)
+                | (uint(packed_weights[address + 2ul]) << 16u)
+                | (uint(packed_weights[address + 3ul]) << 24u);
+            const uint offset = input_base + word * 8u;
+            for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+                if (batch < batch_size) {
+                    const uint batch_offset = batch * input_width + offset;
+                    const float dot = qwen38_q4_word_dot(packed, input, batch_offset);
+                    const float input_sum = input[batch_offset]
+                        + input[batch_offset + 1u]
+                        + input[batch_offset + 2u]
+                        + input[batch_offset + 3u]
+                        + input[batch_offset + 4u]
+                        + input[batch_offset + 5u]
+                        + input[batch_offset + 6u]
+                        + input[batch_offset + 7u];
+                    accum[batch] += dot * scale + input_sum * bias;
+                }
+            }
+        }
+    }
+
+    for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+        accum[batch] = simd_sum(accum[batch]);
+    }
+    if (lane == 0u) {
+        for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+            if (batch < batch_size) {
+                output[batch * output_rows + row] = accum[batch];
+            }
+        }
+    }
+}
+
+// Tile eight output rows per threadgroup so the short-batch path still
+// reuses one staged activation panel across multiple rows. Each SIMD group
+// owns one output row; the group collectively stages at most 8x64 values and
+// avoids the 32-row weight/parameter tile used by the generic kernel.
+#define QWEN38_SHORT_OUTPUT_TILE 8u
+#define QWEN38_SHORT_THREADS (QWEN38_SHORT_OUTPUT_TILE * 32u)
+
+kernel void qwen38_q4_affine_matmul_short_tile(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    threadgroup float* input_tile [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint row = tile * QWEN38_SHORT_OUTPUT_TILE + thread_index / 32u;
+    const uint lane = thread_index % 32u;
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    float accum[QWEN38_SHORT_BATCH_MAX] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    for (uint group = 0; group < groups_per_row; ++group) {
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_BATCH_MAX * 64u;
+             index += QWEN38_SHORT_THREADS) {
+            const uint batch = index / 64u;
+            const uint element = index % 64u;
+            input_tile[index] = batch < batch_size
+                ? input[batch * input_width + group * 64u + element]
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < output_rows && (group % 32u) == lane) {
+            const float scale = qwen38_bf16_to_float(scales[row * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases[row * groups_per_row + group]);
+            const uint word_base = row * words_per_row + group * 8u;
+            for (uint word = 0; word < 8u; ++word) {
+                const uint packed = packed_weights[word_base + word];
+                const uint offset = word * 8u;
+                for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+                    if (batch < batch_size) {
+                        const float dot = qwen38_q4_word_dot_threadgroup(
+                            packed, input_tile, batch * 64u + offset);
+                        const float input_sum = input_tile[batch * 64u + offset]
+                            + input_tile[batch * 64u + offset + 1u]
+                            + input_tile[batch * 64u + offset + 2u]
+                            + input_tile[batch * 64u + offset + 3u]
+                            + input_tile[batch * 64u + offset + 4u]
+                            + input_tile[batch * 64u + offset + 5u]
+                            + input_tile[batch * 64u + offset + 6u]
+                            + input_tile[batch * 64u + offset + 7u];
+                        accum[batch] += dot * scale + input_sum * bias;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+        accum[batch] = simd_sum(accum[batch]);
+    }
+    if (lane == 0u && row < output_rows) {
+        for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+            if (batch < batch_size) {
+                output[batch * output_rows + row] = accum[batch];
+            }
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_short_tile_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    constant uint& batch_size [[buffer(10)]],
+    threadgroup float* input_tile [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint row = tile * QWEN38_SHORT_OUTPUT_TILE + thread_index / 32u;
+    const uint lane = thread_index % 32u;
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / 8u;
+    float accum[QWEN38_SHORT_BATCH_MAX] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    for (uint group = 0; group < groups_per_row; ++group) {
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_BATCH_MAX * 64u;
+             index += QWEN38_SHORT_THREADS) {
+            const uint batch = index / 64u;
+            const uint element = index % 64u;
+            input_tile[index] = batch < batch_size
+                ? input[batch * input_width + group * 64u + element]
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < output_rows && (group % 32u) == lane) {
+            const ulong parameter_offset = ulong(row * groups_per_row + group) * 2ul;
+            const ushort scale_bits = ushort(scales[scale_byte_offset + parameter_offset])
+                | (ushort(scales[scale_byte_offset + parameter_offset + 1ul]) << 8u);
+            const ushort bias_bits = ushort(biases[bias_byte_offset + parameter_offset])
+                | (ushort(biases[bias_byte_offset + parameter_offset + 1ul]) << 8u);
+            const float scale = qwen38_bf16_to_float(scale_bits);
+            const float bias = qwen38_bf16_to_float(bias_bits);
+            const ulong word_base = weight_byte_offset
+                + ulong(row * words_per_row + group * 8u) * 4ul;
+            for (uint word = 0; word < 8u; ++word) {
+                const ulong address = word_base + ulong(word) * 4ul;
+                const uint packed = uint(packed_weights[address])
+                    | (uint(packed_weights[address + 1ul]) << 8u)
+                    | (uint(packed_weights[address + 2ul]) << 16u)
+                    | (uint(packed_weights[address + 3ul]) << 24u);
+                const uint offset = word * 8u;
+                for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+                    if (batch < batch_size) {
+                        const float dot = qwen38_q4_word_dot_threadgroup(
+                            packed, input_tile, batch * 64u + offset);
+                        const float input_sum = input_tile[batch * 64u + offset]
+                            + input_tile[batch * 64u + offset + 1u]
+                            + input_tile[batch * 64u + offset + 2u]
+                            + input_tile[batch * 64u + offset + 3u]
+                            + input_tile[batch * 64u + offset + 4u]
+                            + input_tile[batch * 64u + offset + 5u]
+                            + input_tile[batch * 64u + offset + 6u]
+                            + input_tile[batch * 64u + offset + 7u];
+                        accum[batch] += dot * scale + input_sum * bias;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+        accum[batch] = simd_sum(accum[batch]);
+    }
+    if (lane == 0u && row < output_rows) {
+        for (uint batch = 0; batch < QWEN38_SHORT_BATCH_MAX; ++batch) {
+            if (batch < batch_size) {
+                output[batch * output_rows + row] = accum[batch];
+            }
+        }
+    }
+}
+
+// Compact short-batch tile: retain the 32-output-row weight reuse of the
+// regular prefill kernel, but launch exactly batch_size SIMD groups. A batch
+// of three therefore uses 96 threads instead of 256 while keeping one staged
+// Q4 weight tile for all batch rows.
+#define QWEN38_SHORT_COMPACT_OUTPUT_TILE 32u
+#define QWEN38_SHORT_COMPACT_WORDS_PER_GROUP 8u
+#define QWEN38_SHORT_COMPACT_INPUT_TILE_FLOATS 512u
+#define QWEN38_SHORT_COMPACT_PACKED_TILE_WORDS 256u
+#define QWEN38_SHORT_COMPACT_AFFINE_TILE_FLOATS 64u
+
+kernel void qwen38_q4_affine_matmul_short_compact(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    constant uint& batch_size [[buffer(7)]],
+    threadgroup float* input_tile [[threadgroup(0)]],
+    threadgroup uint* packed_tile [[threadgroup(1)]],
+    threadgroup float* affine_tile [[threadgroup(2)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint thread_count = batch_size * 32u;
+    const uint local_batch = thread_index / 32u;
+    const uint local_row = thread_index % 32u;
+    const uint batch = local_batch;
+    const uint row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + local_row;
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+    threadgroup float* scale_tile = affine_tile;
+    threadgroup float* bias_tile = affine_tile + QWEN38_SHORT_COMPACT_OUTPUT_TILE;
+    float accumulator = 0.0f;
+
+    for (uint affine_group = 0; affine_group < groups_per_row; ++affine_group) {
+        for (uint index = thread_index;
+             index < batch_size * 64u;
+             index += thread_count) {
+            const uint staged_batch = index / 64u;
+            const uint staged_element = index % 64u;
+            input_tile[index] = input[staged_batch * input_width
+                + affine_group * 64u + staged_element];
+        }
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_COMPACT_PACKED_TILE_WORDS;
+             index += thread_count) {
+            const uint packed_row = index / QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            const uint packed_word = index % QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            const uint staged_row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + packed_row;
+            packed_tile[index] = staged_row < output_rows
+                ? packed_weights[staged_row * words_per_row
+                    + affine_group * QWEN38_SHORT_COMPACT_WORDS_PER_GROUP + packed_word]
+                : 0u;
+        }
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_COMPACT_OUTPUT_TILE;
+             index += thread_count) {
+            const uint parameter_row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + index;
+            const uint parameter_index = parameter_row * groups_per_row + affine_group;
+            scale_tile[index] = parameter_row < output_rows
+                ? qwen38_bf16_to_float(scales[parameter_index])
+                : 0.0f;
+            bias_tile[index] = parameter_row < output_rows
+                ? qwen38_bf16_to_float(biases[parameter_index])
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint input_base = local_batch * 64u;
+        const float input_sum = simd_sum(
+            input_tile[input_base + local_row] + input_tile[input_base + local_row + 32u]);
+        if (batch < batch_size && row < output_rows) {
+            const float scale = scale_tile[local_row];
+            const float bias = bias_tile[local_row];
+            const uint packed_base = local_row * QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            float dot_sum = 0.0f;
+            for (uint word = 0; word < QWEN38_SHORT_COMPACT_WORDS_PER_GROUP; ++word) {
+                dot_sum += qwen38_q4_word_dot_threadgroup(
+                    packed_tile[packed_base + word], input_tile, input_base + word * 8u);
+            }
+            accumulator += dot_sum * scale + input_sum * bias;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (batch < batch_size && row < output_rows) {
+        output[batch * output_rows + row] = accumulator;
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_short_compact_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    constant uint& batch_size [[buffer(10)]],
+    threadgroup float* input_tile [[threadgroup(0)]],
+    threadgroup uint* packed_tile [[threadgroup(1)]],
+    threadgroup float* affine_tile [[threadgroup(2)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint thread_count = batch_size * 32u;
+    const uint local_batch = thread_index / 32u;
+    const uint local_row = thread_index % 32u;
+    const uint batch = local_batch;
+    const uint row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + local_row;
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+    threadgroup float* scale_tile = affine_tile;
+    threadgroup float* bias_tile = affine_tile + QWEN38_SHORT_COMPACT_OUTPUT_TILE;
+    float accumulator = 0.0f;
+
+    for (uint affine_group = 0; affine_group < groups_per_row; ++affine_group) {
+        for (uint index = thread_index;
+             index < batch_size * 64u;
+             index += thread_count) {
+            const uint staged_batch = index / 64u;
+            const uint staged_element = index % 64u;
+            input_tile[index] = input[staged_batch * input_width
+                + affine_group * 64u + staged_element];
+        }
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_COMPACT_PACKED_TILE_WORDS;
+             index += thread_count) {
+            const uint packed_row = index / QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            const uint packed_word = index % QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            const uint staged_row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + packed_row;
+            if (staged_row < output_rows) {
+                const ulong weight_address = weight_byte_offset
+                    + (ulong(staged_row) * ulong(words_per_row)
+                        + ulong(affine_group * QWEN38_SHORT_COMPACT_WORDS_PER_GROUP
+                            + packed_word))
+                        * 4ul;
+                packed_tile[index] = uint(packed_weights[weight_address])
+                    | (uint(packed_weights[weight_address + 1ul]) << 8u)
+                    | (uint(packed_weights[weight_address + 2ul]) << 16u)
+                    | (uint(packed_weights[weight_address + 3ul]) << 24u);
+            } else {
+                packed_tile[index] = 0u;
+            }
+        }
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_COMPACT_OUTPUT_TILE;
+             index += thread_count) {
+            const uint parameter_row = tile.x * QWEN38_SHORT_COMPACT_OUTPUT_TILE + index;
+            const ulong parameter_index = ulong(parameter_row * groups_per_row
+                + affine_group) * 2ul;
+            if (parameter_row < output_rows) {
+                const ulong scale_address = scale_byte_offset + parameter_index;
+                const ulong bias_address = bias_byte_offset + parameter_index;
+                const ushort scale_bits = ushort(scales[scale_address])
+                    | (ushort(scales[scale_address + 1ul]) << 8u);
+                const ushort bias_bits = ushort(biases[bias_address])
+                    | (ushort(biases[bias_address + 1ul]) << 8u);
+                scale_tile[index] = qwen38_bf16_to_float(scale_bits);
+                bias_tile[index] = qwen38_bf16_to_float(bias_bits);
+            } else {
+                scale_tile[index] = 0.0f;
+                bias_tile[index] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint input_base = local_batch * 64u;
+        const float input_sum = simd_sum(
+            input_tile[input_base + local_row] + input_tile[input_base + local_row + 32u]);
+        if (batch < batch_size && row < output_rows) {
+            const float scale = scale_tile[local_row];
+            const float bias = bias_tile[local_row];
+            const uint packed_base = local_row * QWEN38_SHORT_COMPACT_WORDS_PER_GROUP;
+            float dot_sum = 0.0f;
+            for (uint word = 0; word < QWEN38_SHORT_COMPACT_WORDS_PER_GROUP; ++word) {
+                dot_sum += qwen38_q4_word_dot_threadgroup(
+                    packed_tile[packed_base + word], input_tile, input_base + word * 8u);
+            }
+            accumulator += dot_sum * scale + input_sum * bias;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (batch < batch_size && row < output_rows) {
+        output[batch * output_rows + row] = accumulator;
+    }
+}
+
+// Pair variant for the short verification batch. Two projections consume the
+// same activation panel, so staging that panel and synchronizing once for both
+// outputs removes a large fraction of the barrier and launch overhead in every
+// DeltaNet/MLP layer. The two matrices have the same input width but may have
+// different output widths (for example qkv+z).
+#define QWEN38_SHORT_PAIR_OUTPUT_TILE 32u
+#define QWEN38_SHORT_PAIR_WORDS_PER_GROUP 8u
+#define QWEN38_SHORT_PAIR_PACKED_TILE_WORDS 256u
+#define QWEN38_SHORT_PAIR_AFFINE_TILE_FLOATS 128u
+
+kernel void qwen38_q4_affine_matmul_pair_short_compact(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights_a [[buffer(1)]],
+    device const ushort* scales_a [[buffer(2)]],
+    device const ushort* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    device const uint* packed_weights_b [[buffer(6)]],
+    device const ushort* scales_b [[buffer(7)]],
+    device const ushort* biases_b [[buffer(8)]],
+    device float* output_b [[buffer(9)]],
+    constant uint& output_rows_b [[buffer(10)]],
+    constant uint& words_per_row [[buffer(11)]],
+    constant uint& batch_size [[buffer(12)]],
+    threadgroup float* input_tile [[threadgroup(0)]],
+    threadgroup uint* packed_tile [[threadgroup(1)]],
+    threadgroup uint* packed_tile_b [[threadgroup(2)]],
+    threadgroup float* affine_tile [[threadgroup(3)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    const uint thread_count = batch_size * 32u;
+    const uint local_batch = thread_index / 32u;
+    const uint local_row = thread_index % 32u;
+    const uint row = tile * QWEN38_SHORT_PAIR_OUTPUT_TILE + local_row;
+    const uint input_width = words_per_row * 8u;
+    const uint groups_per_row = words_per_row / QWEN38_SHORT_PAIR_WORDS_PER_GROUP;
+    threadgroup float* scale_a = affine_tile;
+    threadgroup float* bias_a = affine_tile + 32u;
+    threadgroup float* scale_b = affine_tile + 64u;
+    threadgroup float* bias_b = affine_tile + 96u;
+    float accumulator_a = 0.0f;
+    float accumulator_b = 0.0f;
+
+    for (uint affine_group = 0; affine_group < groups_per_row; ++affine_group) {
+        for (uint index = thread_index;
+             index < batch_size * 64u;
+             index += thread_count) {
+            const uint staged_batch = index / 64u;
+            const uint staged_element = index % 64u;
+            input_tile[index] = input[staged_batch * input_width
+                + affine_group * 64u + staged_element];
+        }
+        for (uint index = thread_index;
+             index < QWEN38_SHORT_PAIR_PACKED_TILE_WORDS;
+             index += thread_count) {
+            const uint packed_row = index / 8u;
+            const uint packed_word = index % 8u;
+            const uint staged_row = tile * QWEN38_SHORT_PAIR_OUTPUT_TILE + packed_row;
+            packed_tile[index] = staged_row < output_rows_a
+                ? packed_weights_a[staged_row * words_per_row
+                    + affine_group * 8u + packed_word]
+                : 0u;
+            packed_tile_b[index] = staged_row < output_rows_b
+                ? packed_weights_b[staged_row * words_per_row
+                    + affine_group * 8u + packed_word]
+                : 0u;
+        }
+        for (uint index = thread_index;
+             index < 32u;
+             index += thread_count) {
+            const uint parameter_row = tile * QWEN38_SHORT_PAIR_OUTPUT_TILE + index;
+            const uint parameter_index = parameter_row * groups_per_row + affine_group;
+            scale_a[index] = parameter_row < output_rows_a
+                ? qwen38_bf16_to_float(scales_a[parameter_index])
+                : 0.0f;
+            bias_a[index] = parameter_row < output_rows_a
+                ? qwen38_bf16_to_float(biases_a[parameter_index])
+                : 0.0f;
+            scale_b[index] = parameter_row < output_rows_b
+                ? qwen38_bf16_to_float(scales_b[parameter_index])
+                : 0.0f;
+            bias_b[index] = parameter_row < output_rows_b
+                ? qwen38_bf16_to_float(biases_b[parameter_index])
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (local_batch < batch_size) {
+            const uint input_base = local_batch * 64u;
+            // Each lane contributes two values; the SIMD reduction gives the
+            // same 64-value affine sum to every output-row lane in this batch.
+            const float input_sum = simd_sum(
+                input_tile[input_base + local_row]
+                    + input_tile[input_base + local_row + 32u]);
+            if (row < output_rows_a) {
+                float dot = 0.0f;
+                for (uint word = 0; word < 8u; ++word) {
+                    dot += qwen38_q4_word_dot_threadgroup(
+                        packed_tile[local_row * 8u + word],
+                        input_tile,
+                        input_base + word * 8u);
+                }
+                accumulator_a += dot * scale_a[local_row] + input_sum * bias_a[local_row];
+            }
+            if (row < output_rows_b) {
+                float dot = 0.0f;
+                for (uint word = 0; word < 8u; ++word) {
+                    dot += qwen38_q4_word_dot_threadgroup(
+                        packed_tile_b[local_row * 8u + word],
+                        input_tile,
+                        input_base + word * 8u);
+                }
+                accumulator_b += dot * scale_b[local_row] + input_sum * bias_b[local_row];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (local_batch < batch_size && row < output_rows_a) {
+        output_a[local_batch * output_rows_a + row] = accumulator_a;
+    }
+    if (local_batch < batch_size && row < output_rows_b) {
+        output_b[local_batch * output_rows_b + row] = accumulator_b;
+    }
+}
+
 // Long prompts need a different balance from decode: reuse every Q4 weight
 // tile across 64 prompt rows and let each SIMD group execute an 8x8 matrix
 // accumulation. Activations and the transient dequantized Q4 tile are half
@@ -1446,6 +3484,54 @@ kernel void qwen38_swiglu_rows(
     }
 }
 
+// MTP verification only needs the winning token for each target row. Reduce
+// the Q4 LM-head output on the GPU so the host does not copy a full
+// batch-by-vocab logits matrix over the shared-memory boundary every round.
+kernel void qwen38_argmax_rows(
+    device const float* logits [[buffer(0)]],
+    device uint* tokens [[buffer(1)]],
+    constant uint& vocab_size [[buffer(2)]],
+    constant uint& batch_size [[buffer(3)]],
+    threadgroup float* partial_values [[threadgroup(0)]],
+    threadgroup uint* partial_indices [[threadgroup(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= batch_size) {
+        return;
+    }
+
+    const uint base = row * vocab_size;
+    float best_value = -INFINITY;
+    uint best_index = 0u;
+    for (uint index = lane; index < vocab_size; index += 256u) {
+        const float value = logits[base + index];
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    partial_values[lane] = best_value;
+    partial_indices[lane] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            const float other_value = partial_values[lane + stride];
+            const uint other_index = partial_indices[lane + stride];
+            if (other_value > partial_values[lane]
+                || (other_value == partial_values[lane]
+                    && other_index < partial_indices[lane])) {
+                partial_values[lane] = other_value;
+                partial_indices[lane] = other_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        tokens[row] = partial_indices[0];
+    }
+}
+
 // Decode keeps the residual stream on the GPU across linear-attention
 // layers. One threadgroup handles the small hidden vector, which avoids a
 // host round-trip for the two RMSNorm operations in every layer.
@@ -1476,12 +3562,60 @@ kernel void qwen38_rms_norm(
     }
 }
 
+// Batched RMSNorm keeps a short speculative verification block on the GPU.
+// Each threadgroup owns one row; this is deliberately separate from the
+// single-row decode kernel so the row stride stays explicit and contiguous.
+kernel void qwen38_rms_norm_rows(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& elements [[buffer(3)]],
+    constant uint& batch_size [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    if (row >= batch_size) {
+        return;
+    }
+    const uint base = row * elements;
+    float sum = 0.0f;
+    for (uint index = thread_index; index < elements; index += 256u) {
+        const float value = input[base + index];
+        sum += value * value;
+    }
+    partial[thread_index] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (thread_index < stride) {
+            partial[thread_index] += partial[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = rsqrt(partial[0] / float(elements) + epsilon);
+    for (uint index = thread_index; index < elements; index += 256u) {
+        output[base + index] = input[base + index] * scale * weights[index];
+    }
+}
+
 kernel void qwen38_add_in_place(
     device float* destination [[buffer(0)]],
     device const float* source [[buffer(1)]],
     constant uint& elements [[buffer(2)]],
     uint index [[thread_position_in_grid]]) {
     if (index < elements) {
+        destination[index] += source[index];
+    }
+}
+
+kernel void qwen38_add_rows(
+    device float* destination [[buffer(0)]],
+    device const float* source [[buffer(1)]],
+    constant uint& elements [[buffer(2)]],
+    constant uint& batch_size [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint total = elements * batch_size;
+    if (index < total) {
         destination[index] += source[index];
     }
 }
@@ -1690,16 +3824,23 @@ kernel void qwen38_deltanet_prefill(
     device const float* a_log [[buffer(5)]],
     device const float* dt_bias [[buffer(6)]],
     device const float* norm [[buffer(7)]],
-    device float* conv_history [[buffer(8)]],
-    device float* recurrent [[buffer(9)]],
-    device float* output [[buffer(10)]],
-    constant uint& batch_size [[buffer(11)]],
-    constant uint& key_heads [[buffer(12)]],
-    constant uint& value_heads [[buffer(13)]],
-    constant uint& key_head_dim [[buffer(14)]],
-    constant uint& value_head_dim [[buffer(15)]],
-    constant uint& conv_kernel_size [[buffer(16)]],
-    constant float& epsilon [[buffer(17)]],
+    device const float* initial_conv_history [[buffer(8)]],
+    device const float* initial_recurrent [[buffer(9)]],
+    device float* conv_history [[buffer(10)]],
+    device float* recurrent [[buffer(11)]],
+    device float* output [[buffer(12)]],
+    device float* snapshot_conv_history [[buffer(20)]],
+    device float* snapshot_recurrent [[buffer(21)]],
+    constant uint& batch_size [[buffer(13)]],
+    constant uint& key_heads [[buffer(14)]],
+    constant uint& value_heads [[buffer(15)]],
+    constant uint& key_head_dim [[buffer(16)]],
+    constant uint& value_head_dim [[buffer(17)]],
+    constant uint& conv_kernel_size [[buffer(18)]],
+    constant float& epsilon [[buffer(19)]],
+    constant uint& snapshot_rows [[buffer(22)]],
+    constant uint& snapshot_conv_stride [[buffer(23)]],
+    constant uint& snapshot_recurrent_stride [[buffer(24)]],
     threadgroup float* scratch [[threadgroup(0)]],
     uint key_head [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -1731,10 +3872,14 @@ kernel void qwen38_deltanet_prefill(
             float key_sum = conv_weight[key_channel * conv_kernel_size + history_width]
                 * qkv[qkv_base + key_channel];
             for (uint tap = 0; tap < history_width; ++tap) {
-                query_sum += conv_weight[query_channel * conv_kernel_size + tap]
-                    * conv_history[query_history_base + tap];
-                key_sum += conv_weight[key_channel * conv_kernel_size + tap]
-                    * conv_history[key_history_base + tap];
+                const float query_history = token == 0
+                    ? initial_conv_history[query_history_base + tap]
+                    : conv_history[query_history_base + tap];
+                const float key_history = token == 0
+                    ? initial_conv_history[key_history_base + tap]
+                    : conv_history[key_history_base + tap];
+                query_sum += conv_weight[query_channel * conv_kernel_size + tap] * query_history;
+                key_sum += conv_weight[key_channel * conv_kernel_size + tap] * key_history;
             }
             query_values[thread_index] = qwen38_silu(query_sum);
             key_values[thread_index] = qwen38_silu(key_sum);
@@ -1783,8 +3928,10 @@ kernel void qwen38_deltanet_prefill(
             float value_sum = conv_weight[value_channel * conv_kernel_size + history_width]
                 * qkv[qkv_base + value_channel];
             for (uint tap = 0; tap < history_width; ++tap) {
-                value_sum += conv_weight[value_channel * conv_kernel_size + tap]
-                    * conv_history[value_history_base + tap];
+                const float value_history = token == 0
+                    ? initial_conv_history[value_history_base + tap]
+                    : conv_history[value_history_base + tap];
+                value_sum += conv_weight[value_channel * conv_kernel_size + tap] * value_history;
             }
             if (history_width > 0) {
                 for (uint tap = 0; tap + 1 < history_width; ++tap) {
@@ -1799,7 +3946,10 @@ kernel void qwen38_deltanet_prefill(
             float kv_mem = 0.0f;
             for (uint key_index = 0; key_index < key_head_dim; ++key_index) {
                 const uint state_index = state_base + key_index;
-                const float state_value = recurrent[state_index] * decay;
+                const float prior_state = token == 0
+                    ? initial_recurrent[state_index]
+                    : recurrent[state_index];
+                const float state_value = prior_state * decay;
                 recurrent[state_index] = state_value;
                 kv_mem += state_value * key_values[key_index];
             }
@@ -1836,6 +3986,44 @@ kernel void qwen38_deltanet_prefill(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+
+        // Preserve the causal state after each row while all writes are
+        // complete. Each key-head group owns disjoint q/k/value and recurrent
+        // ranges, so snapshots can be filled in parallel without atomics.
+        if (token < snapshot_rows) {
+            const uint snapshot_conv_base = token * snapshot_conv_stride;
+            const uint snapshot_recurrent_base = token * snapshot_recurrent_stride;
+            const uint key_elements_per_head = key_head_dim;
+            const uint value_elements_per_key = repeat * value_head_dim;
+            const uint history_stride = conv_kernel_size - 1u;
+            const uint q_state_base = key_head * key_elements_per_head * history_stride;
+            const uint k_state_base = key_elements * history_stride + q_state_base;
+            const uint v_state_base = 2u * key_elements * history_stride
+                + key_head * value_elements_per_key * history_stride;
+            const uint recurrent_stride = value_elements_per_key * key_head_dim;
+            const uint recurrent_base = key_head * recurrent_stride;
+            for (uint index = thread_index;
+                 index < key_elements_per_head * history_stride;
+                 index += QWEN38_PREFILL_THREADS) {
+                snapshot_conv_history[snapshot_conv_base + q_state_base + index]
+                    = conv_history[q_state_base + index];
+                snapshot_conv_history[snapshot_conv_base + k_state_base + index]
+                    = conv_history[k_state_base + index];
+            }
+            for (uint index = thread_index;
+                 index < value_elements_per_key * history_stride;
+                 index += QWEN38_PREFILL_THREADS) {
+                snapshot_conv_history[snapshot_conv_base + v_state_base + index]
+                    = conv_history[v_state_base + index];
+            }
+            for (uint index = thread_index;
+                 index < recurrent_stride;
+                 index += QWEN38_PREFILL_THREADS) {
+                snapshot_recurrent[snapshot_recurrent_base + recurrent_base + index]
+                    = recurrent[recurrent_base + index];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -1922,6 +4110,74 @@ kernel void qwen38_gqa_prepare_query(
     }
 }
 
+// Batched counterpart used by short target verification. Positions are
+// supplied as three contiguous u32 arrays (text rows still use position0 for
+// all axes), keeping the kernel independent of the host-side M-RoPE type.
+kernel void qwen38_gqa_prepare_query_rows(
+    device const float* q_with_gate [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device float* query [[buffer(2)]],
+    device float* gate [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& rotary_dim [[buffer(5)]],
+    constant uint* positions0 [[buffer(6)]],
+    constant uint* positions1 [[buffer(7)]],
+    constant uint* positions2 [[buffer(8)]],
+    constant uint& section1 [[buffer(9)]],
+    constant uint& section2 [[buffer(10)]],
+    constant uint& has_sections [[buffer(11)]],
+    constant float& rope_theta [[buffer(12)]],
+    constant float& epsilon [[buffer(13)]],
+    constant uint& num_heads [[buffer(14)]],
+    constant uint& batch_size [[buffer(15)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint row = group.x;
+    const uint head = group.y;
+    if (row >= batch_size || head >= num_heads) {
+        return;
+    }
+    const uint input_base = (row * num_heads + head) * head_dim * 2u;
+    const uint output_base = (row * num_heads + head) * head_dim;
+    const float value = lane < head_dim ? q_with_gate[input_base + lane] : 0.0f;
+    partial[lane] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < head_dim) {
+        const float inverse = rsqrt(partial[0] / float(head_dim) + epsilon);
+        const float normalized = value * inverse * norm[lane];
+        float rotated = normalized;
+        if (lane < rotary_dim) {
+            const uint rotary_half = rotary_dim / 2u;
+            const uint pair = lane < rotary_half ? lane : lane - rotary_half;
+            const uint other_lane = lane < rotary_half ? lane + rotary_half : lane - rotary_half;
+            const float other = q_with_gate[input_base + other_lane] * inverse * norm[other_lane];
+            const uint axis = qwen38_mrope_axis(
+                pair,
+                positions0[row],
+                positions1[row],
+                positions2[row],
+                section1,
+                section2,
+                has_sections);
+            const float exponent = float(pair * 2u) / float(rotary_dim);
+            const float angle = float(axis) / pow(rope_theta, exponent);
+            const float sine = sin(angle);
+            const float cosine = cos(angle);
+            rotated = lane < rotary_half ? normalized * cosine - other * sine
+                : normalized * cosine + other * sine;
+        }
+        query[output_base + lane] = rotated;
+        gate[output_base + lane] = q_with_gate[input_base + head_dim + lane];
+    }
+}
+
 kernel void qwen38_gqa_prepare_key(
     device const float* key_input [[buffer(0)]],
     device const float* norm [[buffer(1)]],
@@ -1963,6 +4219,68 @@ kernel void qwen38_gqa_prepare_key(
                 position0,
                 position1,
                 position2,
+                section1,
+                section2,
+                has_sections);
+            const float exponent = float(pair * 2u) / float(rotary_dim);
+            const float angle = float(axis) / pow(rope_theta, exponent);
+            const float sine = sin(angle);
+            const float cosine = cos(angle);
+            rotated = lane < rotary_half ? normalized * cosine - other * sine
+                : normalized * cosine + other * sine;
+        }
+        key_output[base + lane] = rotated;
+    }
+}
+
+kernel void qwen38_gqa_prepare_key_rows(
+    device const float* key_input [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device float* key_output [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& rotary_dim [[buffer(4)]],
+    constant uint* positions0 [[buffer(5)]],
+    constant uint* positions1 [[buffer(6)]],
+    constant uint* positions2 [[buffer(7)]],
+    constant uint& section1 [[buffer(8)]],
+    constant uint& section2 [[buffer(9)]],
+    constant uint& has_sections [[buffer(10)]],
+    constant float& rope_theta [[buffer(11)]],
+    constant float& epsilon [[buffer(12)]],
+    constant uint& kv_heads [[buffer(13)]],
+    constant uint& batch_size [[buffer(14)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint row = group.x;
+    const uint head = group.y;
+    if (row >= batch_size || head >= kv_heads) {
+        return;
+    }
+    const uint base = (row * kv_heads + head) * head_dim;
+    const float value = lane < head_dim ? key_input[base + lane] : 0.0f;
+    partial[lane] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < head_dim) {
+        const float inverse = rsqrt(partial[0] / float(head_dim) + epsilon);
+        const float normalized = value * inverse * norm[lane];
+        float rotated = normalized;
+        if (lane < rotary_dim) {
+            const uint rotary_half = rotary_dim / 2u;
+            const uint pair = lane < rotary_half ? lane : lane - rotary_half;
+            const uint other_lane = lane < rotary_half ? lane + rotary_half : lane - rotary_half;
+            const float other = key_input[base + other_lane] * inverse * norm[other_lane];
+            const uint axis = qwen38_mrope_axis(
+                pair,
+                positions0[row],
+                positions1[row],
+                positions2[row],
                 section1,
                 section2,
                 has_sections);

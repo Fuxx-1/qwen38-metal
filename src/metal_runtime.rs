@@ -1,11 +1,15 @@
+#![allow(unexpected_cfgs)]
+
 use crate::metal::EMBEDDED_LIBRARY;
 use crate::model::MlxWeightStore;
 use crate::mps::{self, MpsFp16Gemm, MpsMatrix};
 use metal::{ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
+use objc::{msg_send, sel, sel_impl};
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::Mutex;
+use std::time::Instant;
 
 const QUANT_BITS: usize = 4;
 const VALUES_PER_PACKED_WORD: usize = 32 / QUANT_BITS;
@@ -48,12 +52,50 @@ const Q4_MPS_THREADS_Y: u64 = 8;
 const Q4_DECODE_OUTPUT_TILE: usize = 8;
 const Q4_DECODE_SHARED_MAX_INPUT_ELEMENTS: usize = 6_144;
 const Q4_DECODE_TILED_INPUT_ELEMENTS: usize = 2_048;
+const Q4_SHORT_BATCH_MAX: usize = 8;
+const Q4_SHORT_OUTPUT_TILE: usize = 32;
+const Q4_SHORT_INPUT_TILE_FLOATS: usize = Q4_SHORT_BATCH_MAX * AFFINE_GROUP_SIZE;
+const Q4_SHORT_PACKED_TILE_WORDS: usize =
+    Q4_SHORT_OUTPUT_TILE * (AFFINE_GROUP_SIZE / VALUES_PER_PACKED_WORD);
+const Q4_SHORT_AFFINE_TILE_FLOATS: usize = Q4_SHORT_OUTPUT_TILE * 2;
+// The pair kernel has two independent threadgroup buffers, one per matrix.
+// Each buffer holds a single 32-row x 8-word tile; the pair is represented by
+// the two Metal slots rather than by doubling either slot's allocation.
+const Q4_SHORT_PAIR_PACKED_TILE_WORDS: usize = Q4_SHORT_PACKED_TILE_WORDS;
+const Q4_SHORT_PAIR_AFFINE_TILE_FLOATS: usize = Q4_SHORT_AFFINE_TILE_FLOATS * 2;
+const Q4_BATCH_SIMD_OUTPUT_TILE: usize = 8;
+const Q4_BATCH_SIMD_THREADS: u64 = 64;
+const Q4_BATCH_SIMD_VALUES_PER_LANE: usize = 16;
+const Q4_BATCH_SIMD_VALUES_PER_BLOCK: usize = Q4_BATCH_SIMD_VALUES_PER_LANE * 32;
+const Q4_BATCH3_VECTOR_THREADS: u64 = 32;
+const Q4_BATCH2_VECTOR_THREADS: u64 = 32;
+// The one-row batch-vector kernel has excellent locality for transformer
+// projections, but a vocabulary-sized output launches hundreds of thousands
+// of tiny threadgroups. Use the existing 8-row SIMD tile for those matrices
+// so dispatch overhead does not dominate the final LM-head pass.
+const Q4_BATCH_VECTOR_MAX_ROWS: usize = 65_536;
 
 pub struct MetalRuntime {
     device: Device,
     command_queue: metal::CommandQueue,
     q4_affine_matmul: ComputePipelineState,
     q4_affine_matmul_unaligned: ComputePipelineState,
+    q4_affine_matmul_short: ComputePipelineState,
+    q4_affine_matmul_short_unaligned: ComputePipelineState,
+    q4_affine_matmul_pair_short: ComputePipelineState,
+    q4_affine_matmul_batch_simd: ComputePipelineState,
+    q4_affine_matmul_batch_simd_unaligned: ComputePipelineState,
+    q4_affine_matmul_pair_batch_simd: ComputePipelineState,
+    q4_affine_matmul_batch3_vector: ComputePipelineState,
+    q4_affine_matmul_batch3_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_pair_batch3_vector: ComputePipelineState,
+    q4_affine_matmul_pair_batch3_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_batch2_vector: ComputePipelineState,
+    q4_affine_matmul_batch2_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_pair_batch2_vector: ComputePipelineState,
+    q4_affine_matmul_pair_batch2_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_batch2_vector_add: ComputePipelineState,
+    q4_affine_matmul_batch2_vector_add_unaligned: ComputePipelineState,
     q4_affine_matvec_simd: ComputePipelineState,
     q4_affine_matvec_simd_unaligned: ComputePipelineState,
     q4_affine_matvec_mlx_fast: ComputePipelineState,
@@ -71,8 +113,12 @@ pub struct MetalRuntime {
     swiglu_rows: ComputePipelineState,
     swiglu_half_rows: ComputePipelineState,
     swiglu_half_split_rows: ComputePipelineState,
+    argmax_rows: ComputePipelineState,
     rms_norm: ComputePipelineState,
+    rms_norm_rows: ComputePipelineState,
     add_in_place: ComputePipelineState,
+    add_rows: ComputePipelineState,
+    mtp_prepare_fc_input: ComputePipelineState,
     bf16_gemm: ComputePipelineState,
     vision_attention_scores: ComputePipelineState,
     vision_attention_values: ComputePipelineState,
@@ -84,7 +130,9 @@ pub struct MetalRuntime {
     q8_kv_append: ComputePipelineState,
     q8_kv_append_prefill: ComputePipelineState,
     gqa_prepare_query: ComputePipelineState,
+    gqa_prepare_query_rows: ComputePipelineState,
     gqa_prepare_key: ComputePipelineState,
+    gqa_prepare_key_rows: ComputePipelineState,
     gqa_q8_scores: ComputePipelineState,
     gqa_q8_values: ComputePipelineState,
     gqa_q8_prefill_attention: ComputePipelineState,
@@ -145,6 +193,7 @@ struct ReusableBuffer {
 struct Q4ActivationPool {
     input: Option<ReusableBuffer>,
     outputs: Vec<Option<ReusableBuffer>>,
+    argmax: Option<ReusableBuffer>,
     input_half: Option<ReusableBuffer>,
     weights_half: Option<ReusableBuffer>,
     half_slots: Vec<Option<ReusableBuffer>>,
@@ -164,12 +213,33 @@ pub struct MetalF32Buffer {
     elements: usize,
 }
 
+/// Persistent FP16 weights for the standalone MTP adapter's SwiGLU MLP.
+/// Keeping this one small adapter block expanded avoids re-dequantizing its
+/// three projections for every speculative round without duplicating target
+/// model weights.
+pub struct MetalMtpMlpF16 {
+    gate_up: metal::Buffer,
+    down: metal::Buffer,
+    hidden_elements: usize,
+    intermediate_elements: usize,
+}
+
+/// MPS retains its matrix descriptors until a command buffer has completed.
+/// The fused MTP verifier owns this collection for the lifetime of its one
+/// target-plus-adapter submission.
+#[derive(Default)]
+struct MpsCommandResources {
+    matrices: Vec<MpsMatrix>,
+    gemms: Vec<MpsFp16Gemm>,
+}
+
 /// Per-request decode activations. These buffers deliberately do not use the
 /// shared runtime pools: concurrent requests need isolated residual streams,
 /// while all immutable Q4 weights remain file-mapped and shared.
 pub struct MetalDecodeState {
     hidden_elements: usize,
     hidden: ReusableBuffer,
+    fc_input: Option<ReusableBuffer>,
     normalized: ReusableBuffer,
     post_norm: ReusableBuffer,
     mixed: ReusableBuffer,
@@ -183,6 +253,41 @@ pub struct MetalDecodeState {
     up: Option<ReusableBuffer>,
     swiglu: Option<ReusableBuffer>,
     scores: Option<ReusableBuffer>,
+    logits: Option<ReusableBuffer>,
+    token: Option<ReusableBuffer>,
+    mtp_post_norm_half: Option<ReusableBuffer>,
+    mtp_gate_up_half: Option<ReusableBuffer>,
+    mtp_swiglu_half: Option<ReusableBuffer>,
+}
+
+/// Per-request activation state for a short speculative verification block.
+/// Unlike the single-token decode state, every tensor is row-major with a
+/// fixed batch width so all target layers can share one command buffer.
+pub struct MetalBatchDecodeState {
+    pub(crate) batch_size: usize,
+    pub(crate) hidden_elements: usize,
+    hidden: ReusableBuffer,
+    normalized: ReusableBuffer,
+    post_norm: ReusableBuffer,
+    mixed: ReusableBuffer,
+    qkv: Option<ReusableBuffer>,
+    z: Option<ReusableBuffer>,
+    b: Option<ReusableBuffer>,
+    a: Option<ReusableBuffer>,
+    convolved: Option<ReusableBuffer>,
+    delta_output: Option<ReusableBuffer>,
+    gate: Option<ReusableBuffer>,
+    up: Option<ReusableBuffer>,
+    swiglu: Option<ReusableBuffer>,
+}
+
+/// Compact metadata returned by the fused default MTP verifier. The target
+/// hidden row and the adapter seed activation never leave Metal memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetalMtpVerifyResult {
+    pub accepted: usize,
+    pub target_bonus: u32,
+    pub seed_token: u32,
 }
 
 /// Borrowed immutable inputs for one GPU-resident DeltaNet transformer layer.
@@ -283,6 +388,19 @@ pub struct MetalDecodeFullLayer<'a> {
     gate_proj: MappedQ4AffineJob<'a>,
     up_proj: MappedQ4AffineJob<'a>,
     down_proj: MappedQ4AffineJob<'a>,
+}
+
+/// A target layer in the batched speculative graph. DeltaNet layers read the
+/// committed state and write a shadow state; full-attention layers append to
+/// their request-local Q8 KV cache.
+pub enum MetalBatchDecodeLayer<'a> {
+    Linear {
+        layer: MetalDecodeLinearLayer<'a>,
+        source: &'a MetalDeltaNetState,
+        destination: &'a MetalDeltaNetState,
+        snapshots: Option<&'a MetalDeltaNetSnapshots>,
+    },
+    Full(MetalDecodeFullLayer<'a>, &'a mut Q8KvState),
 }
 
 impl<'a> MetalDecodeFullLayer<'a> {
@@ -431,6 +549,25 @@ pub struct MetalDeltaNetState {
     recurrent: metal::Buffer,
 }
 
+/// Per-row DeltaNet state captured while a short verification batch advances.
+///
+/// A speculative block may be only partially accepted. Keeping one state
+/// image per verified row lets the caller select the accepted prefix directly
+/// instead of replaying those target tokens one at a time.
+pub struct MetalDeltaNetSnapshots {
+    conv: metal::Buffer,
+    recurrent: metal::Buffer,
+    row_count: usize,
+    conv_state_bytes: u64,
+    recurrent_state_bytes: u64,
+}
+
+impl MetalDeltaNetSnapshots {
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
 pub struct Q8KvState {
     keys: metal::Buffer,
     values: metal::Buffer,
@@ -440,6 +577,12 @@ pub struct Q8KvState {
     sequence_length: usize,
     kv_heads: usize,
     head_dim: usize,
+}
+
+impl Q8KvState {
+    pub fn sequence_length(&self) -> usize {
+        self.sequence_length
+    }
 }
 
 fn pipeline_for(
@@ -497,6 +640,71 @@ impl MetalRuntime {
         let q4_affine_matmul = pipeline_for(&device, &library, "qwen38_q4_affine_matmul")?;
         let q4_affine_matmul_unaligned =
             pipeline_for(&device, &library, "qwen38_q4_affine_matmul_unaligned")?;
+        let q4_affine_matmul_short =
+            pipeline_for(&device, &library, "qwen38_q4_affine_matmul_short_compact")?;
+        let q4_affine_matmul_short_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_short_compact_unaligned",
+        )?;
+        let q4_affine_matmul_pair_short = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_short_compact",
+        )?;
+        let q4_affine_matmul_batch_simd =
+            pipeline_for(&device, &library, "qwen38_q4_affine_matmul_batch_simd")?;
+        let q4_affine_matmul_batch_simd_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch_simd_unaligned",
+        )?;
+        let q4_affine_matmul_pair_batch_simd =
+            pipeline_for(&device, &library, "qwen38_q4_affine_matmul_pair_batch_simd")?;
+        let q4_affine_matmul_batch3_vector =
+            pipeline_for(&device, &library, "qwen38_q4_affine_matmul_batch3_vector")?;
+        let q4_affine_matmul_batch3_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch3_vector_unaligned",
+        )?;
+        let q4_affine_matmul_pair_batch3_vector = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch3_vector",
+        )?;
+        let q4_affine_matmul_pair_batch3_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch3_vector_unaligned",
+        )?;
+        let q4_affine_matmul_batch2_vector =
+            pipeline_for(&device, &library, "qwen38_q4_affine_matmul_batch2_vector")?;
+        let q4_affine_matmul_batch2_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_vector_unaligned",
+        )?;
+        let q4_affine_matmul_pair_batch2_vector = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch2_vector",
+        )?;
+        let q4_affine_matmul_pair_batch2_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch2_vector_unaligned",
+        )?;
+        let q4_affine_matmul_batch2_vector_add = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_vector_add",
+        )?;
+        let q4_affine_matmul_batch2_vector_add_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_vector_add_unaligned",
+        )?;
         let q4_affine_matvec_simd =
             pipeline_for(&device, &library, "qwen38_q4_affine_matvec_simd")?;
         let q4_affine_matvec_simd_unaligned =
@@ -536,8 +744,12 @@ impl MetalRuntime {
         let swiglu_half_rows = pipeline_for(&device, &library, "qwen38_swiglu_half_rows")?;
         let swiglu_half_split_rows =
             pipeline_for(&device, &library, "qwen38_swiglu_half_split_rows")?;
+        let argmax_rows = pipeline_for(&device, &library, "qwen38_argmax_rows")?;
         let rms_norm = pipeline_for(&device, &library, "qwen38_rms_norm")?;
+        let rms_norm_rows = pipeline_for(&device, &library, "qwen38_rms_norm_rows")?;
         let add_in_place = pipeline_for(&device, &library, "qwen38_add_in_place")?;
+        let add_rows = pipeline_for(&device, &library, "qwen38_add_rows")?;
+        let mtp_prepare_fc_input = pipeline_for(&device, &library, "qwen38_mtp_prepare_fc_input")?;
         let bf16_gemm_function = library
             .get_function("qwen38_bf16_gemm", None)
             .map_err(MetalRuntimeError::Function)?;
@@ -564,7 +776,10 @@ impl MetalRuntime {
         let q8_kv_append = pipeline_for(&device, &library, "qwen38_q8_kv_append")?;
         let q8_kv_append_prefill = pipeline_for(&device, &library, "qwen38_q8_kv_append_prefill")?;
         let gqa_prepare_query = pipeline_for(&device, &library, "qwen38_gqa_prepare_query")?;
+        let gqa_prepare_query_rows =
+            pipeline_for(&device, &library, "qwen38_gqa_prepare_query_rows")?;
         let gqa_prepare_key = pipeline_for(&device, &library, "qwen38_gqa_prepare_key")?;
+        let gqa_prepare_key_rows = pipeline_for(&device, &library, "qwen38_gqa_prepare_key_rows")?;
         let gqa_q8_scores = pipeline_for(&device, &library, "qwen38_gqa_q8_scores")?;
         let gqa_q8_values = pipeline_for(&device, &library, "qwen38_gqa_q8_values")?;
         let gqa_q8_prefill_attention =
@@ -597,6 +812,22 @@ impl MetalRuntime {
             device,
             q4_affine_matmul,
             q4_affine_matmul_unaligned,
+            q4_affine_matmul_short,
+            q4_affine_matmul_short_unaligned,
+            q4_affine_matmul_pair_short,
+            q4_affine_matmul_batch_simd,
+            q4_affine_matmul_batch_simd_unaligned,
+            q4_affine_matmul_pair_batch_simd,
+            q4_affine_matmul_batch3_vector,
+            q4_affine_matmul_batch3_vector_unaligned,
+            q4_affine_matmul_pair_batch3_vector,
+            q4_affine_matmul_pair_batch3_vector_unaligned,
+            q4_affine_matmul_batch2_vector,
+            q4_affine_matmul_batch2_vector_unaligned,
+            q4_affine_matmul_pair_batch2_vector,
+            q4_affine_matmul_pair_batch2_vector_unaligned,
+            q4_affine_matmul_batch2_vector_add,
+            q4_affine_matmul_batch2_vector_add_unaligned,
             q4_affine_matvec_simd,
             q4_affine_matvec_simd_unaligned,
             q4_affine_matvec_mlx_fast,
@@ -614,8 +845,12 @@ impl MetalRuntime {
             swiglu_rows,
             swiglu_half_rows,
             swiglu_half_split_rows,
+            argmax_rows,
             rms_norm,
+            rms_norm_rows,
             add_in_place,
+            add_rows,
+            mtp_prepare_fc_input,
             bf16_gemm,
             vision_attention_scores,
             vision_attention_values,
@@ -627,7 +862,9 @@ impl MetalRuntime {
             q8_kv_append,
             q8_kv_append_prefill,
             gqa_prepare_query,
+            gqa_prepare_query_rows,
             gqa_prepare_key,
+            gqa_prepare_key_rows,
             gqa_q8_scores,
             gqa_q8_values,
             gqa_q8_prefill_attention,
@@ -710,6 +947,129 @@ impl MetalRuntime {
         })
     }
 
+    /// Expands the MTP adapter's three Q4 MLP matrices once into private FP16
+    /// memory. This is intentionally adapter-only: the target transformer's
+    /// weights remain memory-efficient mapped Q4 tensors.
+    pub fn create_mtp_mlp_f16(
+        &self,
+        hidden_elements: usize,
+        gate: &MappedQ4AffineJob<'_>,
+        up: &MappedQ4AffineJob<'_>,
+        down: &MappedQ4AffineJob<'_>,
+    ) -> Result<MetalMtpMlpF16, MetalRuntimeError> {
+        if !mps::is_available(&self.device) {
+            return Err(MetalRuntimeError::Mps(
+                "MPS matrix multiplication is unavailable on this Metal device".to_owned(),
+            ));
+        }
+        let gate_words = validate_mapped_q4_affine_shape(
+            hidden_elements,
+            gate.weights,
+            gate.weight_offset,
+            gate.scales,
+            gate.scale_offset,
+            gate.biases,
+            gate.bias_offset,
+            gate.output_rows,
+        )?;
+        let up_words = validate_mapped_q4_affine_shape(
+            hidden_elements,
+            up.weights,
+            up.weight_offset,
+            up.scales,
+            up.scale_offset,
+            up.biases,
+            up.bias_offset,
+            up.output_rows,
+        )?;
+        if gate.output_rows != up.output_rows {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "MTP FP16 MLP gate/up rows",
+                actual: up.output_rows,
+                expected: gate.output_rows,
+            });
+        }
+        if down.output_rows != hidden_elements {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "MTP FP16 MLP down rows",
+                actual: down.output_rows,
+                expected: hidden_elements,
+            });
+        }
+        let down_words = validate_mapped_q4_affine_shape(
+            gate.output_rows,
+            down.weights,
+            down.weight_offset,
+            down.scales,
+            down.scale_offset,
+            down.biases,
+            down.bias_offset,
+            down.output_rows,
+        )?;
+        let gate_elements = hidden_elements.checked_mul(gate.output_rows).ok_or(
+            MetalRuntimeError::DimensionOverflow("MTP FP16 gate weight elements"),
+        )?;
+        let up_elements = hidden_elements.checked_mul(up.output_rows).ok_or(
+            MetalRuntimeError::DimensionOverflow("MTP FP16 up weight elements"),
+        )?;
+        let gate_bytes = checked_byte_len::<u16>(gate_elements)?;
+        let gate_up_bytes = gate_bytes
+            .checked_add(checked_byte_len::<u16>(up_elements)?)
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "MTP FP16 gate/up weight bytes",
+            ))?;
+        let down_elements = gate.output_rows.checked_mul(hidden_elements).ok_or(
+            MetalRuntimeError::DimensionOverflow("MTP FP16 down weight elements"),
+        )?;
+        let down_bytes = checked_byte_len::<u16>(down_elements)?;
+        let options = MTLResourceOptions::StorageModePrivate;
+        let gate_up = self.device.new_buffer(gate_up_bytes, options);
+        let down_buffer = self.device.new_buffer(down_bytes, options);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_q4_affine_dequantize_f16(
+            encoder,
+            &gate_up,
+            0,
+            gate,
+            u32::try_from(gate_words)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP FP16 gate words"))?,
+        )?;
+        self.encode_q4_affine_dequantize_f16(
+            encoder,
+            &gate_up,
+            gate_bytes,
+            up,
+            u32::try_from(up_words)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP FP16 up words"))?,
+        )?;
+        self.encode_q4_affine_dequantize_f16(
+            encoder,
+            &down_buffer,
+            0,
+            down,
+            u32::try_from(down_words)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP FP16 down words"))?,
+        )?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        Ok(MetalMtpMlpF16 {
+            gate_up,
+            down: down_buffer,
+            hidden_elements,
+            intermediate_elements: gate.output_rows,
+        })
+    }
+
+    pub fn mps_available(&self) -> bool {
+        mps::is_available(&self.device)
+    }
+
     /// Allocates a request-local residual stream. Scratch buffers grow lazily
     /// from the exact projection sizes of the first linear-attention layer.
     pub fn create_decode_state(
@@ -720,6 +1080,7 @@ impl MetalRuntime {
         Ok(MetalDecodeState {
             hidden_elements,
             hidden: shared_reusable_buffer(&self.device, hidden_bytes)?,
+            fc_input: None,
             normalized: shared_reusable_buffer(&self.device, hidden_bytes)?,
             post_norm: shared_reusable_buffer(&self.device, hidden_bytes)?,
             mixed: shared_reusable_buffer(&self.device, hidden_bytes)?,
@@ -733,6 +1094,77 @@ impl MetalRuntime {
             up: None,
             swiglu: None,
             scores: None,
+            logits: None,
+            token: None,
+            mtp_post_norm_half: None,
+            mtp_gate_up_half: None,
+            mtp_swiglu_half: None,
+        })
+    }
+
+    pub fn create_batch_decode_state(
+        &self,
+        hidden_elements: usize,
+        batch_size: usize,
+    ) -> Result<MetalBatchDecodeState, MetalRuntimeError> {
+        if hidden_elements == 0 || batch_size == 0 {
+            return Err(MetalRuntimeError::EmptyDimension);
+        }
+        let total_elements =
+            hidden_elements
+                .checked_mul(batch_size)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "batched decode hidden elements",
+                ))?;
+        let bytes = checked_byte_len::<f32>(total_elements)?;
+        Ok(MetalBatchDecodeState {
+            batch_size,
+            hidden_elements,
+            hidden: shared_reusable_buffer(&self.device, bytes)?,
+            normalized: shared_reusable_buffer(&self.device, bytes)?,
+            post_norm: shared_reusable_buffer(&self.device, bytes)?,
+            mixed: shared_reusable_buffer(&self.device, bytes)?,
+            qkv: None,
+            z: None,
+            b: None,
+            a: None,
+            convolved: None,
+            delta_output: None,
+            gate: None,
+            up: None,
+            swiglu: None,
+        })
+    }
+
+    pub fn write_batch_decode_hidden(
+        &self,
+        state: &mut MetalBatchDecodeState,
+        values: &[f32],
+    ) -> Result<(), MetalRuntimeError> {
+        let expected = state.hidden_elements.checked_mul(state.batch_size).ok_or(
+            MetalRuntimeError::DimensionOverflow("batched decode hidden elements"),
+        )?;
+        if values.len() != expected {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "batched decode hidden activation",
+                actual: values.len(),
+                expected,
+            });
+        }
+        copy_slice_to_buffer(&state.hidden.buffer, values);
+        Ok(())
+    }
+
+    pub fn read_batch_decode_hidden(
+        &self,
+        state: &MetalBatchDecodeState,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        let expected = state.hidden_elements.checked_mul(state.batch_size).ok_or(
+            MetalRuntimeError::DimensionOverflow("batched decode hidden elements"),
+        )?;
+        Ok(unsafe {
+            std::slice::from_raw_parts(state.hidden.buffer.contents().cast::<f32>(), expected)
+                .to_vec()
         })
     }
 
@@ -766,6 +1198,259 @@ impl MetalRuntime {
             )
             .to_vec()
         })
+    }
+
+    /// Reads the latest RMS-normalized decode activation. MTP needs this
+    /// value as the next adapter input, while the ordinary decode path uses
+    /// the unnormalized residual stream above.
+    pub fn read_decode_normalized(
+        &self,
+        state: &MetalDecodeState,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        if state.hidden_elements == 0 {
+            return Err(MetalRuntimeError::EmptyDimension);
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                state.normalized.buffer.contents().cast::<f32>(),
+                state.hidden_elements,
+            )
+            .to_vec()
+        })
+    }
+
+    pub fn read_decode_logits(
+        &self,
+        state: &MetalDecodeState,
+        output_rows: usize,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        let logits = state
+            .logits
+            .as_ref()
+            .ok_or(MetalRuntimeError::EmptyBuffer)?;
+        if output_rows == 0 || checked_byte_len::<f32>(output_rows)? > logits.capacity_bytes {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "decode logits",
+                actual: output_rows,
+                expected: usize::try_from(logits.capacity_bytes / size_of::<f32>() as u64)
+                    .unwrap_or(usize::MAX),
+            });
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(logits.buffer.contents().cast::<f32>(), output_rows).to_vec()
+        })
+    }
+
+    pub fn read_decode_token(&self, state: &MetalDecodeState) -> Result<u32, MetalRuntimeError> {
+        let token = state
+            .token
+            .as_ref()
+            .ok_or(MetalRuntimeError::EmptyDimension)?;
+        if token.capacity_bytes < size_of::<u32>() as u64 {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "decode token",
+                actual: usize::try_from(token.capacity_bytes).unwrap_or(usize::MAX),
+                expected: size_of::<u32>(),
+            });
+        }
+        Ok(unsafe { *(token.buffer.contents().cast::<u32>()) })
+    }
+
+    /// Runs the standalone MTP adapter's FC and one attention layer in the
+    /// same command buffer. The optional final norm/LM head is encoded after
+    /// the adapter layer so draft selection does not need another submission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_decode_step(
+        &self,
+        state: &mut MetalDecodeState,
+        fc_input: &[f32],
+        fc: &MappedQ4AffineJob<'_>,
+        layer: &MetalDecodeFullLayer<'_>,
+        mtp_mlp: Option<&MetalMtpMlpF16>,
+        kv_state: &mut Q8KvState,
+        final_norm: &MetalF32Buffer,
+        lm_head: Option<&MappedQ4AffineJob<'_>>,
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        validate_mapped_q4_affine_matvec(
+            fc_input,
+            fc.weights,
+            fc.weight_offset,
+            fc.scales,
+            fc.scale_offset,
+            fc.biases,
+            fc.bias_offset,
+            fc.output_rows,
+        )?;
+        let input_bytes = checked_byte_len::<f32>(fc_input.len())?;
+        ensure_shared_buffer(&self.device, &mut state.fc_input, input_bytes)?;
+        copy_slice_to_buffer(
+            &state
+                .fc_input
+                .as_ref()
+                .expect("MTP FC input buffer is initialized")
+                .buffer,
+            fc_input,
+        );
+        let command_buffer = self.command_queue.new_command_buffer();
+        let mut mps_resources = MpsCommandResources::default();
+        let sequence_length = self.encode_mtp_decode_step(
+            command_buffer,
+            state,
+            fc_input.len(),
+            fc,
+            layer,
+            mtp_mlp,
+            &mut mps_resources,
+            kv_state,
+            final_norm,
+            lm_head,
+            epsilon,
+        )?;
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        kv_state.sequence_length = sequence_length;
+        Ok(())
+    }
+
+    /// Encodes the MTP adapter graph into an existing command buffer. The
+    /// caller owns filling `state.fc_input`; this lets the fused verifier
+    /// produce that input directly on the GPU before the adapter consumes it.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mtp_decode_step(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut MetalDecodeState,
+        fc_input_elements: usize,
+        fc: &MappedQ4AffineJob<'_>,
+        layer: &MetalDecodeFullLayer<'_>,
+        mtp_mlp: Option<&MetalMtpMlpF16>,
+        mps_resources: &mut MpsCommandResources,
+        kv_state: &mut Q8KvState,
+        final_norm: &MetalF32Buffer,
+        lm_head: Option<&MappedQ4AffineJob<'_>>,
+        epsilon: f32,
+    ) -> Result<usize, MetalRuntimeError> {
+        let fc_input = state
+            .fc_input
+            .as_ref()
+            .ok_or(MetalRuntimeError::EmptyBuffer)?;
+        if fc_input.capacity_bytes < checked_byte_len::<f32>(fc_input_elements)? {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "MTP FC input buffer",
+                actual: usize::try_from(fc_input.capacity_bytes / size_of::<f32>() as u64)
+                    .unwrap_or(usize::MAX),
+                expected: fc_input_elements,
+            });
+        }
+        let words_per_row = validate_mapped_q4_affine_shape(
+            fc_input_elements,
+            fc.weights,
+            fc.weight_offset,
+            fc.scales,
+            fc.scale_offset,
+            fc.biases,
+            fc.bias_offset,
+            fc.output_rows,
+        )?;
+        if final_norm.elements != state.hidden_elements {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "MTP final norm weights",
+                actual: final_norm.elements,
+                expected: state.hidden_elements,
+            });
+        }
+        let lm_words = if let Some(job) = lm_head {
+            let words = validate_mapped_q4_affine_shape(
+                state.hidden_elements,
+                job.weights,
+                job.weight_offset,
+                job.scales,
+                job.scale_offset,
+                job.biases,
+                job.bias_offset,
+                job.output_rows,
+            )?;
+            ensure_shared_buffer(
+                &self.device,
+                &mut state.logits,
+                checked_byte_len::<f32>(job.output_rows)?,
+            )?;
+            ensure_shared_buffer(&self.device, &mut state.token, checked_byte_len::<u32>(1)?)?;
+            Some(words)
+        } else {
+            None
+        };
+
+        let fc_encoder = command_buffer.new_compute_command_encoder();
+        self.encode_q4_affine_matvec_mlx_fast(
+            fc_encoder,
+            &fc_input.buffer,
+            &state.hidden.buffer,
+            fc,
+            u32::try_from(words_per_row)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP FC words per row"))?,
+        )?;
+        fc_encoder.end_encoding();
+
+        let sequence_length = self.encode_decode_full_layer(
+            command_buffer,
+            state,
+            layer,
+            kv_state,
+            epsilon,
+            mtp_mlp,
+            mps_resources,
+        )?;
+
+        let logits_encoder = command_buffer.new_compute_command_encoder();
+        let hidden_elements = u32::try_from(state.hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP hidden elements"))?;
+        self.encode_rms_norm(
+            logits_encoder,
+            &state.hidden.buffer,
+            final_norm,
+            &state.normalized.buffer,
+            hidden_elements,
+            epsilon,
+        );
+        if let Some(job) = lm_head {
+            self.encode_q4_affine_matvec_mlx_fast(
+                logits_encoder,
+                &state.normalized.buffer,
+                &state
+                    .logits
+                    .as_ref()
+                    .expect("MTP logits buffer is initialized")
+                    .buffer,
+                job,
+                u32::try_from(lm_words.expect("MTP LM head words are initialized"))
+                    .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP LM head words"))?,
+            )?;
+            let vocab_size = u32::try_from(job.output_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP vocabulary size"))?;
+            self.encode_argmax_rows(
+                logits_encoder,
+                &state
+                    .logits
+                    .as_ref()
+                    .expect("MTP logits buffer is initialized")
+                    .buffer,
+                &state
+                    .token
+                    .as_ref()
+                    .expect("MTP token buffer is initialized")
+                    .buffer,
+                vocab_size,
+                1,
+            );
+        }
+        logits_encoder.end_encoding();
+        Ok(sequence_length)
     }
 
     /// Executes one complete linear-attention transformer layer. This is the
@@ -816,8 +1501,16 @@ impl MetalRuntime {
         epsilon: f32,
     ) -> Result<(), MetalRuntimeError> {
         let command_buffer = self.command_queue.new_command_buffer();
-        let sequence_length =
-            self.encode_decode_full_layer(command_buffer, state, layer, kv_state, epsilon)?;
+        let mut mps_resources = MpsCommandResources::default();
+        let sequence_length = self.encode_decode_full_layer(
+            command_buffer,
+            state,
+            layer,
+            kv_state,
+            epsilon,
+            None,
+            &mut mps_resources,
+        )?;
         command_buffer.commit();
         command_buffer.wait_until_completed();
         if command_buffer.status() == MTLCommandBufferStatus::Error {
@@ -835,6 +1528,8 @@ impl MetalRuntime {
         layer: &MetalDecodeFullLayer<'_>,
         kv_state: &mut Q8KvState,
         epsilon: f32,
+        mtp_mlp: Option<&MetalMtpMlpF16>,
+        mps_resources: &mut MpsCommandResources,
     ) -> Result<usize, MetalRuntimeError> {
         let config = layer.gqa.as_u32()?;
         if layer.gqa.kv_heads != kv_state.kv_heads || layer.gqa.head_dim != kv_state.head_dim {
@@ -925,10 +1620,19 @@ impl MetalRuntime {
             hidden_elements,
             "full-attention MLP down projection",
         )?;
+        if let Some(mtp_mlp) = mtp_mlp {
+            if mtp_mlp.hidden_elements != hidden_elements
+                || mtp_mlp.intermediate_elements != gate_rows
+            {
+                return Err(MetalRuntimeError::WrongLength {
+                    name: "MTP FP16 MLP dimensions",
+                    actual: mtp_mlp.intermediate_elements,
+                    expected: gate_rows,
+                });
+            }
+        }
         let hidden_elements_u32 = u32::try_from(hidden_elements)
             .map_err(|_| MetalRuntimeError::DimensionOverflow("decode hidden elements"))?;
-        let gate_elements_u32 = u32::try_from(gate_rows)
-            .map_err(|_| MetalRuntimeError::DimensionOverflow("decode MLP elements"))?;
 
         let sequence_length =
             kv_state
@@ -977,21 +1681,23 @@ impl MetalRuntime {
             &mut state.delta_output,
             checked_byte_len::<f32>(query_elements)?,
         )?;
-        ensure_shared_buffer(
-            &self.device,
-            &mut state.gate,
-            checked_byte_len::<f32>(gate_rows)?,
-        )?;
-        ensure_shared_buffer(
-            &self.device,
-            &mut state.up,
-            checked_byte_len::<f32>(gate_rows)?,
-        )?;
-        ensure_shared_buffer(
-            &self.device,
-            &mut state.swiglu,
-            checked_byte_len::<f32>(gate_rows)?,
-        )?;
+        if mtp_mlp.is_none() {
+            ensure_shared_buffer(
+                &self.device,
+                &mut state.gate,
+                checked_byte_len::<f32>(gate_rows)?,
+            )?;
+            ensure_shared_buffer(
+                &self.device,
+                &mut state.up,
+                checked_byte_len::<f32>(gate_rows)?,
+            )?;
+            ensure_shared_buffer(
+                &self.device,
+                &mut state.swiglu,
+                checked_byte_len::<f32>(gate_rows)?,
+            )?;
+        }
         ensure_shared_buffer(
             &self.device,
             &mut state.scores,
@@ -1033,21 +1739,6 @@ impl MetalRuntime {
             .delta_output
             .as_ref()
             .expect("decode full-attention output buffer is initialized")
-            .buffer;
-        let gate_output = &state
-            .gate
-            .as_ref()
-            .expect("decode MLP gate buffer is initialized")
-            .buffer;
-        let up_output = &state
-            .up
-            .as_ref()
-            .expect("decode MLP up buffer is initialized")
-            .buffer;
-        let swiglu_output = &state
-            .swiglu
-            .as_ref()
-            .expect("decode SwiGLU buffer is initialized")
             .buffer;
         let scores = &state
             .scores
@@ -1219,36 +1910,65 @@ impl MetalRuntime {
             hidden_elements_u32,
             epsilon,
         );
-        self.encode_q4_affine_matvec(
-            output_encoder,
-            post_norm,
-            gate_output,
-            &layer.gate_proj,
-            gate_words,
-        )?;
-        self.encode_q4_affine_matvec(
-            output_encoder,
-            post_norm,
-            up_output,
-            &layer.up_proj,
-            up_words,
-        )?;
-        self.encode_swiglu(
-            output_encoder,
-            gate_output,
-            up_output,
-            swiglu_output,
-            gate_elements_u32,
-        );
-        self.encode_q4_affine_matvec(
-            output_encoder,
-            swiglu_output,
-            mixed,
-            &layer.down_proj,
-            down_words,
-        )?;
-        self.encode_add_in_place(output_encoder, hidden, mixed, hidden_elements_u32);
+        if mtp_mlp.is_none() {
+            let gate_output = &state
+                .gate
+                .as_ref()
+                .expect("decode MLP gate buffer is initialized")
+                .buffer;
+            let up_output = &state
+                .up
+                .as_ref()
+                .expect("decode MLP up buffer is initialized")
+                .buffer;
+            let swiglu_output = &state
+                .swiglu
+                .as_ref()
+                .expect("decode SwiGLU buffer is initialized")
+                .buffer;
+            let gate_elements_u32 = u32::try_from(gate_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("decode MLP elements"))?;
+            self.encode_q4_affine_matvec(
+                output_encoder,
+                post_norm,
+                gate_output,
+                &layer.gate_proj,
+                gate_words,
+            )?;
+            self.encode_q4_affine_matvec(
+                output_encoder,
+                post_norm,
+                up_output,
+                &layer.up_proj,
+                up_words,
+            )?;
+            self.encode_swiglu(
+                output_encoder,
+                gate_output,
+                up_output,
+                swiglu_output,
+                gate_elements_u32,
+            );
+            self.encode_q4_affine_matvec(
+                output_encoder,
+                swiglu_output,
+                mixed,
+                &layer.down_proj,
+                down_words,
+            )?;
+            self.encode_add_in_place(output_encoder, hidden, mixed, hidden_elements_u32);
+        }
         output_encoder.end_encoding();
+
+        if let Some(mtp_mlp) = mtp_mlp {
+            self.encode_mtp_f16_mlp(
+                command_buffer,
+                state,
+                mtp_mlp,
+                mps_resources,
+                hidden_elements_u32,
+            )?;
+        }
 
         Ok(sequence_length)
     }
@@ -1266,6 +1986,7 @@ impl MetalRuntime {
             return Err(MetalRuntimeError::EmptyDimension);
         }
         let command_buffer = self.command_queue.new_command_buffer();
+        let mut mps_resources = MpsCommandResources::default();
         let mut full_sequence_lengths = Vec::new();
         for descriptor in layers.iter_mut() {
             match descriptor {
@@ -1295,6 +2016,8 @@ impl MetalRuntime {
                         layer,
                         kv_state,
                         epsilon,
+                        None,
+                        &mut mps_resources,
                     )?);
                 }
             }
@@ -1312,6 +2035,1139 @@ impl MetalRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Executes a short target verification block with row-major activations.
+    /// All layer kernels are encoded before one command-buffer wait, while
+    /// causal DeltaNet and Q8 attention state advance in their existing order.
+    pub fn decode_batch_layers(
+        &self,
+        state: &mut MetalBatchDecodeState,
+        layers: &mut [MetalBatchDecodeLayer<'_>],
+        positions: &[[u32; 3]],
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        let command_buffer = self.command_queue.new_command_buffer();
+        let full_sequence_lengths =
+            self.encode_decode_batch_graph(command_buffer, state, layers, positions, epsilon)?;
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+        Ok(())
+    }
+
+    /// Runs a target verification graph and computes the final greedy token
+    /// for every row before the command buffer completes. Only hidden rows
+    /// and compact token IDs are returned to the host.
+    pub fn decode_batch_layers_with_argmax(
+        &self,
+        state: &mut MetalBatchDecodeState,
+        layers: &mut [MetalBatchDecodeLayer<'_>],
+        positions: &[[u32; 3]],
+        epsilon: f32,
+        final_norm: &MetalF32Buffer,
+        lm_head: &MappedQ4AffineJob<'_>,
+    ) -> Result<(Vec<f32>, Vec<u32>), MetalRuntimeError> {
+        if final_norm.elements != state.hidden_elements {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "batched final norm weights",
+                actual: final_norm.elements,
+                expected: state.hidden_elements,
+            });
+        }
+        let words_per_row = validate_mapped_q4_affine_shape(
+            state.hidden_elements,
+            lm_head.weights,
+            lm_head.weight_offset,
+            lm_head.scales,
+            lm_head.scale_offset,
+            lm_head.biases,
+            lm_head.bias_offset,
+            lm_head.output_rows,
+        )?;
+        let words_per_row = u32::try_from(words_per_row)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP LM head words per row"))?;
+        let batch_size = u32::try_from(state.batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP batch size"))?;
+        let output_rows = u32::try_from(lm_head.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP LM head output rows"))?;
+        let logits_elements = state
+            .batch_size
+            .checked_mul(lm_head.output_rows)
+            .ok_or(MetalRuntimeError::DimensionOverflow("MTP LM head logits"))?;
+
+        let mut activations = self
+            .q4_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::ActivationPoolPoisoned)?;
+        if activations.outputs.is_empty() {
+            activations.outputs.push(None);
+        }
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.outputs[0],
+            checked_byte_len::<f32>(logits_elements)?,
+        )?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.argmax,
+            checked_byte_len::<u32>(state.batch_size)?,
+        )?;
+        let logits = &activations.outputs[0]
+            .as_ref()
+            .expect("MTP logits buffer is initialized")
+            .buffer;
+        let tokens = &activations
+            .argmax
+            .as_ref()
+            .expect("MTP argmax buffer is initialized")
+            .buffer;
+
+        if std::env::var_os("QWEN38_BATCH_PROFILE").is_some() {
+            return self.decode_batch_layers_with_argmax_profiled(
+                state,
+                layers,
+                positions,
+                epsilon,
+                final_norm,
+                lm_head,
+                words_per_row,
+                batch_size,
+                output_rows,
+                logits,
+                tokens,
+            );
+        }
+
+        let batch_timing = std::env::var_os("QWEN38_BATCH_TIMING").is_some();
+        let timing_started = batch_timing.then(Instant::now);
+        let command_buffer = self.command_queue.new_command_buffer();
+        let full_sequence_lengths =
+            self.encode_decode_batch_graph(command_buffer, state, layers, positions, epsilon)?;
+        let final_encoder = command_buffer.new_compute_command_encoder();
+        let hidden_elements = u32::try_from(state.hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP hidden elements"))?;
+        self.encode_rms_norm_rows(
+            final_encoder,
+            &state.hidden.buffer,
+            final_norm,
+            &state.normalized.buffer,
+            hidden_elements,
+            batch_size,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul(
+            final_encoder,
+            &state.normalized.buffer,
+            logits,
+            lm_head,
+            words_per_row,
+            state.batch_size,
+        )?;
+        self.encode_argmax_rows(final_encoder, logits, tokens, output_rows, batch_size);
+        final_encoder.end_encoding();
+        let encode_elapsed = timing_started.map(|started| started.elapsed());
+        let submit_started = batch_timing.then(Instant::now);
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        let submit_elapsed = submit_started.map(|started| started.elapsed());
+        let gpu_ms = batch_timing.then(|| completed_command_buffer_gpu_ms(command_buffer));
+        update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+        let readback_started = batch_timing.then(Instant::now);
+        let hidden = self.read_batch_decode_hidden(state)?;
+        let token_ids = unsafe {
+            std::slice::from_raw_parts(tokens.contents().cast::<u32>(), state.batch_size).to_vec()
+        };
+        if let (Some(started), Some(encode), Some(submit), Some(gpu), Some(readback)) = (
+            timing_started,
+            encode_elapsed,
+            submit_elapsed,
+            gpu_ms,
+            readback_started.map(|readback_started| readback_started.elapsed()),
+        ) {
+            eprintln!(
+                "batch_verify timing batch={} encode_ms={:.3} submit_wait_ms={:.3} gpu_ms={gpu:.3} readback_ms={:.3} total_ms={:.3}",
+                state.batch_size,
+                encode.as_secs_f64() * 1_000.0,
+                submit.as_secs_f64() * 1_000.0,
+                readback.as_secs_f64() * 1_000.0,
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        Ok((hidden, token_ids))
+    }
+
+    /// Executes the production two-row MTP verifier and immediately feeds its
+    /// accepted target row into the one-layer adapter. This keeps the target
+    /// hidden activation, acceptance decision, and next draft token on the
+    /// GPU until the complete speculative round has finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batch_layers_with_mtp_seed(
+        &self,
+        state: &mut MetalBatchDecodeState,
+        layers: &mut [MetalBatchDecodeLayer<'_>],
+        positions: &[[u32; 3]],
+        epsilon: f32,
+        final_norm: &MetalF32Buffer,
+        lm_head: &MappedQ4AffineJob<'_>,
+        adapter_state: &mut MetalDecodeState,
+        adapter_embedding: &MappedQ4AffineJob<'_>,
+        adapter_embedding_norm: &MetalF32Buffer,
+        adapter_hidden_norm: &MetalF32Buffer,
+        adapter_fc: &MappedQ4AffineJob<'_>,
+        adapter_layer: &MetalDecodeFullLayer<'_>,
+        adapter_mlp: Option<&MetalMtpMlpF16>,
+        adapter_kv: &mut Q8KvState,
+        adapter_final_norm: &MetalF32Buffer,
+        adapter_epsilon: f32,
+        draft_token: u32,
+    ) -> Result<MetalMtpVerifyResult, MetalRuntimeError> {
+        if state.batch_size != 2 || positions.len() != state.batch_size {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "fused MTP verification batch",
+                actual: positions.len(),
+                expected: 2,
+            });
+        }
+        if state.hidden_elements != adapter_state.hidden_elements
+            || final_norm.elements != state.hidden_elements
+            || adapter_embedding_norm.elements != state.hidden_elements
+            || adapter_hidden_norm.elements != state.hidden_elements
+            || adapter_final_norm.elements != state.hidden_elements
+        {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "fused MTP hidden dimensions",
+                actual: adapter_state.hidden_elements,
+                expected: state.hidden_elements,
+            });
+        }
+        let target_words = validate_mapped_q4_affine_shape(
+            state.hidden_elements,
+            lm_head.weights,
+            lm_head.weight_offset,
+            lm_head.scales,
+            lm_head.scale_offset,
+            lm_head.biases,
+            lm_head.bias_offset,
+            lm_head.output_rows,
+        )?;
+        validate_mapped_q4_affine_shape(
+            state.hidden_elements,
+            adapter_embedding.weights,
+            adapter_embedding.weight_offset,
+            adapter_embedding.scales,
+            adapter_embedding.scale_offset,
+            adapter_embedding.biases,
+            adapter_embedding.bias_offset,
+            adapter_embedding.output_rows,
+        )?;
+        if state.hidden_elements % AFFINE_GROUP_SIZE != 0 {
+            return Err(MetalRuntimeError::InputNotGrouped {
+                input_elements: state.hidden_elements,
+                group_size: AFFINE_GROUP_SIZE,
+            });
+        }
+        let adapter_fc_elements = state
+            .hidden_elements
+            .checked_mul(2)
+            .ok_or(MetalRuntimeError::DimensionOverflow("fused MTP FC input"))?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut adapter_state.fc_input,
+            checked_byte_len::<f32>(adapter_fc_elements)?,
+        )?;
+
+        let batch_size = u32::try_from(state.batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP batch size"))?;
+        let output_rows = u32::try_from(lm_head.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP vocabulary size"))?;
+        let logits_elements = state
+            .batch_size
+            .checked_mul(lm_head.output_rows)
+            .ok_or(MetalRuntimeError::DimensionOverflow("MTP LM head logits"))?;
+        let mut activations = self
+            .q4_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::ActivationPoolPoisoned)?;
+        if activations.outputs.is_empty() {
+            activations.outputs.push(None);
+        }
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.outputs[0],
+            checked_byte_len::<f32>(logits_elements)?,
+        )?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.argmax,
+            checked_byte_len::<u32>(state.batch_size)?,
+        )?;
+        let logits = &activations.outputs[0]
+            .as_ref()
+            .expect("fused MTP target logits buffer is initialized")
+            .buffer;
+        let tokens = &activations
+            .argmax
+            .as_ref()
+            .expect("fused MTP target token buffer is initialized")
+            .buffer;
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let mut mps_resources = MpsCommandResources::default();
+        let full_sequence_lengths =
+            self.encode_decode_batch_graph(command_buffer, state, layers, positions, epsilon)?;
+        let final_encoder = command_buffer.new_compute_command_encoder();
+        let hidden_elements = u32::try_from(state.hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP hidden elements"))?;
+        self.encode_rms_norm_rows(
+            final_encoder,
+            &state.hidden.buffer,
+            final_norm,
+            &state.normalized.buffer,
+            hidden_elements,
+            batch_size,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul(
+            final_encoder,
+            &state.normalized.buffer,
+            logits,
+            lm_head,
+            u32::try_from(target_words)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP LM head words"))?,
+            state.batch_size,
+        )?;
+        self.encode_argmax_rows(final_encoder, logits, tokens, output_rows, batch_size);
+        final_encoder.end_encoding();
+
+        {
+            let adapter_input = &adapter_state
+                .fc_input
+                .as_ref()
+                .expect("fused MTP FC input buffer is initialized")
+                .buffer;
+            let prepare_encoder = command_buffer.new_compute_command_encoder();
+            self.encode_mtp_prepare_fc_input(
+                prepare_encoder,
+                &state.hidden.buffer,
+                tokens,
+                draft_token,
+                adapter_embedding,
+                adapter_embedding_norm,
+                adapter_hidden_norm,
+                adapter_input,
+                hidden_elements,
+                adapter_epsilon,
+            )?;
+            prepare_encoder.end_encoding();
+        }
+        let adapter_sequence_length = self.encode_mtp_decode_step(
+            command_buffer,
+            adapter_state,
+            adapter_fc_elements,
+            adapter_fc,
+            adapter_layer,
+            adapter_mlp,
+            &mut mps_resources,
+            adapter_kv,
+            adapter_final_norm,
+            Some(lm_head),
+            adapter_epsilon,
+        )?;
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+        adapter_kv.sequence_length = adapter_sequence_length;
+
+        let result_tokens = unsafe {
+            std::slice::from_raw_parts(tokens.contents().cast::<u32>(), state.batch_size)
+        };
+        let accepted = usize::try_from(result_tokens[0])
+            .map_err(|_| MetalRuntimeError::InvalidSequenceLength)?;
+        if accepted > 1 {
+            return Err(MetalRuntimeError::InvalidSequenceLength);
+        }
+        let seed_token = self.read_decode_token(adapter_state)?;
+        Ok(MetalMtpVerifyResult {
+            accepted,
+            target_bonus: result_tokens[1],
+            seed_token,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_layers_with_argmax_profiled(
+        &self,
+        state: &mut MetalBatchDecodeState,
+        layers: &mut [MetalBatchDecodeLayer<'_>],
+        positions: &[[u32; 3]],
+        epsilon: f32,
+        final_norm: &MetalF32Buffer,
+        lm_head: &MappedQ4AffineJob<'_>,
+        words_per_row: u32,
+        batch_size: u32,
+        output_rows: u32,
+        logits: &metal::Buffer,
+        tokens: &metal::Buffer,
+    ) -> Result<(Vec<f32>, Vec<u32>), MetalRuntimeError> {
+        // This path deliberately commits one layer at a time. It is a
+        // diagnostic switch, not a production scheduling mode: splitting the
+        // graph gives each hybrid layer an independent GPU duration without
+        // changing causal state or activation dependencies.
+        let wall_started = Instant::now();
+        let mut linear_gpu_ms = 0.0_f64;
+        let mut full_gpu_ms = 0.0_f64;
+        let mut linear_wall_ms = 0.0_f64;
+        let mut full_wall_ms = 0.0_f64;
+
+        for layer_index in 0..layers.len() {
+            let kind = match &layers[layer_index] {
+                MetalBatchDecodeLayer::Linear { .. } => "linear",
+                MetalBatchDecodeLayer::Full(_, _) => "full",
+            };
+            let command_buffer = self.command_queue.new_command_buffer();
+            let layer_started = Instant::now();
+            let single_layer = &mut layers[layer_index..=layer_index];
+            let full_sequence_lengths = self.encode_decode_batch_graph(
+                command_buffer,
+                state,
+                single_layer,
+                positions,
+                epsilon,
+            )?;
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalRuntimeError::CommandFailed);
+            }
+            update_batch_full_sequence_lengths(single_layer, &full_sequence_lengths);
+            let wall_ms = layer_started.elapsed().as_secs_f64() * 1_000.0;
+            let gpu_ms = completed_command_buffer_gpu_ms(command_buffer);
+            match kind {
+                "linear" => {
+                    linear_gpu_ms += gpu_ms;
+                    linear_wall_ms += wall_ms;
+                }
+                "full" => {
+                    full_gpu_ms += gpu_ms;
+                    full_wall_ms += wall_ms;
+                }
+                _ => unreachable!("batch layer kind is exhaustive"),
+            }
+            eprintln!(
+                "batch_verify layer={layer_index} kind={kind} gpu_ms={gpu_ms:.3} wall_ms={wall_ms:.3}"
+            );
+        }
+
+        let final_command_buffer = self.command_queue.new_command_buffer();
+        let final_started = Instant::now();
+        let final_encoder = final_command_buffer.new_compute_command_encoder();
+        let hidden_elements = u32::try_from(state.hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP hidden elements"))?;
+        self.encode_rms_norm_rows(
+            final_encoder,
+            &state.hidden.buffer,
+            final_norm,
+            &state.normalized.buffer,
+            hidden_elements,
+            batch_size,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul(
+            final_encoder,
+            &state.normalized.buffer,
+            logits,
+            lm_head,
+            words_per_row,
+            state.batch_size,
+        )?;
+        self.encode_argmax_rows(final_encoder, logits, tokens, output_rows, batch_size);
+        final_encoder.end_encoding();
+        final_command_buffer.commit();
+        final_command_buffer.wait_until_completed();
+        if final_command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        let final_wall_ms = final_started.elapsed().as_secs_f64() * 1_000.0;
+        let final_gpu_ms = completed_command_buffer_gpu_ms(final_command_buffer);
+        eprintln!(
+            "batch_verify summary batch={} linear_gpu_ms={linear_gpu_ms:.3} linear_wall_ms={linear_wall_ms:.3} full_gpu_ms={full_gpu_ms:.3} full_wall_ms={full_wall_ms:.3} lm_head_gpu_ms={final_gpu_ms:.3} lm_head_wall_ms={final_wall_ms:.3} total_wall_ms={:.3}",
+            state.batch_size,
+            wall_started.elapsed().as_secs_f64() * 1_000.0,
+        );
+
+        let hidden = self.read_batch_decode_hidden(state)?;
+        let token_ids = unsafe {
+            std::slice::from_raw_parts(tokens.contents().cast::<u32>(), state.batch_size).to_vec()
+        };
+        Ok((hidden, token_ids))
+    }
+
+    fn encode_decode_batch_graph(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut MetalBatchDecodeState,
+        layers: &mut [MetalBatchDecodeLayer<'_>],
+        positions: &[[u32; 3]],
+        epsilon: f32,
+    ) -> Result<Vec<usize>, MetalRuntimeError> {
+        if layers.is_empty() || positions.len() != state.batch_size {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "batched decode positions",
+                actual: positions.len(),
+                expected: state.batch_size,
+            });
+        }
+        let mut full_sequence_lengths = Vec::new();
+        for descriptor in layers.iter_mut() {
+            match descriptor {
+                MetalBatchDecodeLayer::Linear {
+                    layer,
+                    source,
+                    destination,
+                    snapshots,
+                } => self.encode_decode_batch_linear_layer(
+                    command_buffer,
+                    state,
+                    layer,
+                    source,
+                    destination,
+                    *snapshots,
+                    epsilon,
+                )?,
+                MetalBatchDecodeLayer::Full(layer, kv_state) => {
+                    full_sequence_lengths.push(self.encode_decode_batch_full_layer(
+                        command_buffer,
+                        state,
+                        layer,
+                        kv_state,
+                        positions,
+                        epsilon,
+                    )?);
+                }
+            }
+        }
+        Ok(full_sequence_lengths)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decode_batch_linear_layer(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut MetalBatchDecodeState,
+        layer: &MetalDecodeLinearLayer<'_>,
+        source: &MetalDeltaNetState,
+        destination: &MetalDeltaNetState,
+        snapshots: Option<&MetalDeltaNetSnapshots>,
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        let batch_size = state.batch_size;
+        let hidden_elements = state.hidden_elements;
+        let config = layer.delta_weights.config;
+        validate_deltanet_config(config)?;
+        let channels = config.channels()?;
+        let value_elements = config
+            .value_heads
+            .checked_mul(config.value_head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "batched DeltaNet values",
+            ))?;
+        let qkv_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.qkv,
+            channels,
+            "batched DeltaNet qkv",
+        )?;
+        let z_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.z,
+            value_elements,
+            "batched DeltaNet z",
+        )?;
+        let b_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.b,
+            config.value_heads,
+            "batched DeltaNet b",
+        )?;
+        let a_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.a,
+            config.value_heads,
+            "batched DeltaNet a",
+        )?;
+        let out_words = validate_decode_q4_job(
+            value_elements,
+            &layer.out_proj,
+            hidden_elements,
+            "batched DeltaNet output",
+        )?;
+        let gate_rows = layer.gate_proj.output_rows;
+        let gate_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.gate_proj,
+            gate_rows,
+            "batched MLP gate",
+        )?;
+        let up_words =
+            validate_decode_q4_job(hidden_elements, &layer.up_proj, gate_rows, "batched MLP up")?;
+        let down_words = validate_decode_q4_job(
+            gate_rows,
+            &layer.down_proj,
+            hidden_elements,
+            "batched MLP down",
+        )?;
+        let batch_u32 = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched DeltaNet size"))?;
+        let hidden_u32 = u32::try_from(hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched hidden size"))?;
+        let total =
+            batch_size
+                .checked_mul(hidden_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "batched hidden elements",
+                ))?;
+        let ensure = |slot: &mut Option<ReusableBuffer>, elements: usize| {
+            ensure_shared_buffer(&self.device, slot, checked_byte_len::<f32>(elements)?)
+        };
+        ensure(
+            &mut state.qkv,
+            batch_size
+                .checked_mul(channels)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched qkv"))?,
+        )?;
+        ensure(
+            &mut state.z,
+            batch_size
+                .checked_mul(value_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched z"))?,
+        )?;
+        ensure(
+            &mut state.b,
+            batch_size
+                .checked_mul(config.value_heads)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched b"))?,
+        )?;
+        ensure(
+            &mut state.a,
+            batch_size
+                .checked_mul(config.value_heads)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched a"))?,
+        )?;
+        ensure(
+            &mut state.convolved,
+            batch_size
+                .checked_mul(value_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched convolved"))?,
+        )?;
+        ensure(
+            &mut state.delta_output,
+            batch_size
+                .checked_mul(value_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "batched DeltaNet output",
+                ))?,
+        )?;
+        ensure(
+            &mut state.gate,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched gate"))?,
+        )?;
+        ensure(
+            &mut state.up,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched up"))?,
+        )?;
+        ensure(
+            &mut state.swiglu,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched SwiGLU"))?,
+        )?;
+        let hidden = &state.hidden.buffer;
+        let normalized = &state.normalized.buffer;
+        let post_norm = &state.post_norm.buffer;
+        let mixed = &state.mixed.buffer;
+        let qkv = &state
+            .qkv
+            .as_ref()
+            .expect("batched qkv buffer initialized")
+            .buffer;
+        let z = &state
+            .z
+            .as_ref()
+            .expect("batched z buffer initialized")
+            .buffer;
+        let b = &state
+            .b
+            .as_ref()
+            .expect("batched b buffer initialized")
+            .buffer;
+        let a = &state
+            .a
+            .as_ref()
+            .expect("batched a buffer initialized")
+            .buffer;
+        let delta_output = &state
+            .delta_output
+            .as_ref()
+            .expect("batched DeltaNet output initialized")
+            .buffer;
+        let gate = &state
+            .gate
+            .as_ref()
+            .expect("batched gate buffer initialized")
+            .buffer;
+        let up = &state
+            .up
+            .as_ref()
+            .expect("batched up buffer initialized")
+            .buffer;
+        let swiglu = &state
+            .swiglu
+            .as_ref()
+            .expect("batched SwiGLU buffer initialized")
+            .buffer;
+
+        let projection = command_buffer.new_compute_command_encoder();
+        self.encode_rms_norm_rows(
+            projection,
+            hidden,
+            layer.input_norm,
+            normalized,
+            hidden_u32,
+            batch_u32,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul_pair(
+            projection, normalized, qkv, &layer.qkv, z, &layer.z, qkv_words, z_words, batch_size,
+        )?;
+        self.encode_q4_affine_matmul_pair(
+            projection, normalized, b, &layer.b, a, &layer.a, b_words, a_words, batch_size,
+        )?;
+        projection.end_encoding();
+
+        self.encode_deltanet_prefill(
+            command_buffer,
+            layer.delta_weights,
+            &source.conv,
+            &source.recurrent,
+            &destination.conv,
+            &destination.recurrent,
+            snapshots,
+            qkv,
+            z,
+            b,
+            a,
+            delta_output,
+            batch_size,
+            epsilon,
+        )?;
+
+        let output = command_buffer.new_compute_command_encoder();
+        if !self.encode_q4_affine_matmul_add(
+            output,
+            delta_output,
+            hidden,
+            &layer.out_proj,
+            out_words,
+            batch_size,
+        )? {
+            self.encode_q4_affine_matmul(
+                output,
+                delta_output,
+                mixed,
+                &layer.out_proj,
+                out_words,
+                batch_size,
+            )?;
+            self.encode_add_rows(output, hidden, mixed, hidden_u32, batch_u32);
+        }
+        self.encode_rms_norm_rows(
+            output,
+            hidden,
+            layer.post_attention_norm,
+            post_norm,
+            hidden_u32,
+            batch_u32,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul_pair(
+            output,
+            post_norm,
+            gate,
+            &layer.gate_proj,
+            up,
+            &layer.up_proj,
+            gate_words,
+            up_words,
+            batch_size,
+        )?;
+        self.encode_swiglu(
+            output,
+            gate,
+            up,
+            swiglu,
+            u32::try_from(
+                batch_size
+                    .checked_mul(gate_rows)
+                    .ok_or(MetalRuntimeError::DimensionOverflow("batched SwiGLU"))?,
+            )
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched SwiGLU"))?,
+        );
+        if !self.encode_q4_affine_matmul_add(
+            output,
+            swiglu,
+            hidden,
+            &layer.down_proj,
+            down_words,
+            batch_size,
+        )? {
+            self.encode_q4_affine_matmul(
+                output,
+                swiglu,
+                mixed,
+                &layer.down_proj,
+                down_words,
+                batch_size,
+            )?;
+            self.encode_add_rows(output, hidden, mixed, hidden_u32, batch_u32);
+        }
+        output.end_encoding();
+        let _ = total;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decode_batch_full_layer(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut MetalBatchDecodeState,
+        layer: &MetalDecodeFullLayer<'_>,
+        kv_state: &mut Q8KvState,
+        positions: &[[u32; 3]],
+        epsilon: f32,
+    ) -> Result<usize, MetalRuntimeError> {
+        let batch_size = state.batch_size;
+        let hidden_elements = state.hidden_elements;
+        let config = layer.gqa.as_u32()?;
+        let query_elements = layer.gqa.num_heads.checked_mul(layer.gqa.head_dim).ok_or(
+            MetalRuntimeError::DimensionOverflow("batched query elements"),
+        )?;
+        let q_with_gate_elements =
+            query_elements
+                .checked_mul(2)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "batched query gate elements",
+                ))?;
+        let kv_elements = layer
+            .gqa
+            .kv_heads
+            .checked_mul(layer.gqa.head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow("batched KV elements"))?;
+        let q_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.q_proj,
+            q_with_gate_elements,
+            "batched full q",
+        )?;
+        let k_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.k_proj,
+            kv_elements,
+            "batched full k",
+        )?;
+        let v_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.v_proj,
+            kv_elements,
+            "batched full v",
+        )?;
+        let o_words = validate_decode_q4_job(
+            query_elements,
+            &layer.o_proj,
+            hidden_elements,
+            "batched full output",
+        )?;
+        let gate_rows = layer.gate_proj.output_rows;
+        let gate_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.gate_proj,
+            gate_rows,
+            "batched full gate",
+        )?;
+        let up_words = validate_decode_q4_job(
+            hidden_elements,
+            &layer.up_proj,
+            gate_rows,
+            "batched full up",
+        )?;
+        let down_words = validate_decode_q4_job(
+            gate_rows,
+            &layer.down_proj,
+            hidden_elements,
+            "batched full down",
+        )?;
+        let batch_u32 = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched full size"))?;
+        let hidden_u32 = u32::try_from(hidden_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched hidden size"))?;
+        let ensure = |slot: &mut Option<ReusableBuffer>, elements: usize| {
+            ensure_shared_buffer(&self.device, slot, checked_byte_len::<f32>(elements)?)
+        };
+        ensure(
+            &mut state.qkv,
+            batch_size
+                .checked_mul(q_with_gate_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched q gate"))?,
+        )?;
+        ensure(
+            &mut state.z,
+            batch_size
+                .checked_mul(query_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched query"))?,
+        )?;
+        ensure(
+            &mut state.b,
+            batch_size
+                .checked_mul(query_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched gate"))?,
+        )?;
+        ensure(
+            &mut state.a,
+            batch_size
+                .checked_mul(kv_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched key"))?,
+        )?;
+        ensure(
+            &mut state.convolved,
+            batch_size
+                .checked_mul(kv_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched value"))?,
+        )?;
+        ensure(
+            &mut state.delta_output,
+            batch_size
+                .checked_mul(query_elements)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "batched attention output",
+                ))?,
+        )?;
+        ensure(
+            &mut state.gate,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched MLP gate"))?,
+        )?;
+        ensure(
+            &mut state.up,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched MLP up"))?,
+        )?;
+        ensure(
+            &mut state.swiglu,
+            batch_size
+                .checked_mul(gate_rows)
+                .ok_or(MetalRuntimeError::DimensionOverflow("batched MLP SwiGLU"))?,
+        )?;
+        let hidden = &state.hidden.buffer;
+        let normalized = &state.normalized.buffer;
+        let post_norm = &state.post_norm.buffer;
+        let mixed = &state.mixed.buffer;
+        let q_with_gate = &state
+            .qkv
+            .as_ref()
+            .expect("batched q buffer initialized")
+            .buffer;
+        let query = &state
+            .z
+            .as_ref()
+            .expect("batched query buffer initialized")
+            .buffer;
+        let gate = &state
+            .b
+            .as_ref()
+            .expect("batched gate buffer initialized")
+            .buffer;
+        let key = &state
+            .a
+            .as_ref()
+            .expect("batched key buffer initialized")
+            .buffer;
+        let value = &state
+            .convolved
+            .as_ref()
+            .expect("batched value buffer initialized")
+            .buffer;
+        let attention = &state
+            .delta_output
+            .as_ref()
+            .expect("batched attention buffer initialized")
+            .buffer;
+        let gate_output = &state
+            .gate
+            .as_ref()
+            .expect("batched MLP gate initialized")
+            .buffer;
+        let up_output = &state
+            .up
+            .as_ref()
+            .expect("batched MLP up initialized")
+            .buffer;
+        let swiglu = &state
+            .swiglu
+            .as_ref()
+            .expect("batched MLP SwiGLU initialized")
+            .buffer;
+
+        let projection = command_buffer.new_compute_command_encoder();
+        self.encode_rms_norm_rows(
+            projection,
+            hidden,
+            layer.input_norm,
+            normalized,
+            hidden_u32,
+            batch_u32,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul_pair(
+            projection,
+            normalized,
+            q_with_gate,
+            &layer.q_proj,
+            key,
+            &layer.k_proj,
+            q_words,
+            k_words,
+            batch_size,
+        )?;
+        self.encode_q4_affine_matmul(
+            projection,
+            normalized,
+            value,
+            &layer.v_proj,
+            v_words,
+            batch_size,
+        )?;
+        projection.end_encoding();
+
+        let prepare = command_buffer.new_compute_command_encoder();
+        self.encode_gqa_prepare_query_rows(
+            prepare,
+            q_with_gate,
+            layer.q_norm,
+            query,
+            gate,
+            config,
+            positions,
+            epsilon,
+        )?;
+        self.encode_gqa_prepare_key_rows(
+            prepare,
+            key,
+            layer.k_norm,
+            attention,
+            config,
+            positions,
+            epsilon,
+        )?;
+        prepare.end_encoding();
+        let sequence_length = self.encode_gqa_prefill(
+            command_buffer,
+            kv_state,
+            query,
+            gate,
+            attention,
+            value,
+            attention,
+            layer.gqa.num_heads,
+            batch_size,
+        )?;
+
+        let output = command_buffer.new_compute_command_encoder();
+        if !self.encode_q4_affine_matmul_add(
+            output,
+            attention,
+            hidden,
+            &layer.o_proj,
+            o_words,
+            batch_size,
+        )? {
+            self.encode_q4_affine_matmul(
+                output,
+                attention,
+                mixed,
+                &layer.o_proj,
+                o_words,
+                batch_size,
+            )?;
+            self.encode_add_rows(output, hidden, mixed, hidden_u32, batch_u32);
+        }
+        self.encode_rms_norm_rows(
+            output,
+            hidden,
+            layer.post_attention_norm,
+            post_norm,
+            hidden_u32,
+            batch_u32,
+            epsilon,
+        );
+        self.encode_q4_affine_matmul_pair(
+            output,
+            post_norm,
+            gate_output,
+            &layer.gate_proj,
+            up_output,
+            &layer.up_proj,
+            gate_words,
+            up_words,
+            batch_size,
+        )?;
+        self.encode_swiglu(
+            output,
+            gate_output,
+            up_output,
+            swiglu,
+            u32::try_from(
+                batch_size
+                    .checked_mul(gate_rows)
+                    .ok_or(MetalRuntimeError::DimensionOverflow("batched full SwiGLU"))?,
+            )
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("batched full SwiGLU"))?,
+        );
+        if !self.encode_q4_affine_matmul_add(
+            output,
+            swiglu,
+            hidden,
+            &layer.down_proj,
+            down_words,
+            batch_size,
+        )? {
+            self.encode_q4_affine_matmul(
+                output,
+                swiglu,
+                mixed,
+                &layer.down_proj,
+                down_words,
+                batch_size,
+            )?;
+            self.encode_add_rows(output, hidden, mixed, hidden_u32, batch_u32);
+        }
+        output.end_encoding();
+        Ok(sequence_length)
     }
 
     /// Encodes consecutive DeltaNet layers into one command buffer. Each
@@ -1846,6 +3702,105 @@ impl MetalRuntime {
                 })
             })
             .collect()
+    }
+
+    /// Computes the greedy token for every row of one mapped Q4 projection.
+    /// The projection stays in a reusable GPU buffer and only the compact
+    /// token-id vector crosses back to the host.
+    pub fn q4_affine_argmax_mapped_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+        job: &MappedQ4AffineJob<'_>,
+    ) -> Result<Vec<u32>, MetalRuntimeError> {
+        if batch_size == 0 || input.is_empty() || input.len() % batch_size != 0 {
+            return Err(MetalRuntimeError::EmptyDimension);
+        }
+        let input_elements = input.len() / batch_size;
+        let words_per_row = validate_mapped_q4_affine_shape(
+            input_elements,
+            job.weights,
+            job.weight_offset,
+            job.scales,
+            job.scale_offset,
+            job.biases,
+            job.bias_offset,
+            job.output_rows,
+        )?;
+        let words_per_row = u32::try_from(words_per_row)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("words per row"))?;
+        let batch_size_u32 = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("Q4 batch size"))?;
+        let output_rows_u32 = u32::try_from(job.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("Q4 output rows"))?;
+
+        let mut activations = self
+            .q4_activations
+            .lock()
+            .map_err(|_| MetalRuntimeError::ActivationPoolPoisoned)?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.input,
+            checked_byte_len::<f32>(input.len())?,
+        )?;
+        if activations.outputs.is_empty() {
+            activations.outputs.push(None);
+        }
+        let output_elements = batch_size
+            .checked_mul(job.output_rows)
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q4 argmax logits"))?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.outputs[0],
+            checked_byte_len::<f32>(output_elements)?,
+        )?;
+        ensure_shared_buffer(
+            &self.device,
+            &mut activations.argmax,
+            checked_byte_len::<u32>(batch_size)?,
+        )?;
+        let input_buffer = &activations
+            .input
+            .as_ref()
+            .expect("input buffer is initialized")
+            .buffer;
+        let logits_buffer = &activations.outputs[0]
+            .as_ref()
+            .expect("argmax logits buffer is initialized")
+            .buffer;
+        let token_buffer = &activations
+            .argmax
+            .as_ref()
+            .expect("argmax token buffer is initialized")
+            .buffer;
+        copy_slice_to_buffer(input_buffer, input);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_q4_affine_matmul(
+            encoder,
+            input_buffer,
+            logits_buffer,
+            job,
+            words_per_row,
+            batch_size,
+        )?;
+        self.encode_argmax_rows(
+            encoder,
+            logits_buffer,
+            token_buffer,
+            output_rows_u32,
+            batch_size_u32,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalRuntimeError::CommandFailed);
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(token_buffer.contents().cast::<u32>(), batch_size).to_vec()
+        })
     }
 
     fn should_use_mps_q4_prefill(&self, batch_size: usize, jobs: &[MappedQ4AffineJob<'_>]) -> bool {
@@ -2713,6 +4668,134 @@ impl MetalRuntime {
         Ok(())
     }
 
+    /// Runs the one-row MTP adapter MLP with persistent FP16 weights. MPS
+    /// handles the two large GEMMs while the existing Metal kernel keeps
+    /// SwiGLU and the FP16/FP32 boundaries on the same command buffer.
+    fn encode_mtp_f16_mlp(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut MetalDecodeState,
+        mlp: &MetalMtpMlpF16,
+        mps_resources: &mut MpsCommandResources,
+        hidden_elements_u32: u32,
+    ) -> Result<(), MetalRuntimeError> {
+        let hidden_elements = state.hidden_elements;
+        if mlp.hidden_elements != hidden_elements {
+            return Err(MetalRuntimeError::WrongLength {
+                name: "MTP FP16 MLP hidden elements",
+                actual: mlp.hidden_elements,
+                expected: hidden_elements,
+            });
+        }
+        let gate_up_rows = mlp.intermediate_elements.checked_mul(2).ok_or(
+            MetalRuntimeError::DimensionOverflow("MTP FP16 gate/up rows"),
+        )?;
+        let gate_up_elements =
+            gate_up_rows
+                .checked_mul(1)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "MTP FP16 gate/up activation elements",
+                ))?;
+        ensure_private_buffer(
+            &self.device,
+            &mut state.mtp_post_norm_half,
+            checked_byte_len::<u16>(hidden_elements)?,
+        )?;
+        ensure_private_buffer(
+            &self.device,
+            &mut state.mtp_gate_up_half,
+            checked_byte_len::<u16>(gate_up_elements)?,
+        )?;
+        ensure_private_buffer(
+            &self.device,
+            &mut state.mtp_swiglu_half,
+            checked_byte_len::<u16>(mlp.intermediate_elements)?,
+        )?;
+
+        let post_norm = &state.post_norm.buffer;
+        let mixed = &state.mixed.buffer;
+        let hidden = &state.hidden.buffer;
+        let post_norm_half = &state
+            .mtp_post_norm_half
+            .as_ref()
+            .expect("MTP FP16 post-norm buffer is initialized")
+            .buffer;
+        let gate_up_half = &state
+            .mtp_gate_up_half
+            .as_ref()
+            .expect("MTP FP16 gate/up buffer is initialized")
+            .buffer;
+        let swiglu_half = &state
+            .mtp_swiglu_half
+            .as_ref()
+            .expect("MTP FP16 SwiGLU buffer is initialized")
+            .buffer;
+
+        let conversion_encoder = command_buffer.new_compute_command_encoder();
+        self.encode_f32_to_f16(
+            conversion_encoder,
+            post_norm,
+            post_norm_half,
+            hidden_elements,
+        )?;
+        conversion_encoder.end_encoding();
+
+        let input_matrix = MpsMatrix::new_fp16(post_norm_half, 1, hidden_elements)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        let gate_up_weight = MpsMatrix::new_fp16(&mlp.gate_up, gate_up_rows, hidden_elements)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        let gate_up_result = MpsMatrix::new_fp16(gate_up_half, 1, gate_up_rows)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        let gate_up_gemm = MpsFp16Gemm::new(&self.device, 1, gate_up_rows, hidden_elements)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        gate_up_gemm.encode(
+            command_buffer,
+            &input_matrix,
+            &gate_up_weight,
+            &gate_up_result,
+        );
+        mps_resources.matrices.push(input_matrix);
+        mps_resources.matrices.push(gate_up_weight);
+        mps_resources.matrices.push(gate_up_result);
+        mps_resources.gemms.push(gate_up_gemm);
+
+        let intermediate_elements_u32 = u32::try_from(mlp.intermediate_elements)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("MTP FP16 MLP elements"))?;
+        let swiglu_encoder = command_buffer.new_compute_command_encoder();
+        self.encode_swiglu_half_split(
+            swiglu_encoder,
+            gate_up_half,
+            swiglu_half,
+            intermediate_elements_u32,
+            intermediate_elements_u32,
+        );
+        swiglu_encoder.end_encoding();
+
+        let swiglu_matrix = MpsMatrix::new_fp16(swiglu_half, 1, mlp.intermediate_elements)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        let down_weight =
+            MpsMatrix::new_fp16(&mlp.down, hidden_elements, mlp.intermediate_elements)
+                .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        // Reuse the gate/up storage after SwiGLU has consumed it. Only the
+        // first hidden-sized FP16 row is needed for the down projection.
+        let down_result = MpsMatrix::new_fp16(gate_up_half, 1, hidden_elements)
+            .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        let down_gemm =
+            MpsFp16Gemm::new(&self.device, 1, hidden_elements, mlp.intermediate_elements)
+                .map_err(|error| MetalRuntimeError::Mps(error.to_string()))?;
+        down_gemm.encode(command_buffer, &swiglu_matrix, &down_weight, &down_result);
+        mps_resources.matrices.push(swiglu_matrix);
+        mps_resources.matrices.push(down_weight);
+        mps_resources.matrices.push(down_result);
+        mps_resources.gemms.push(down_gemm);
+
+        let output_encoder = command_buffer.new_compute_command_encoder();
+        self.encode_f16_to_f32(output_encoder, gate_up_half, mixed, hidden_elements)?;
+        self.encode_add_in_place(output_encoder, hidden, mixed, hidden_elements_u32);
+        output_encoder.end_encoding();
+        Ok(())
+    }
+
     fn encode_f32_to_f16(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2772,6 +4855,97 @@ impl MetalRuntime {
         );
     }
 
+    fn encode_argmax_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        logits: &metal::Buffer,
+        tokens: &metal::Buffer,
+        vocab_size: u32,
+        batch_size: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.argmax_rows);
+        encoder.set_buffer(0, Some(logits), 0);
+        encoder.set_buffer(1, Some(tokens), 0);
+        encoder.set_bytes(
+            2,
+            size_of::<u32>() as u64,
+            (&vocab_size as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            3,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        encoder.set_threadgroup_memory_length(1, THREADS_PER_THREADGROUP * size_of::<u32>() as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(batch_size), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mtp_prepare_fc_input(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        target_hidden: &metal::Buffer,
+        target_tokens: &metal::Buffer,
+        draft_token: u32,
+        embedding: &MappedQ4AffineJob<'_>,
+        embedding_norm: &MetalF32Buffer,
+        hidden_norm: &MetalF32Buffer,
+        output: &metal::Buffer,
+        hidden_elements: u32,
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        encoder.set_compute_pipeline_state(&self.mtp_prepare_fc_input);
+        encoder.set_buffer(0, Some(target_hidden), 0);
+        encoder.set_buffer(1, Some(target_tokens), 0);
+        encoder.set_bytes(
+            2,
+            size_of::<u32>() as u64,
+            (&draft_token as *const u32).cast(),
+        );
+        // The MTP embedding lookup is tiny and executes once per round. Use
+        // the byte-addressed binding for both mapped alignment variants.
+        encoder.set_buffer(3, Some(embedding.weights), 0);
+        encoder.set_buffer(4, Some(embedding.scales), 0);
+        encoder.set_buffer(5, Some(embedding.biases), 0);
+        encoder.set_buffer(6, Some(&embedding_norm.buffer), 0);
+        encoder.set_buffer(7, Some(&hidden_norm.buffer), 0);
+        encoder.set_buffer(8, Some(output), 0);
+        encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&hidden_elements as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            10,
+            size_of::<u64>() as u64,
+            (&embedding.weight_offset as *const u64).cast(),
+        );
+        encoder.set_bytes(
+            11,
+            size_of::<u64>() as u64,
+            (&embedding.scale_offset as *const u64).cast(),
+        );
+        encoder.set_bytes(
+            12,
+            size_of::<u64>() as u64,
+            (&embedding.bias_offset as *const u64).cast(),
+        );
+        encoder.set_bytes(13, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_threadgroup_memory_length(
+            0,
+            THREADS_PER_THREADGROUP * 2 * size_of::<f32>() as u64,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        Ok(())
+    }
+
     fn encode_rms_norm(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2794,6 +4968,35 @@ impl MetalRuntime {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rms_norm_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &metal::Buffer,
+        weights: &MetalF32Buffer,
+        output: &metal::Buffer,
+        elements: u32,
+        batch_size: u32,
+        epsilon: f32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.rms_norm_rows);
+        encoder.set_buffer(0, Some(input), 0);
+        encoder.set_buffer(1, Some(&weights.buffer), 0);
+        encoder.set_buffer(2, Some(output), 0);
+        encoder.set_bytes(3, size_of::<u32>() as u64, (&elements as *const u32).cast());
+        encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.set_bytes(5, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(batch_size), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+    }
+
     fn encode_add_in_place(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2807,6 +5010,30 @@ impl MetalRuntime {
         encoder.set_bytes(2, size_of::<u32>() as u64, (&elements as *const u32).cast());
         encoder.dispatch_threads(
             MTLSize::new(u64::from(elements), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+    }
+
+    fn encode_add_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        destination: &metal::Buffer,
+        source: &metal::Buffer,
+        elements: u32,
+        batch_size: u32,
+    ) {
+        let total = elements.saturating_mul(batch_size);
+        encoder.set_compute_pipeline_state(&self.add_rows);
+        encoder.set_buffer(0, Some(destination), 0);
+        encoder.set_buffer(1, Some(source), 0);
+        encoder.set_bytes(2, size_of::<u32>() as u64, (&elements as *const u32).cast());
+        encoder.set_bytes(
+            3,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.dispatch_threads(
+            MTLSize::new(u64::from(total), 1, 1),
             MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
         );
     }
@@ -2989,6 +5216,199 @@ impl MetalRuntime {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gqa_prepare_query_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        q_with_gate: &metal::Buffer,
+        q_norm: &MetalF32Buffer,
+        query: &metal::Buffer,
+        gate: &metal::Buffer,
+        config: MetalGqaDecodeConfigU32,
+        positions: &[[u32; 3]],
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        let batch_size = u32::try_from(positions.len())
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA batch size"))?;
+        let position0: Vec<u32> = positions.iter().map(|position| position[0]).collect();
+        let position1: Vec<u32> = positions.iter().map(|position| position[1]).collect();
+        let position2: Vec<u32> = positions.iter().map(|position| position[2]).collect();
+        encoder.set_compute_pipeline_state(&self.gqa_prepare_query_rows);
+        encoder.set_buffer(0, Some(q_with_gate), 0);
+        encoder.set_buffer(1, Some(&q_norm.buffer), 0);
+        encoder.set_buffer(2, Some(query), 0);
+        encoder.set_buffer(3, Some(gate), 0);
+        encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&config.head_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            (&config.rotary_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            6,
+            checked_byte_len::<u32>(position0.len())?,
+            position0.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            7,
+            checked_byte_len::<u32>(position1.len())?,
+            position1.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            8,
+            checked_byte_len::<u32>(position2.len())?,
+            position2.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&config.section1 as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            10,
+            size_of::<u32>() as u64,
+            (&config.section2 as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            11,
+            size_of::<u32>() as u64,
+            (&config.has_mrope_sections as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            12,
+            size_of::<f32>() as u64,
+            (&config.rope_theta as *const f32).cast(),
+        );
+        encoder.set_bytes(13, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_bytes(
+            14,
+            size_of::<u32>() as u64,
+            (&config.num_heads as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            15,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(batch_size), u64::from(config.num_heads), 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gqa_prepare_key_rows(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        key_input: &metal::Buffer,
+        k_norm: &MetalF32Buffer,
+        key_output: &metal::Buffer,
+        config: MetalGqaDecodeConfigU32,
+        positions: &[[u32; 3]],
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        let batch_size = u32::try_from(positions.len())
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA batch size"))?;
+        let position0: Vec<u32> = positions.iter().map(|position| position[0]).collect();
+        let position1: Vec<u32> = positions.iter().map(|position| position[1]).collect();
+        let position2: Vec<u32> = positions.iter().map(|position| position[2]).collect();
+        encoder.set_compute_pipeline_state(&self.gqa_prepare_key_rows);
+        encoder.set_buffer(0, Some(key_input), 0);
+        encoder.set_buffer(1, Some(&k_norm.buffer), 0);
+        encoder.set_buffer(2, Some(key_output), 0);
+        encoder.set_bytes(
+            3,
+            size_of::<u32>() as u64,
+            (&config.head_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            4,
+            size_of::<u32>() as u64,
+            (&config.rotary_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            5,
+            checked_byte_len::<u32>(position0.len())?,
+            position0.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            6,
+            checked_byte_len::<u32>(position1.len())?,
+            position1.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            7,
+            checked_byte_len::<u32>(position2.len())?,
+            position2.as_ptr().cast(),
+        );
+        encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&config.section1 as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&config.section2 as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            10,
+            size_of::<u32>() as u64,
+            (&config.has_mrope_sections as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            11,
+            size_of::<f32>() as u64,
+            (&config.rope_theta as *const f32).cast(),
+        );
+        encoder.set_bytes(12, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_bytes(
+            13,
+            size_of::<u32>() as u64,
+            (&config.kv_heads as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            14,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(batch_size), u64::from(config.kv_heads), 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        Ok(())
+    }
+
+    fn encode_q4_affine_matvec_mlx_fast(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &metal::Buffer,
+        output: &metal::Buffer,
+        job: &MappedQ4AffineJob<'_>,
+        words_per_row: u32,
+    ) -> Result<(), MetalRuntimeError> {
+        // Keep the MTP-only fast path easy to A/B against the normal decode
+        // kernel. The diagnostic switch also overrides the global MLX decode
+        // experiment so it cannot silently re-enable this dispatch.
+        let disabled = std::env::var_os("QWEN38_DISABLE_MTP_MLX_FAST").is_some();
+        self.encode_q4_affine_matvec_mode(
+            encoder,
+            input,
+            output,
+            job,
+            words_per_row,
+            !disabled,
+            disabled,
+        )
+    }
+
     fn encode_q4_affine_matvec(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -2996,6 +5416,20 @@ impl MetalRuntime {
         output: &metal::Buffer,
         job: &MappedQ4AffineJob<'_>,
         words_per_row: u32,
+    ) -> Result<(), MetalRuntimeError> {
+        self.encode_q4_affine_matvec_mode(encoder, input, output, job, words_per_row, false, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q4_affine_matvec_mode(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &metal::Buffer,
+        output: &metal::Buffer,
+        job: &MappedQ4AffineJob<'_>,
+        words_per_row: u32,
+        force_mlx_fast: bool,
+        disable_mlx_fast: bool,
     ) -> Result<(), MetalRuntimeError> {
         let output_rows = u32::try_from(job.output_rows)
             .map_err(|_| MetalRuntimeError::DimensionOverflow("output row count"))?;
@@ -3007,7 +5441,9 @@ impl MetalRuntime {
             .ok_or(MetalRuntimeError::DimensionOverflow("decode input width"))?;
         let full_input_bytes = checked_byte_len::<f32>(input_elements)?;
         let tiled_input_bytes = checked_byte_len::<f32>(Q4_DECODE_TILED_INPUT_ELEMENTS)?;
-        let use_mlx_fast = self.mlx_q4_decode && input_elements % 512 == 0;
+        let use_mlx_fast = !disable_mlx_fast
+            && (force_mlx_fast || self.mlx_q4_decode)
+            && input_elements % 512 == 0;
         let use_shared = !use_mlx_fast
             && self.fast_q4_decode
             && input_elements <= Q4_DECODE_SHARED_MAX_INPUT_ELEMENTS
@@ -3113,6 +5549,92 @@ impl MetalRuntime {
         Ok(())
     }
 
+    /// Accumulates a batch-2 Q4 projection directly into a residual buffer.
+    /// The fused path is limited to the same aligned 32-lane shape as the
+    /// production batch-vector kernel; callers fall back to a normal output
+    /// plus add_rows when the shape or diagnostic switches do not match.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q4_affine_matmul_add(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &metal::Buffer,
+        destination: &metal::Buffer,
+        job: &MappedQ4AffineJob<'_>,
+        words_per_row: u32,
+        batch_size: usize,
+    ) -> Result<bool, MetalRuntimeError> {
+        if batch_size != 2
+            || !self.fast_q4_prefill
+            || std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_some()
+            || std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_some()
+            || std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_some()
+            || std::env::var_os("QWEN38_DISABLE_RESIDUAL_FUSION").is_some()
+            || words_per_row % 8 != 0
+        {
+            return Ok(false);
+        }
+
+        let output_rows = u32::try_from(job.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("residual output rows"))?;
+        encoder.set_compute_pipeline_state(if job.aligned {
+            &self.q4_affine_matmul_batch2_vector_add
+        } else {
+            &self.q4_affine_matmul_batch2_vector_add_unaligned
+        });
+        encoder.set_buffer(0, Some(input), 0);
+        if job.aligned {
+            encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+            encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+            encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+            encoder.set_buffer(4, Some(destination), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as u64,
+                (&words_per_row as *const u32).cast(),
+            );
+            encoder.set_bytes(
+                6,
+                size_of::<u32>() as u64,
+                (&output_rows as *const u32).cast(),
+            );
+        } else {
+            encoder.set_buffer(1, Some(job.weights), 0);
+            encoder.set_buffer(2, Some(job.scales), 0);
+            encoder.set_buffer(3, Some(job.biases), 0);
+            encoder.set_buffer(4, Some(destination), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as u64,
+                (&words_per_row as *const u32).cast(),
+            );
+            encoder.set_bytes(
+                6,
+                size_of::<u64>() as u64,
+                (&job.weight_offset as *const u64).cast(),
+            );
+            encoder.set_bytes(
+                7,
+                size_of::<u64>() as u64,
+                (&job.scale_offset as *const u64).cast(),
+            );
+            encoder.set_bytes(
+                8,
+                size_of::<u64>() as u64,
+                (&job.bias_offset as *const u64).cast(),
+            );
+            encoder.set_bytes(
+                9,
+                size_of::<u32>() as u64,
+                (&output_rows as *const u32).cast(),
+            );
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(output_rows), 1, 1),
+            MTLSize::new(Q4_BATCH2_VECTOR_THREADS, 1, 1),
+        );
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_q4_affine_matmul(
         &self,
@@ -3127,10 +5649,283 @@ impl MetalRuntime {
             .map_err(|_| MetalRuntimeError::DimensionOverflow("output row count"))?;
         let batch_size_u32 = u32::try_from(batch_size)
             .map_err(|_| MetalRuntimeError::DimensionOverflow("Q4 batch size"))?;
+        // Short speculative batches use the SIMD-group kernel when the input
+        // width can be evenly partitioned across 32 lanes. Unlike the compact
+        // tile path below, each SIMD group owns four output rows and streams
+        // the input in 512-value panels, avoiding a padded 8x32 group for
+        // batch=2..8.
+        let input_elements = (words_per_row as usize)
+            .checked_mul(VALUES_PER_PACKED_WORD)
+            .ok_or(MetalRuntimeError::DimensionOverflow("Q4 input elements"))?;
+        let use_batch_vector = self.fast_q4_prefill
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && job.output_rows <= Q4_BATCH_VECTOR_MAX_ROWS
+            && words_per_row % 8 == 0;
+        let batch_vector = if use_batch_vector {
+            match batch_size {
+                2 if std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_none() => Some((
+                    if job.aligned {
+                        &self.q4_affine_matmul_batch2_vector
+                    } else {
+                        &self.q4_affine_matmul_batch2_vector_unaligned
+                    },
+                    Q4_BATCH2_VECTOR_THREADS,
+                    job.aligned,
+                )),
+                3 if std::env::var_os("QWEN38_DISABLE_BATCH3_WEIGHT_VECTOR").is_none() => Some((
+                    if job.aligned {
+                        &self.q4_affine_matmul_batch3_vector
+                    } else {
+                        &self.q4_affine_matmul_batch3_vector_unaligned
+                    },
+                    Q4_BATCH3_VECTOR_THREADS,
+                    job.aligned,
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((pipeline, threads, aligned)) = batch_vector {
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(input), 0);
+            if aligned {
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+            } else {
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+            }
+            encoder.set_buffer(4, Some(output), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as u64,
+                (&words_per_row as *const u32).cast(),
+            );
+            if aligned {
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+            } else {
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    9,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job.output_rows).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("batch-vector output rows")
+                    })?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(threads, 1, 1),
+            );
+            return Ok(());
+        }
+        let use_batch_simd = self.fast_q4_prefill
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && (2..=Q4_SHORT_BATCH_MAX).contains(&batch_size)
+            && input_elements % Q4_BATCH_SIMD_VALUES_PER_BLOCK == 0;
+        if use_batch_simd {
+            encoder.set_compute_pipeline_state(if job.aligned {
+                &self.q4_affine_matmul_batch_simd
+            } else {
+                &self.q4_affine_matmul_batch_simd_unaligned
+            });
+            encoder.set_buffer(0, Some(input), 0);
+            if job.aligned {
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u32>() as u64,
+                    (&batch_size_u32 as *const u32).cast(),
+                );
+            } else {
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    9,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    10,
+                    size_of::<u32>() as u64,
+                    (&batch_size_u32 as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job.output_rows.div_ceil(Q4_BATCH_SIMD_OUTPUT_TILE)).map_err(
+                        |_| MetalRuntimeError::DimensionOverflow("batch SIMD output tiles"),
+                    )?,
+                    u64::try_from(batch_size).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("batch SIMD batch tiles")
+                    })?,
+                    1,
+                ),
+                MTLSize::new(Q4_BATCH_SIMD_THREADS, 1, 1),
+            );
+            return Ok(());
+        }
+        let use_short_batch = std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && (2..=Q4_SHORT_BATCH_MAX).contains(&batch_size);
         let output_tile_groups = u64::try_from(job.output_rows.div_ceil(Q4_PREFILL_OUTPUT_TILE))
             .map_err(|_| MetalRuntimeError::DimensionOverflow("Q4 output tile groups"))?;
         let batch_tile_groups = u64::try_from(batch_size.div_ceil(Q4_PREFILL_BATCH_TILE))
             .map_err(|_| MetalRuntimeError::DimensionOverflow("Q4 batch tile groups"))?;
+
+        if use_short_batch {
+            encoder.set_compute_pipeline_state(if job.aligned {
+                &self.q4_affine_matmul_short
+            } else {
+                &self.q4_affine_matmul_short_unaligned
+            });
+            encoder.set_buffer(0, Some(input), 0);
+            if job.aligned {
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u32>() as u64,
+                    (&batch_size_u32 as *const u32).cast(),
+                );
+            } else {
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    9,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    10,
+                    size_of::<u32>() as u64,
+                    (&batch_size_u32 as *const u32).cast(),
+                );
+            }
+            encoder.set_threadgroup_memory_length(
+                0,
+                checked_byte_len::<f32>(Q4_SHORT_INPUT_TILE_FLOATS)?,
+            );
+            encoder.set_threadgroup_memory_length(
+                1,
+                checked_byte_len::<u32>(Q4_SHORT_PACKED_TILE_WORDS)?,
+            );
+            encoder.set_threadgroup_memory_length(
+                2,
+                checked_byte_len::<f32>(Q4_SHORT_AFFINE_TILE_FLOATS)?,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job.output_rows.div_ceil(Q4_SHORT_OUTPUT_TILE)).map_err(
+                        |_| MetalRuntimeError::DimensionOverflow("short Q4 output tiles"),
+                    )?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(
+                    u64::try_from(batch_size * 32)
+                        .map_err(|_| MetalRuntimeError::DimensionOverflow("short Q4 threads"))?,
+                    1,
+                    1,
+                ),
+            );
+            return Ok(());
+        }
 
         // Long, aligned prompts benefit from a matrix-core path that reuses a
         // dequantized 64x8 weight tile across 64 prompt rows. Keep the
@@ -3138,7 +5933,9 @@ impl MetalRuntime {
         // environment switch for reproducible A/B measurements.
         let use_simdgroup = self.fast_q4_prefill
             && job.aligned
-            && batch_size >= Q4_SIMDGROUP_PREFILL_MIN_BATCH
+            && (batch_size >= Q4_SIMDGROUP_PREFILL_MIN_BATCH
+                || (std::env::var_os("QWEN38_ENABLE_SIMDGROUP_VERIFY").is_some()
+                    && (2..=Q4_SHORT_BATCH_MAX).contains(&batch_size)))
             && job.output_rows >= Q4_SIMDGROUP_PREFILL_OUTPUT_TILE
             && words_per_row as usize % (Q4_SIMDGROUP_PREFILL_K_TILE / VALUES_PER_PACKED_WORD) == 0;
         let use_wide_simdgroup = self.fast_q4_prefill
@@ -3323,6 +6120,349 @@ impl MetalRuntime {
         encoder.dispatch_thread_groups(
             MTLSize::new(output_tile_groups, batch_tile_groups, 1),
             MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        Ok(())
+    }
+
+    /// Encodes two short-batch projections that consume the same activation
+    /// matrix. The pair kernel stages each 64-value input panel once and
+    /// computes both output matrices before the next barrier. If the shape is
+    /// outside the compact path, retain the regular two-dispatch behavior.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_q4_affine_matmul_pair(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        input: &metal::Buffer,
+        output_a: &metal::Buffer,
+        job_a: &MappedQ4AffineJob<'_>,
+        output_b: &metal::Buffer,
+        job_b: &MappedQ4AffineJob<'_>,
+        words_per_row_a: u32,
+        words_per_row_b: u32,
+        batch_size: usize,
+    ) -> Result<(), MetalRuntimeError> {
+        let use_pair_batch_vector = self.fast_q4_prefill
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_FUSED_PAIR").is_none()
+            && words_per_row_a == words_per_row_b
+            && words_per_row_a % 8 == 0;
+        let pair_batch_vector = if use_pair_batch_vector {
+            match batch_size {
+                2 if std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_none() => Some((
+                    if job_a.aligned && job_b.aligned {
+                        &self.q4_affine_matmul_pair_batch2_vector
+                    } else {
+                        &self.q4_affine_matmul_pair_batch2_vector_unaligned
+                    },
+                    Q4_BATCH2_VECTOR_THREADS,
+                    job_a.aligned && job_b.aligned,
+                )),
+                3 if std::env::var_os("QWEN38_DISABLE_BATCH3_WEIGHT_VECTOR").is_none() => Some((
+                    if job_a.aligned && job_b.aligned {
+                        &self.q4_affine_matmul_pair_batch3_vector
+                    } else {
+                        &self.q4_affine_matmul_pair_batch3_vector_unaligned
+                    },
+                    Q4_BATCH3_VECTOR_THREADS,
+                    job_a.aligned && job_b.aligned,
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((pipeline, threads, aligned)) = pair_batch_vector {
+            if std::env::var_os("QWEN38_PAIR_TRACE").is_some() {
+                eprintln!(
+                    "q4 pair mode=batch{batch_size}_weight_vector rows={}+{} words={} aligned={}+{}",
+                    job_a.output_rows,
+                    job_b.output_rows,
+                    words_per_row_a,
+                    job_a.aligned,
+                    job_b.aligned,
+                );
+            }
+            let output_rows_a_u32 = u32::try_from(job_a.output_rows).map_err(|_| {
+                MetalRuntimeError::DimensionOverflow("paired batch-vector output rows")
+            })?;
+            let output_rows_b_u32 = u32::try_from(job_b.output_rows).map_err(|_| {
+                MetalRuntimeError::DimensionOverflow("paired batch-vector output rows")
+            })?;
+            let output_tiles = job_a.output_rows.max(job_b.output_rows);
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(input), 0);
+            if aligned {
+                encoder.set_buffer(1, Some(job_a.weights), job_a.weight_offset);
+                encoder.set_buffer(2, Some(job_a.scales), job_a.scale_offset);
+                encoder.set_buffer(3, Some(job_a.biases), job_a.bias_offset);
+            } else {
+                encoder.set_buffer(1, Some(job_a.weights), 0);
+                encoder.set_buffer(2, Some(job_a.scales), 0);
+                encoder.set_buffer(3, Some(job_a.biases), 0);
+            }
+            encoder.set_buffer(4, Some(output_a), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as u64,
+                (&output_rows_a_u32 as *const u32).cast(),
+            );
+            if aligned {
+                encoder.set_buffer(6, Some(job_b.weights), job_b.weight_offset);
+                encoder.set_buffer(7, Some(job_b.scales), job_b.scale_offset);
+                encoder.set_buffer(8, Some(job_b.biases), job_b.bias_offset);
+                encoder.set_buffer(9, Some(output_b), 0);
+                encoder.set_bytes(
+                    10,
+                    size_of::<u32>() as u64,
+                    (&output_rows_b_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    11,
+                    size_of::<u32>() as u64,
+                    (&words_per_row_a as *const u32).cast(),
+                );
+            } else {
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job_a.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job_a.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job_a.bias_offset as *const u64).cast(),
+                );
+                encoder.set_buffer(9, Some(job_b.weights), 0);
+                encoder.set_buffer(10, Some(job_b.scales), 0);
+                encoder.set_buffer(11, Some(job_b.biases), 0);
+                encoder.set_buffer(12, Some(output_b), 0);
+                encoder.set_bytes(
+                    13,
+                    size_of::<u32>() as u64,
+                    (&output_rows_b_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    14,
+                    size_of::<u64>() as u64,
+                    (&job_b.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    15,
+                    size_of::<u64>() as u64,
+                    (&job_b.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    16,
+                    size_of::<u64>() as u64,
+                    (&job_b.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    17,
+                    size_of::<u32>() as u64,
+                    (&words_per_row_a as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(output_tiles).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("paired batch-vector output rows")
+                    })?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(threads, 1, 1),
+            );
+            return Ok(());
+        }
+        let batch_simd_eligible = self.fast_q4_prefill
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && (2..=Q4_SHORT_BATCH_MAX).contains(&batch_size)
+            && (words_per_row_a as usize)
+                .checked_mul(VALUES_PER_PACKED_WORD)
+                .is_some_and(|input_elements| input_elements % Q4_BATCH_SIMD_VALUES_PER_BLOCK == 0);
+        let use_pair_simd = batch_simd_eligible
+            && std::env::var_os("QWEN38_DISABLE_FUSED_PAIR").is_none()
+            && job_a.aligned
+            && job_b.aligned
+            && words_per_row_a == words_per_row_b;
+        if use_pair_simd {
+            if std::env::var_os("QWEN38_PAIR_TRACE").is_some() {
+                eprintln!(
+                    "q4 pair mode=batch_simd rows={}+{} words={} aligned={}+{}",
+                    job_a.output_rows,
+                    job_b.output_rows,
+                    words_per_row_a,
+                    job_a.aligned,
+                    job_b.aligned,
+                );
+            }
+            let output_rows_a_u32 = u32::try_from(job_a.output_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("paired SIMD output rows"))?;
+            let output_rows_b_u32 = u32::try_from(job_b.output_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("paired SIMD output rows"))?;
+            let batch_size_u32 = u32::try_from(batch_size)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("paired SIMD batch size"))?;
+            let output_tiles = job_a
+                .output_rows
+                .max(job_b.output_rows)
+                .div_ceil(Q4_BATCH_SIMD_OUTPUT_TILE);
+            encoder.set_compute_pipeline_state(&self.q4_affine_matmul_pair_batch_simd);
+            encoder.set_buffer(0, Some(input), 0);
+            encoder.set_buffer(1, Some(job_a.weights), job_a.weight_offset);
+            encoder.set_buffer(2, Some(job_a.scales), job_a.scale_offset);
+            encoder.set_buffer(3, Some(job_a.biases), job_a.bias_offset);
+            encoder.set_buffer(4, Some(output_a), 0);
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as u64,
+                (&output_rows_a_u32 as *const u32).cast(),
+            );
+            encoder.set_buffer(6, Some(job_b.weights), job_b.weight_offset);
+            encoder.set_buffer(7, Some(job_b.scales), job_b.scale_offset);
+            encoder.set_buffer(8, Some(job_b.biases), job_b.bias_offset);
+            encoder.set_buffer(9, Some(output_b), 0);
+            encoder.set_bytes(
+                10,
+                size_of::<u32>() as u64,
+                (&output_rows_b_u32 as *const u32).cast(),
+            );
+            encoder.set_bytes(
+                11,
+                size_of::<u32>() as u64,
+                (&words_per_row_a as *const u32).cast(),
+            );
+            encoder.set_bytes(
+                12,
+                size_of::<u32>() as u64,
+                (&batch_size_u32 as *const u32).cast(),
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(output_tiles).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("paired SIMD output tiles")
+                    })?,
+                    u64::try_from(batch_size).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("paired SIMD batch tiles")
+                    })?,
+                    1,
+                ),
+                MTLSize::new(Q4_BATCH_SIMD_THREADS, 1, 1),
+            );
+            return Ok(());
+        }
+        let use_pair = std::env::var_os("QWEN38_DISABLE_FUSED_PAIR").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && !batch_simd_eligible
+            && std::env::var_os("QWEN38_ENABLE_SIMDGROUP_VERIFY").is_none()
+            && (2..=Q4_SHORT_BATCH_MAX).contains(&batch_size)
+            && job_a.aligned
+            && job_b.aligned
+            && words_per_row_a == words_per_row_b;
+        if std::env::var_os("QWEN38_PAIR_TRACE").is_some() {
+            eprintln!(
+                "q4 pair rows={}+{} words={}+{} batch={} aligned={}+{} enabled={}",
+                job_a.output_rows,
+                job_b.output_rows,
+                words_per_row_a,
+                words_per_row_b,
+                batch_size,
+                job_a.aligned,
+                job_b.aligned,
+                use_pair,
+            );
+        }
+        if !use_pair {
+            self.encode_q4_affine_matmul(
+                encoder,
+                input,
+                output_a,
+                job_a,
+                words_per_row_a,
+                batch_size,
+            )?;
+            return self.encode_q4_affine_matmul(
+                encoder,
+                input,
+                output_b,
+                job_b,
+                words_per_row_b,
+                batch_size,
+            );
+        }
+
+        let output_rows_a = u32::try_from(job_a.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("paired output rows"))?;
+        let output_rows_b = u32::try_from(job_b.output_rows)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("paired output rows"))?;
+        let batch_size_u32 = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("paired Q4 batch size"))?;
+        let output_tiles = job_a
+            .output_rows
+            .max(job_b.output_rows)
+            .div_ceil(Q4_SHORT_OUTPUT_TILE);
+
+        encoder.set_compute_pipeline_state(&self.q4_affine_matmul_pair_short);
+        encoder.set_buffer(0, Some(input), 0);
+        encoder.set_buffer(1, Some(job_a.weights), job_a.weight_offset);
+        encoder.set_buffer(2, Some(job_a.scales), job_a.scale_offset);
+        encoder.set_buffer(3, Some(job_a.biases), job_a.bias_offset);
+        encoder.set_buffer(4, Some(output_a), 0);
+        encoder.set_bytes(
+            5,
+            size_of::<u32>() as u64,
+            (&output_rows_a as *const u32).cast(),
+        );
+        encoder.set_buffer(6, Some(job_b.weights), job_b.weight_offset);
+        encoder.set_buffer(7, Some(job_b.scales), job_b.scale_offset);
+        encoder.set_buffer(8, Some(job_b.biases), job_b.bias_offset);
+        encoder.set_buffer(9, Some(output_b), 0);
+        encoder.set_bytes(
+            10,
+            size_of::<u32>() as u64,
+            (&output_rows_b as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            11,
+            size_of::<u32>() as u64,
+            (&words_per_row_a as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            12,
+            size_of::<u32>() as u64,
+            (&batch_size_u32 as *const u32).cast(),
+        );
+        encoder
+            .set_threadgroup_memory_length(0, checked_byte_len::<f32>(Q4_SHORT_INPUT_TILE_FLOATS)?);
+        encoder.set_threadgroup_memory_length(
+            1,
+            checked_byte_len::<u32>(Q4_SHORT_PAIR_PACKED_TILE_WORDS)?,
+        );
+        encoder
+            .set_threadgroup_memory_length(2, checked_byte_len::<u32>(Q4_SHORT_PACKED_TILE_WORDS)?);
+        encoder.set_threadgroup_memory_length(
+            3,
+            checked_byte_len::<f32>(Q4_SHORT_PAIR_AFFINE_TILE_FLOATS)?,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::try_from(output_tiles)
+                    .map_err(|_| MetalRuntimeError::DimensionOverflow("paired output tiles"))?,
+                1,
+                1,
+            ),
+            MTLSize::new(
+                u64::try_from(batch_size * 32)
+                    .map_err(|_| MetalRuntimeError::DimensionOverflow("paired Q4 threads"))?,
+                1,
+                1,
+            ),
         );
         Ok(())
     }
@@ -3682,20 +6822,97 @@ impl MetalRuntime {
         &self,
         weights: &MetalDeltaNetWeights,
     ) -> Result<MetalDeltaNetState, MetalRuntimeError> {
-        let config = weights.config;
-        let channels = config.channels()?;
-        let history_elements = channels
-            .checked_mul(config.conv_kernel_size.saturating_sub(1))
-            .ok_or(MetalRuntimeError::DimensionOverflow(
-                "DeltaNet convolution state",
-            ))?;
+        let (conv_bytes, recurrent_bytes) = deltanet_state_byte_lengths(weights)?;
         Ok(MetalDeltaNetState {
             // A one-element allocation keeps the buffer binding valid for a
             // kernel-size-one model, whose shader never reads this state.
-            conv: self.zeroed_shared_buffer(checked_byte_len::<f32>(history_elements.max(1))?)?,
-            recurrent: self
-                .zeroed_shared_buffer(checked_byte_len::<f32>(config.recurrent_elements()?)?)?,
+            conv: self.zeroed_shared_buffer(conv_bytes)?,
+            recurrent: self.zeroed_shared_buffer(recurrent_bytes)?,
         })
+    }
+
+    /// Allocates compact row-major DeltaNet state images for a speculative
+    /// verification block. The final candidate keeps using the ordinary
+    /// shadow state, so callers only need images for intermediate rows.
+    pub fn create_deltanet_snapshots(
+        &self,
+        weights: &MetalDeltaNetWeights,
+        row_count: usize,
+    ) -> Result<MetalDeltaNetSnapshots, MetalRuntimeError> {
+        if row_count == 0 {
+            return Err(MetalRuntimeError::EmptyDimension);
+        }
+        let (conv_state_bytes, recurrent_state_bytes) = deltanet_state_byte_lengths(weights)?;
+        let total_conv_bytes =
+            conv_state_bytes
+                .checked_mul(u64::try_from(row_count).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("DeltaNet snapshot row count")
+                })?)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "DeltaNet convolution snapshots",
+                ))?;
+        let total_recurrent_bytes =
+            recurrent_state_bytes
+                .checked_mul(u64::try_from(row_count).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("DeltaNet snapshot row count")
+                })?)
+                .ok_or(MetalRuntimeError::DimensionOverflow(
+                    "DeltaNet recurrent snapshots",
+                ))?;
+        Ok(MetalDeltaNetSnapshots {
+            conv: self.zeroed_shared_buffer(total_conv_bytes)?,
+            recurrent: self.zeroed_shared_buffer(total_recurrent_bytes)?,
+            row_count,
+            conv_state_bytes,
+            recurrent_state_bytes,
+        })
+    }
+
+    /// Restores one completed verification row into the active DeltaNet
+    /// state. A one-row snapshot has exactly the same layout as the active
+    /// state, so the latency-sensitive MTP path swaps its buffers instead of
+    /// copying them through unified memory.
+    pub fn restore_deltanet_snapshot(
+        &self,
+        snapshots: &mut MetalDeltaNetSnapshots,
+        row: usize,
+        destination: &mut MetalDeltaNetState,
+    ) -> Result<(), MetalRuntimeError> {
+        if row >= snapshots.row_count {
+            return Err(MetalRuntimeError::InvalidSnapshotRow);
+        }
+        if destination.conv.length() != snapshots.conv_state_bytes
+            || destination.recurrent.length() != snapshots.recurrent_state_bytes
+        {
+            return Err(MetalRuntimeError::InvalidDeltaNetSnapshot);
+        }
+        if row == 0 && snapshots.row_count == 1 {
+            std::mem::swap(&mut snapshots.conv, &mut destination.conv);
+            std::mem::swap(&mut snapshots.recurrent, &mut destination.recurrent);
+            return Ok(());
+        }
+        let row = u64::try_from(row)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet snapshot row"))?;
+        let conv_offset = row.checked_mul(snapshots.conv_state_bytes).ok_or(
+            MetalRuntimeError::DimensionOverflow("DeltaNet convolution snapshot offset"),
+        )?;
+        let recurrent_offset = row.checked_mul(snapshots.recurrent_state_bytes).ok_or(
+            MetalRuntimeError::DimensionOverflow("DeltaNet recurrent snapshot offset"),
+        )?;
+        copy_buffer_region_bytes(
+            &snapshots.conv,
+            conv_offset,
+            &destination.conv,
+            0,
+            snapshots.conv_state_bytes,
+        )?;
+        copy_buffer_region_bytes(
+            &snapshots.recurrent,
+            recurrent_offset,
+            &destination.recurrent,
+            0,
+            snapshots.recurrent_state_bytes,
+        )
     }
 
     /// Copies a completed recurrent state into request-owned Metal buffers.
@@ -3733,6 +6950,22 @@ impl MetalRuntime {
             .checked_add(additional_tokens)
             .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV token capacity"))?;
         self.ensure_q8_kv_capacity(state, required_tokens)
+    }
+
+    /// Moves the logical end of a request-local Q8 KV cache backwards.
+    /// Speculative verification writes a short candidate suffix into a cloned
+    /// cache; rejected rows can be discarded by changing the active length,
+    /// while the already-written bytes remain available for the next append.
+    pub fn truncate_q8_kv_tokens(
+        &self,
+        state: &mut Q8KvState,
+        sequence_length: usize,
+    ) -> Result<(), MetalRuntimeError> {
+        if sequence_length > state.sequence_length {
+            return Err(MetalRuntimeError::InvalidSequenceLength);
+        }
+        state.sequence_length = sequence_length;
+        Ok(())
     }
 
     /// Clones a request-local Q8 KV cache, including its allocated capacity and
@@ -3818,7 +7051,7 @@ impl MetalRuntime {
             .checked_next_power_of_two()
             .ok_or(MetalRuntimeError::DimensionOverflow("Q8 KV token capacity"))?
             .max(16);
-        let replacement =
+        let mut replacement =
             self.allocate_q8_kv_state(state.kv_heads, state.head_dim, capacity_tokens)?;
         let active_elements = state
             .sequence_length
@@ -3853,6 +7086,7 @@ impl MetalRuntime {
                 checked_byte_len::<f32>(active_scales)? as usize,
             );
         }
+        replacement.sequence_length = state.sequence_length;
         *state = replacement;
         Ok(())
     }
@@ -4165,6 +7399,169 @@ impl MetalRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_deltanet_prefill(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        weights: &MetalDeltaNetWeights,
+        initial_conv: &metal::Buffer,
+        initial_recurrent: &metal::Buffer,
+        destination_conv: &metal::Buffer,
+        destination_recurrent: &metal::Buffer,
+        snapshots: Option<&MetalDeltaNetSnapshots>,
+        qkv: &metal::Buffer,
+        z: &metal::Buffer,
+        b: &metal::Buffer,
+        a: &metal::Buffer,
+        output: &metal::Buffer,
+        batch_size: usize,
+        epsilon: f32,
+    ) -> Result<(), MetalRuntimeError> {
+        let config = weights.config;
+        validate_deltanet_config(config)?;
+        let dimensions = config.as_u32()?;
+        let snapshot_rows = batch_size.saturating_sub(1);
+        let batch_size = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet batch size"))?;
+        let (
+            snapshot_conv,
+            snapshot_recurrent,
+            snapshot_rows,
+            snapshot_conv_elements,
+            snapshot_recurrent_elements,
+        ) = match snapshots {
+            Some(snapshots) => {
+                if snapshots.row_count < snapshot_rows {
+                    return Err(MetalRuntimeError::InvalidDeltaNetSnapshot);
+                }
+                if snapshots.conv_state_bytes == 0
+                    || snapshots.recurrent_state_bytes == 0
+                    || snapshots.conv.length()
+                        < snapshots
+                            .conv_state_bytes
+                            .checked_mul(u64::try_from(snapshot_rows).map_err(|_| {
+                                MetalRuntimeError::DimensionOverflow("DeltaNet snapshot rows")
+                            })?)
+                            .ok_or(MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet convolution snapshots",
+                            ))?
+                    || snapshots.recurrent.length()
+                        < snapshots
+                            .recurrent_state_bytes
+                            .checked_mul(u64::try_from(snapshot_rows).map_err(|_| {
+                                MetalRuntimeError::DimensionOverflow("DeltaNet snapshot rows")
+                            })?)
+                            .ok_or(MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet recurrent snapshots",
+                            ))?
+                {
+                    return Err(MetalRuntimeError::InvalidDeltaNetSnapshot);
+                }
+                (
+                    &snapshots.conv,
+                    &snapshots.recurrent,
+                    u32::try_from(snapshot_rows).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("DeltaNet snapshot rows")
+                    })?,
+                    u32::try_from(snapshots.conv_state_bytes / size_of::<f32>() as u64).map_err(
+                        |_| {
+                            MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet convolution snapshot stride",
+                            )
+                        },
+                    )?,
+                    u32::try_from(snapshots.recurrent_state_bytes / size_of::<f32>() as u64)
+                        .map_err(|_| {
+                            MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet recurrent snapshot stride",
+                            )
+                        })?,
+                )
+            }
+            None => (destination_conv, destination_recurrent, 0_u32, 0_u32, 0_u32),
+        };
+        let scratch_elements = config
+            .key_head_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(THREADS_PER_THREADGROUP as usize * 3))
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "DeltaNet prefill scratch",
+            ))?;
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.deltanet_prefill);
+        encoder.set_buffer(0, Some(qkv), 0);
+        encoder.set_buffer(1, Some(z), 0);
+        encoder.set_buffer(2, Some(b), 0);
+        encoder.set_buffer(3, Some(a), 0);
+        encoder.set_buffer(4, Some(&weights.conv_weight), 0);
+        encoder.set_buffer(5, Some(&weights.a_log), 0);
+        encoder.set_buffer(6, Some(&weights.dt_bias), 0);
+        encoder.set_buffer(7, Some(&weights.norm), 0);
+        encoder.set_buffer(8, Some(initial_conv), 0);
+        encoder.set_buffer(9, Some(initial_recurrent), 0);
+        encoder.set_buffer(10, Some(destination_conv), 0);
+        encoder.set_buffer(11, Some(destination_recurrent), 0);
+        encoder.set_buffer(12, Some(output), 0);
+        // The snapshot bindings deliberately alias the destination state when
+        // capture is disabled, keeping every Metal argument valid on the
+        // ordinary prefill path.
+        encoder.set_buffer(20, Some(snapshot_conv), 0);
+        encoder.set_buffer(21, Some(snapshot_recurrent), 0);
+        encoder.set_bytes(
+            13,
+            size_of::<u32>() as u64,
+            (&batch_size as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            14,
+            size_of::<u32>() as u64,
+            (&dimensions.key_heads as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            15,
+            size_of::<u32>() as u64,
+            (&dimensions.value_heads as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            16,
+            size_of::<u32>() as u64,
+            (&dimensions.key_head_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            17,
+            size_of::<u32>() as u64,
+            (&dimensions.value_head_dim as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            18,
+            size_of::<u32>() as u64,
+            (&dimensions.conv_kernel_size as *const u32).cast(),
+        );
+        encoder.set_bytes(19, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_bytes(
+            22,
+            size_of::<u32>() as u64,
+            (&snapshot_rows as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            23,
+            size_of::<u32>() as u64,
+            (&snapshot_conv_elements as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            24,
+            size_of::<u32>() as u64,
+            (&snapshot_recurrent_elements as *const u32).cast(),
+        );
+        encoder.set_threadgroup_memory_length(0, checked_byte_len::<f32>(scratch_elements)?);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(dimensions.key_heads), 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        encoder.end_encoding();
+        Ok(())
+    }
+
     /// Advances an entire causal DeltaNet prompt in one GPU submission. The
     /// state buffers are identical to `deltanet_step`, so decode can continue
     /// with the single-token path after prefill.
@@ -4173,6 +7570,105 @@ impl MetalRuntime {
         &self,
         weights: &MetalDeltaNetWeights,
         state: &mut MetalDeltaNetState,
+        qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        batch_size: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        self.deltanet_prefill_from_buffers(
+            weights,
+            &state.conv,
+            &state.recurrent,
+            &state.conv,
+            &state.recurrent,
+            None,
+            qkv,
+            z,
+            b,
+            a,
+            batch_size,
+            epsilon,
+        )
+    }
+
+    /// Advances a causal DeltaNet span from `source` into `destination`.
+    ///
+    /// The source is only read for the first token. Later rows read the
+    /// destination written by the preceding row, so the destination does not
+    /// need to be initialized. This is used by speculative verification to
+    /// keep the committed recurrent state untouched until acceptance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_prefill_from(
+        &self,
+        weights: &MetalDeltaNetWeights,
+        source: &MetalDeltaNetState,
+        destination: &mut MetalDeltaNetState,
+        qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        batch_size: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        self.deltanet_prefill_from_buffers(
+            weights,
+            &source.conv,
+            &source.recurrent,
+            &destination.conv,
+            &destination.recurrent,
+            None,
+            qkv,
+            z,
+            b,
+            a,
+            batch_size,
+            epsilon,
+        )
+    }
+
+    /// Snapshotting variant used by focused runtime tests and by callers that
+    /// need to restore a partially accepted causal span.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_prefill_from_with_snapshots(
+        &self,
+        weights: &MetalDeltaNetWeights,
+        source: &MetalDeltaNetState,
+        destination: &mut MetalDeltaNetState,
+        snapshots: &MetalDeltaNetSnapshots,
+        qkv: &[f32],
+        z: &[f32],
+        b: &[f32],
+        a: &[f32],
+        batch_size: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, MetalRuntimeError> {
+        self.deltanet_prefill_from_buffers(
+            weights,
+            &source.conv,
+            &source.recurrent,
+            &destination.conv,
+            &destination.recurrent,
+            Some(snapshots),
+            qkv,
+            z,
+            b,
+            a,
+            batch_size,
+            epsilon,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deltanet_prefill_from_buffers(
+        &self,
+        weights: &MetalDeltaNetWeights,
+        initial_conv: &metal::Buffer,
+        initial_recurrent: &metal::Buffer,
+        destination_conv: &metal::Buffer,
+        destination_recurrent: &metal::Buffer,
+        snapshots: Option<&MetalDeltaNetSnapshots>,
         qkv: &[f32],
         z: &[f32],
         b: &[f32],
@@ -4221,6 +7717,41 @@ impl MetalRuntime {
         let dimensions = config.as_u32()?;
         let batch_size_u32 = u32::try_from(batch_size)
             .map_err(|_| MetalRuntimeError::DimensionOverflow("DeltaNet prefill batch"))?;
+        let snapshot_rows = batch_size.saturating_sub(1);
+        let (
+            snapshot_conv,
+            snapshot_recurrent,
+            snapshot_rows_u32,
+            snapshot_conv_stride,
+            snapshot_recurrent_stride,
+        ) = match snapshots {
+            Some(snapshots) => {
+                if snapshots.row_count < snapshot_rows {
+                    return Err(MetalRuntimeError::InvalidDeltaNetSnapshot);
+                }
+                (
+                    &snapshots.conv,
+                    &snapshots.recurrent,
+                    u32::try_from(snapshot_rows).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("DeltaNet snapshot rows")
+                    })?,
+                    u32::try_from(snapshots.conv_state_bytes / size_of::<f32>() as u64).map_err(
+                        |_| {
+                            MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet convolution snapshot stride",
+                            )
+                        },
+                    )?,
+                    u32::try_from(snapshots.recurrent_state_bytes / size_of::<f32>() as u64)
+                        .map_err(|_| {
+                            MetalRuntimeError::DimensionOverflow(
+                                "DeltaNet recurrent snapshot stride",
+                            )
+                        })?,
+                )
+            }
+            None => (destination_conv, destination_recurrent, 0_u32, 0_u32, 0_u32),
+        };
         let scratch_elements = config
             .key_head_dim
             .checked_mul(2)
@@ -4259,40 +7790,59 @@ impl MetalRuntime {
         encoder.set_buffer(5, Some(&weights.a_log), 0);
         encoder.set_buffer(6, Some(&weights.dt_bias), 0);
         encoder.set_buffer(7, Some(&weights.norm), 0);
-        encoder.set_buffer(8, Some(&state.conv), 0);
-        encoder.set_buffer(9, Some(&state.recurrent), 0);
-        encoder.set_buffer(10, Some(language_slot(&activations, 4)), 0);
+        encoder.set_buffer(8, Some(initial_conv), 0);
+        encoder.set_buffer(9, Some(initial_recurrent), 0);
+        encoder.set_buffer(10, Some(destination_conv), 0);
+        encoder.set_buffer(11, Some(destination_recurrent), 0);
+        encoder.set_buffer(12, Some(language_slot(&activations, 4)), 0);
+        encoder.set_buffer(20, Some(snapshot_conv), 0);
+        encoder.set_buffer(21, Some(snapshot_recurrent), 0);
         encoder.set_bytes(
-            11,
+            13,
             size_of::<u32>() as u64,
             (&batch_size_u32 as *const u32).cast(),
         );
         encoder.set_bytes(
-            12,
+            14,
             size_of::<u32>() as u64,
             (&dimensions.key_heads as *const u32).cast(),
         );
         encoder.set_bytes(
-            13,
+            15,
             size_of::<u32>() as u64,
             (&dimensions.value_heads as *const u32).cast(),
         );
         encoder.set_bytes(
-            14,
+            16,
             size_of::<u32>() as u64,
             (&dimensions.key_head_dim as *const u32).cast(),
         );
         encoder.set_bytes(
-            15,
+            17,
             size_of::<u32>() as u64,
             (&dimensions.value_head_dim as *const u32).cast(),
         );
         encoder.set_bytes(
-            16,
+            18,
             size_of::<u32>() as u64,
             (&dimensions.conv_kernel_size as *const u32).cast(),
         );
-        encoder.set_bytes(17, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_bytes(19, size_of::<f32>() as u64, (&epsilon as *const f32).cast());
+        encoder.set_bytes(
+            22,
+            size_of::<u32>() as u64,
+            (&snapshot_rows_u32 as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            23,
+            size_of::<u32>() as u64,
+            (&snapshot_conv_stride as *const u32).cast(),
+        );
+        encoder.set_bytes(
+            24,
+            size_of::<u32>() as u64,
+            (&snapshot_recurrent_stride as *const u32).cast(),
+        );
         encoder.set_threadgroup_memory_length(0, checked_byte_len::<f32>(scratch_elements)?);
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(dimensions.key_heads), 1, 1),
@@ -4507,6 +8057,174 @@ impl MetalRuntime {
             )
             .to_vec()
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gqa_prefill(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        state: &mut Q8KvState,
+        query: &metal::Buffer,
+        gate: &metal::Buffer,
+        key: &metal::Buffer,
+        value: &metal::Buffer,
+        output: &metal::Buffer,
+        num_heads: usize,
+        batch_size: usize,
+    ) -> Result<usize, MetalRuntimeError> {
+        validate_attention_shape(state.kv_heads, state.head_dim)?;
+        if batch_size == 0
+            || num_heads == 0
+            || num_heads % state.kv_heads != 0
+            || num_heads > u32::MAX as usize
+        {
+            return Err(MetalRuntimeError::InvalidAttentionShape);
+        }
+        let query_elements_per_row = num_heads
+            .checked_mul(state.head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA query elements"))?;
+        let key_value_elements_per_row = state
+            .kv_heads
+            .checked_mul(state.head_dim)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA KV elements"))?;
+        let query_elements = batch_size
+            .checked_mul(query_elements_per_row)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA query elements"))?;
+        let key_value_elements = batch_size
+            .checked_mul(key_value_elements_per_row)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA KV elements"))?;
+        let output_length = query_elements;
+        for (name, buffer, expected) in [
+            ("GQA query buffer", query, query_elements),
+            ("GQA gate buffer", gate, query_elements),
+            ("GQA key buffer", key, key_value_elements),
+            ("GQA value buffer", value, key_value_elements),
+            ("GQA output buffer", output, output_length),
+        ] {
+            if checked_byte_len::<f32>(expected)? > buffer.length() {
+                return Err(MetalRuntimeError::WrongLength {
+                    name,
+                    actual: usize::try_from(buffer.length() / size_of::<f32>() as u64)
+                        .unwrap_or(usize::MAX),
+                    expected,
+                });
+            }
+        }
+        let start_token = state.sequence_length;
+        let total_length = start_token
+            .checked_add(batch_size)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA sequence length"))?;
+        self.ensure_q8_kv_capacity(state, total_length)?;
+        let start_token_u32 = u32::try_from(start_token)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA start token"))?;
+        let total_length_u32 = u32::try_from(total_length)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA sequence length"))?;
+        let batch_size_u32 = u32::try_from(batch_size)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA batch size"))?;
+        let num_heads_u32 = u32::try_from(num_heads)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA head count"))?;
+        let kv_heads_u32 = u32::try_from(state.kv_heads)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA KV head count"))?;
+        let head_dim_u32 = u32::try_from(state.head_dim)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA head dimension"))?;
+        let append_groups = batch_size
+            .checked_mul(state.kv_heads)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA append groups"))?;
+        let attention_groups = batch_size
+            .checked_mul(num_heads)
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA attention groups"))?;
+        let append_groups = u64::try_from(append_groups)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA append groups"))?;
+        let attention_groups = u64::try_from(attention_groups)
+            .map_err(|_| MetalRuntimeError::DimensionOverflow("GQA attention groups"))?;
+        let scratch_elements = THREADS_PER_THREADGROUP
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(4))
+            .ok_or(MetalRuntimeError::DimensionOverflow("GQA scratch"))?;
+
+        let append_encoder = command_buffer.new_compute_command_encoder();
+        append_encoder.set_compute_pipeline_state(&self.q8_kv_append_prefill);
+        append_encoder.set_buffer(0, Some(key), 0);
+        append_encoder.set_buffer(1, Some(value), 0);
+        append_encoder.set_buffer(2, Some(&state.keys), 0);
+        append_encoder.set_buffer(3, Some(&state.values), 0);
+        append_encoder.set_buffer(4, Some(&state.key_scales), 0);
+        append_encoder.set_buffer(5, Some(&state.value_scales), 0);
+        append_encoder.set_bytes(
+            6,
+            size_of::<u32>() as u64,
+            (&kv_heads_u32 as *const u32).cast(),
+        );
+        append_encoder.set_bytes(
+            7,
+            size_of::<u32>() as u64,
+            (&head_dim_u32 as *const u32).cast(),
+        );
+        append_encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&start_token_u32 as *const u32).cast(),
+        );
+        append_encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&batch_size_u32 as *const u32).cast(),
+        );
+        append_encoder
+            .set_threadgroup_memory_length(0, THREADS_PER_THREADGROUP * size_of::<f32>() as u64);
+        append_encoder.dispatch_thread_groups(
+            MTLSize::new(append_groups, 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        append_encoder.end_encoding();
+
+        let attention_encoder = command_buffer.new_compute_command_encoder();
+        attention_encoder.set_compute_pipeline_state(&self.gqa_q8_prefill_attention);
+        attention_encoder.set_buffer(0, Some(query), 0);
+        attention_encoder.set_buffer(1, Some(&state.keys), 0);
+        attention_encoder.set_buffer(2, Some(&state.key_scales), 0);
+        attention_encoder.set_buffer(3, Some(&state.values), 0);
+        attention_encoder.set_buffer(4, Some(&state.value_scales), 0);
+        attention_encoder.set_buffer(5, Some(gate), 0);
+        attention_encoder.set_buffer(6, Some(output), 0);
+        attention_encoder.set_bytes(
+            7,
+            size_of::<u32>() as u64,
+            (&start_token_u32 as *const u32).cast(),
+        );
+        attention_encoder.set_bytes(
+            8,
+            size_of::<u32>() as u64,
+            (&total_length_u32 as *const u32).cast(),
+        );
+        attention_encoder.set_bytes(
+            9,
+            size_of::<u32>() as u64,
+            (&num_heads_u32 as *const u32).cast(),
+        );
+        attention_encoder.set_bytes(
+            10,
+            size_of::<u32>() as u64,
+            (&kv_heads_u32 as *const u32).cast(),
+        );
+        attention_encoder.set_bytes(
+            11,
+            size_of::<u32>() as u64,
+            (&head_dim_u32 as *const u32).cast(),
+        );
+        attention_encoder.set_threadgroup_memory_length(
+            0,
+            scratch_elements
+                .checked_mul(size_of::<f32>() as u64)
+                .ok_or(MetalRuntimeError::DimensionOverflow("GQA scratch"))?,
+        );
+        attention_encoder.dispatch_thread_groups(
+            MTLSize::new(attention_groups, 1, 1),
+            MTLSize::new(THREADS_PER_THREADGROUP, 1, 1),
+        );
+        attention_encoder.end_encoding();
+        Ok(total_length)
     }
 
     /// Appends a complete prompt span to the Q8 KV cache, then computes each
@@ -4990,18 +8708,54 @@ fn copy_buffer_bytes(
     destination: &metal::Buffer,
     byte_len: u64,
 ) -> Result<(), MetalRuntimeError> {
-    if byte_len > source.length() || byte_len > destination.length() {
+    copy_buffer_region_bytes(source, 0, destination, 0, byte_len)
+}
+
+fn copy_buffer_region_bytes(
+    source: &metal::Buffer,
+    source_offset: u64,
+    destination: &metal::Buffer,
+    destination_offset: u64,
+    byte_len: u64,
+) -> Result<(), MetalRuntimeError> {
+    let source_end =
+        source_offset
+            .checked_add(byte_len)
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "Metal source buffer range",
+            ))?;
+    let destination_end =
+        destination_offset
+            .checked_add(byte_len)
+            .ok_or(MetalRuntimeError::DimensionOverflow(
+                "Metal destination buffer range",
+            ))?;
+    if source_end > source.length() || destination_end > destination.length() {
         return Err(MetalRuntimeError::WrongLength {
             name: "Metal state buffer copy",
             actual: usize::try_from(byte_len).unwrap_or(usize::MAX),
-            expected: usize::try_from(source.length().min(destination.length()))
-                .unwrap_or(usize::MAX),
+            expected: usize::try_from(
+                source
+                    .length()
+                    .saturating_sub(source_offset)
+                    .min(destination.length().saturating_sub(destination_offset)),
+            )
+            .unwrap_or(usize::MAX),
         });
     }
     unsafe {
         std::ptr::copy_nonoverlapping(
-            source.contents().cast::<u8>(),
-            destination.contents().cast::<u8>(),
+            source.contents().cast::<u8>().add(
+                usize::try_from(source_offset).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("Metal source buffer offset")
+                })?,
+            ),
+            destination
+                .contents()
+                .cast::<u8>()
+                .add(usize::try_from(destination_offset).map_err(|_| {
+                    MetalRuntimeError::DimensionOverflow("Metal destination buffer offset")
+                })?),
             usize::try_from(byte_len)
                 .map_err(|_| MetalRuntimeError::DimensionOverflow("Metal state copy bytes"))?,
         );
@@ -5048,6 +8802,23 @@ fn validate_deltanet_config(config: DeltaNetConfig) -> Result<(), MetalRuntimeEr
     Ok(())
 }
 
+fn deltanet_state_byte_lengths(
+    weights: &MetalDeltaNetWeights,
+) -> Result<(u64, u64), MetalRuntimeError> {
+    let config = weights.config;
+    validate_deltanet_config(config)?;
+    let channels = config.channels()?;
+    let history_elements = channels
+        .checked_mul(config.conv_kernel_size.saturating_sub(1))
+        .ok_or(MetalRuntimeError::DimensionOverflow(
+            "DeltaNet convolution state",
+        ))?;
+    Ok((
+        checked_byte_len::<f32>(history_elements.max(1))?,
+        checked_byte_len::<f32>(config.recurrent_elements()?)?,
+    ))
+}
+
 fn validate_attention_shape(kv_heads: usize, head_dim: usize) -> Result<(), MetalRuntimeError> {
     if kv_heads == 0 || head_dim == 0 || head_dim > THREADS_PER_THREADGROUP as usize {
         return Err(MetalRuntimeError::InvalidAttentionShape);
@@ -5055,6 +8826,29 @@ fn validate_attention_shape(kv_heads: usize, head_dim: usize) -> Result<(), Meta
     u32::try_from(kv_heads).map_err(|_| MetalRuntimeError::InvalidAttentionShape)?;
     u32::try_from(head_dim).map_err(|_| MetalRuntimeError::InvalidAttentionShape)?;
     Ok(())
+}
+
+fn update_batch_full_sequence_lengths(
+    layers: &mut [MetalBatchDecodeLayer<'_>],
+    full_sequence_lengths: &[usize],
+) {
+    let mut full_index = 0;
+    for descriptor in layers {
+        if let MetalBatchDecodeLayer::Full(_, kv_state) = descriptor {
+            kv_state.sequence_length = full_sequence_lengths[full_index];
+            full_index += 1;
+        }
+    }
+    debug_assert_eq!(full_index, full_sequence_lengths.len());
+}
+
+/// Returns command-buffer execution time after completion. The Metal crate
+/// does not currently wrap these timestamps, but the Objective-C selectors
+/// are available on every deployment target supported by this runtime.
+fn completed_command_buffer_gpu_ms(command_buffer: &metal::CommandBufferRef) -> f64 {
+    let started: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
+    let ended: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
+    (ended - started).max(0.0) * 1_000.0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5072,7 +8866,11 @@ pub enum MetalRuntimeError {
     LanguageActivationPoolPoisoned,
     EmptyDimension,
     InvalidDeltaNetConfig,
+    InvalidDeltaNetSnapshot,
+    InvalidSnapshotRow,
     InvalidAttentionShape,
+    InvalidDecodeConfig(&'static str),
+    InvalidSequenceLength,
     InputNotGrouped {
         input_elements: usize,
         group_size: usize,
@@ -5117,10 +8915,20 @@ impl fmt::Display for MetalRuntimeError {
                 formatter,
                 "DeltaNet dimensions must be non-zero, GPU-threadgroup compatible, and evenly grouped"
             ),
+            Self::InvalidDeltaNetSnapshot => {
+                write!(formatter, "DeltaNet snapshot geometry does not match its destination state")
+            }
+            Self::InvalidSnapshotRow => write!(formatter, "DeltaNet snapshot row is unavailable"),
             Self::InvalidAttentionShape => write!(
                 formatter,
                 "attention dimensions must be non-zero and fit one GPU threadgroup"
             ),
+            Self::InvalidDecodeConfig(message) => {
+                write!(formatter, "invalid decode configuration: {message}")
+            }
+            Self::InvalidSequenceLength => {
+                write!(formatter, "the requested KV sequence length exceeds the active cache")
+            }
             Self::InputNotGrouped {
                 input_elements,
                 group_size,
@@ -5620,6 +9428,603 @@ mod tests {
                     0,
                     output_rows,
                     true,
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        let expected: Vec<f32> = input
+            .chunks_exact(input_width)
+            .flat_map(|row| cpu_q4_affine_matvec(row, &quantized, &scales, &biases, output_rows))
+            .collect();
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_simd_q4_matmul_short_batch_matches_cpu_reference() {
+        let batch_size = 3;
+        let input_width = 512;
+        let output_rows = 11;
+        let input: Vec<f32> = (0..batch_size * input_width)
+            .map(|index| ((index % 37) as f32 - 18.0) * 0.03125)
+            .collect();
+        let quantized: Vec<u8> = (0..output_rows * input_width)
+            .map(|index| ((index * 13 + 3) % 16) as u8)
+            .collect();
+        let scales = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.015625 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let expected: Vec<f32> = input
+            .chunks_exact(input_width)
+            .flat_map(|row| cpu_q4_affine_matvec(row, &quantized, &scales, &biases, output_rows))
+            .collect();
+        let runtime = MetalRuntime::new().unwrap();
+
+        let weights = runtime.buffer_from_slice(&pack_q4(&quantized)).unwrap();
+        let scales_buffer = runtime.buffer_from_slice(&scales).unwrap();
+        let biases_buffer = runtime.buffer_from_slice(&biases).unwrap();
+        let actual = runtime
+            .q4_affine_matmul_mapped_batch(
+                &input,
+                batch_size,
+                &[MappedQ4AffineJob::new(
+                    &weights,
+                    0,
+                    &scales_buffer,
+                    0,
+                    &biases_buffer,
+                    0,
+                    output_rows,
+                    true,
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        for (actual, expected) in actual.into_iter().zip(&expected) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "aligned actual {actual}, expected {expected}"
+            );
+        }
+
+        let packed = pack_q4(&quantized);
+        let mut weight_bytes = vec![0_u8];
+        let mut scale_bytes = vec![0_u8];
+        let mut bias_bytes = vec![0_u8];
+        for value in packed {
+            weight_bytes.extend(value.to_le_bytes());
+        }
+        for value in &scales {
+            scale_bytes.extend(value.to_le_bytes());
+        }
+        for value in &biases {
+            bias_bytes.extend(value.to_le_bytes());
+        }
+        let weight_buffer = runtime.buffer_from_slice(&weight_bytes).unwrap();
+        let scale_buffer = runtime.buffer_from_slice(&scale_bytes).unwrap();
+        let bias_buffer = runtime.buffer_from_slice(&bias_bytes).unwrap();
+        let actual = runtime
+            .q4_affine_matmul_mapped_batch(
+                &input,
+                batch_size,
+                &[MappedQ4AffineJob::new(
+                    &weight_buffer,
+                    1,
+                    &scale_buffer,
+                    1,
+                    &bias_buffer,
+                    1,
+                    output_rows,
+                    false,
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        for (actual, expected) in actual.into_iter().zip(&expected) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "unaligned actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn unaligned_batch_weight_vectors_match_cpu_reference() {
+        // 512 values make 64 packed words per row, which deliberately selects
+        // the batch-2/3 weight-vector kernels rather than the compact fallback.
+        let input_width = 512;
+        let output_rows = 13;
+        let quantized: Vec<u8> = (0..output_rows * input_width)
+            .map(|index| ((index * 17 + 5) % 16) as u8)
+            .collect();
+        let scales = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.046875 + (index % 5) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let biases = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.03125 + (index % 4) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let runtime = MetalRuntime::new().unwrap();
+        let weight_bytes = prefixed_u32_bytes(&pack_q4(&quantized));
+        let scale_bytes = prefixed_u16_bytes(&scales);
+        let bias_bytes = prefixed_u16_bytes(&biases);
+        let weight_buffer = runtime.buffer_from_slice(&weight_bytes).unwrap();
+        let scale_buffer = runtime.buffer_from_slice(&scale_bytes).unwrap();
+        let bias_buffer = runtime.buffer_from_slice(&bias_bytes).unwrap();
+        let job = MappedQ4AffineJob::new(
+            &weight_buffer,
+            1,
+            &scale_buffer,
+            1,
+            &bias_buffer,
+            1,
+            output_rows,
+            false,
+        );
+
+        for batch_size in [2_usize, 3] {
+            let input: Vec<f32> = (0..batch_size * input_width)
+                .map(|index| ((index % 47) as f32 - 23.0) * 0.0234375)
+                .collect();
+            let actual = runtime
+                .q4_affine_matmul_mapped_batch(&input, batch_size, &[job])
+                .unwrap()
+                .remove(0);
+            let expected: Vec<f32> = input
+                .chunks_exact(input_width)
+                .flat_map(|row| {
+                    cpu_q4_affine_matvec(row, &quantized, &scales, &biases, output_rows)
+                })
+                .collect();
+            assert_q4_outputs_close(
+                &actual,
+                &expected,
+                &format!("unaligned batch-{batch_size} weight vector"),
+            );
+        }
+    }
+
+    #[test]
+    fn unaligned_paired_batch_weight_vectors_match_cpu_reference() {
+        // Both projections and all of their affine parameters have byte
+        // prefixes. This covers the unaligned paired batch-2 and batch-3
+        // kernels used by target q/k and MLP gate/up verification.
+        let input_width = 512;
+        let output_rows_a = 11;
+        let output_rows_b = 7;
+        let quantized_a: Vec<u8> = (0..output_rows_a * input_width)
+            .map(|index| ((index * 7 + 3) % 16) as u8)
+            .collect();
+        let quantized_b: Vec<u8> = (0..output_rows_b * input_width)
+            .map(|index| ((index * 13 + 9) % 16) as u8)
+            .collect();
+        let scales_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.0234375 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let scales_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0390625 + (index % 4) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let biases_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.015625 + (index % 3) as f32 * 0.00390625))
+            .collect::<Vec<_>>();
+        let runtime = MetalRuntime::new().unwrap();
+        let weight_a_buffer = runtime
+            .buffer_from_slice(&prefixed_u32_bytes(&pack_q4(&quantized_a)))
+            .unwrap();
+        let scale_a_buffer = runtime
+            .buffer_from_slice(&prefixed_u16_bytes(&scales_a))
+            .unwrap();
+        let bias_a_buffer = runtime
+            .buffer_from_slice(&prefixed_u16_bytes(&biases_a))
+            .unwrap();
+        let weight_b_buffer = runtime
+            .buffer_from_slice(&prefixed_u32_bytes(&pack_q4(&quantized_b)))
+            .unwrap();
+        let scale_b_buffer = runtime
+            .buffer_from_slice(&prefixed_u16_bytes(&scales_b))
+            .unwrap();
+        let bias_b_buffer = runtime
+            .buffer_from_slice(&prefixed_u16_bytes(&biases_b))
+            .unwrap();
+        let job_a = MappedQ4AffineJob::new(
+            &weight_a_buffer,
+            1,
+            &scale_a_buffer,
+            1,
+            &bias_a_buffer,
+            1,
+            output_rows_a,
+            false,
+        );
+        let job_b = MappedQ4AffineJob::new(
+            &weight_b_buffer,
+            1,
+            &scale_b_buffer,
+            1,
+            &bias_b_buffer,
+            1,
+            output_rows_b,
+            false,
+        );
+
+        for batch_size in [2_usize, 3] {
+            let input: Vec<f32> = (0..batch_size * input_width)
+                .map(|index| ((index % 53) as f32 - 26.0) * 0.01953125)
+                .collect();
+            let (actual_a, actual_b) =
+                run_q4_pair_batch(&runtime, &input, input_width, &job_a, &job_b);
+            let expected_a: Vec<f32> = input
+                .chunks_exact(input_width)
+                .flat_map(|row| {
+                    cpu_q4_affine_matvec(row, &quantized_a, &scales_a, &biases_a, output_rows_a)
+                })
+                .collect();
+            let expected_b: Vec<f32> = input
+                .chunks_exact(input_width)
+                .flat_map(|row| {
+                    cpu_q4_affine_matvec(row, &quantized_b, &scales_b, &biases_b, output_rows_b)
+                })
+                .collect();
+            assert_q4_outputs_close(
+                &actual_a,
+                &expected_a,
+                &format!("unaligned paired batch-{batch_size} projection A"),
+            );
+            assert_q4_outputs_close(
+                &actual_b,
+                &expected_b,
+                &format!("unaligned paired batch-{batch_size} projection B"),
+            );
+        }
+    }
+
+    #[test]
+    fn batch_simd_q4_pair_short_batch_matches_cpu_reference() {
+        let batch_size = 3;
+        let input_width = 512;
+        let output_rows_a = 11;
+        let output_rows_b = 7;
+        let words_per_row = input_width / VALUES_PER_PACKED_WORD;
+        let input: Vec<f32> = (0..batch_size * input_width)
+            .map(|index| ((index % 41) as f32 - 20.0) * 0.0234375)
+            .collect();
+        let quantized_a: Vec<u8> = (0..output_rows_a * input_width)
+            .map(|index| ((index * 7 + 1) % 16) as u8)
+            .collect();
+        let quantized_b: Vec<u8> = (0..output_rows_b * input_width)
+            .map(|index| ((index * 11 + 5) % 16) as u8)
+            .collect();
+        let scales_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.03125 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let scales_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.046875 + (index % 4) as f32 * 0.01171875))
+            .collect::<Vec<_>>();
+        let biases_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.0234375 + (index % 3) as f32 * 0.00390625))
+            .collect::<Vec<_>>();
+        let expected_a: Vec<f32> = input
+            .chunks_exact(input_width)
+            .flat_map(|row| {
+                cpu_q4_affine_matvec(row, &quantized_a, &scales_a, &biases_a, output_rows_a)
+            })
+            .collect();
+        let expected_b: Vec<f32> = input
+            .chunks_exact(input_width)
+            .flat_map(|row| {
+                cpu_q4_affine_matvec(row, &quantized_b, &scales_b, &biases_b, output_rows_b)
+            })
+            .collect();
+        let runtime = MetalRuntime::new().unwrap();
+        let weights_a = runtime.buffer_from_slice(&pack_q4(&quantized_a)).unwrap();
+        let scales_a_buffer = runtime.buffer_from_slice(&scales_a).unwrap();
+        let biases_a_buffer = runtime.buffer_from_slice(&biases_a).unwrap();
+        let weights_b = runtime.buffer_from_slice(&pack_q4(&quantized_b)).unwrap();
+        let scales_b_buffer = runtime.buffer_from_slice(&scales_b).unwrap();
+        let biases_b_buffer = runtime.buffer_from_slice(&biases_b).unwrap();
+        let job_a = MappedQ4AffineJob::new(
+            &weights_a,
+            0,
+            &scales_a_buffer,
+            0,
+            &biases_a_buffer,
+            0,
+            output_rows_a,
+            true,
+        );
+        let job_b = MappedQ4AffineJob::new(
+            &weights_b,
+            0,
+            &scales_b_buffer,
+            0,
+            &biases_b_buffer,
+            0,
+            output_rows_b,
+            true,
+        );
+        let input_buffer = runtime.buffer_from_slice(&input).unwrap();
+        let output_a = runtime
+            .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * output_rows_a).unwrap())
+            .unwrap();
+        let output_b = runtime
+            .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * output_rows_b).unwrap())
+            .unwrap();
+        let command_buffer = runtime.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime
+            .encode_q4_affine_matmul_pair(
+                encoder,
+                &input_buffer,
+                &output_a,
+                &job_a,
+                &output_b,
+                &job_b,
+                u32::try_from(words_per_row).unwrap(),
+                u32::try_from(words_per_row).unwrap(),
+                batch_size,
+            )
+            .unwrap();
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_ne!(command_buffer.status(), MTLCommandBufferStatus::Error);
+        let actual_a = unsafe {
+            std::slice::from_raw_parts(
+                output_a.contents().cast::<f32>(),
+                batch_size * output_rows_a,
+            )
+            .to_vec()
+        };
+        let actual_b = unsafe {
+            std::slice::from_raw_parts(
+                output_b.contents().cast::<f32>(),
+                batch_size * output_rows_b,
+            )
+            .to_vec()
+        };
+        for (actual, expected) in actual_a.into_iter().zip(&expected_a) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "pair A actual {actual}, expected {expected}"
+            );
+        }
+        for (actual, expected) in actual_b.into_iter().zip(&expected_b) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "pair B actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_q4_pair_batch_matches_cpu_reference() {
+        let input_width = 128;
+        let output_rows_a = 37;
+        let output_rows_b = 29;
+        let words_per_row = input_width / VALUES_PER_PACKED_WORD;
+        let quantized_a: Vec<u8> = (0..output_rows_a * input_width)
+            .map(|index| ((index * 7 + 1) % 16) as u8)
+            .collect();
+        let quantized_b: Vec<u8> = (0..output_rows_b * input_width)
+            .map(|index| ((index * 11 + 5) % 16) as u8)
+            .collect();
+        let scales_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases_a = (0..output_rows_a * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.03125 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let scales_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.046875 + (index % 4) as f32 * 0.01171875))
+            .collect::<Vec<_>>();
+        let biases_b = (0..output_rows_b * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.0234375 + (index % 3) as f32 * 0.00390625))
+            .collect::<Vec<_>>();
+
+        let runtime = MetalRuntime::new().unwrap();
+        let weights_a = runtime.buffer_from_slice(&pack_q4(&quantized_a)).unwrap();
+        let scales_a_buffer = runtime.buffer_from_slice(&scales_a).unwrap();
+        let biases_a_buffer = runtime.buffer_from_slice(&biases_a).unwrap();
+        let weights_b = runtime.buffer_from_slice(&pack_q4(&quantized_b)).unwrap();
+        let scales_b_buffer = runtime.buffer_from_slice(&scales_b).unwrap();
+        let biases_b_buffer = runtime.buffer_from_slice(&biases_b).unwrap();
+        let job_a = MappedQ4AffineJob::new(
+            &weights_a,
+            0,
+            &scales_a_buffer,
+            0,
+            &biases_a_buffer,
+            0,
+            output_rows_a,
+            true,
+        );
+        let job_b = MappedQ4AffineJob::new(
+            &weights_b,
+            0,
+            &scales_b_buffer,
+            0,
+            &biases_b_buffer,
+            0,
+            output_rows_b,
+            true,
+        );
+
+        for batch_size in [2_usize, 3] {
+            let input: Vec<f32> = (0..batch_size * input_width)
+                .map(|index| ((index % 31) as f32 - 15.0) * 0.046875)
+                .collect();
+            let output_a = runtime
+                .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * output_rows_a).unwrap())
+                .unwrap();
+            let output_b = runtime
+                .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * output_rows_b).unwrap())
+                .unwrap();
+            let input_buffer = runtime.buffer_from_slice(&input).unwrap();
+            let command_buffer = runtime.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            runtime
+                .encode_q4_affine_matmul_pair(
+                    encoder,
+                    &input_buffer,
+                    &output_a,
+                    &job_a,
+                    &output_b,
+                    &job_b,
+                    u32::try_from(words_per_row).unwrap(),
+                    u32::try_from(words_per_row).unwrap(),
+                    batch_size,
+                )
+                .unwrap();
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_ne!(command_buffer.status(), MTLCommandBufferStatus::Error);
+
+            let actual_a = unsafe {
+                std::slice::from_raw_parts(
+                    output_a.contents().cast::<f32>(),
+                    batch_size * output_rows_a,
+                )
+                .to_vec()
+            };
+            let actual_b = unsafe {
+                std::slice::from_raw_parts(
+                    output_b.contents().cast::<f32>(),
+                    batch_size * output_rows_b,
+                )
+                .to_vec()
+            };
+            let expected_a: Vec<f32> = input
+                .chunks_exact(input_width)
+                .flat_map(|row| {
+                    cpu_q4_affine_matvec(row, &quantized_a, &scales_a, &biases_a, output_rows_a)
+                })
+                .collect();
+            let expected_b: Vec<f32> = input
+                .chunks_exact(input_width)
+                .flat_map(|row| {
+                    cpu_q4_affine_matvec(row, &quantized_b, &scales_b, &biases_b, output_rows_b)
+                })
+                .collect();
+            for (actual, expected) in actual_a.into_iter().zip(expected_a) {
+                assert!(
+                    (actual - expected).abs() < 0.001,
+                    "pair A batch {batch_size}: actual {actual}, expected {expected}"
+                );
+            }
+            for (actual, expected) in actual_b.into_iter().zip(expected_b) {
+                assert!(
+                    (actual - expected).abs() < 0.001,
+                    "pair B batch {batch_size}: actual {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_argmax_batch_matches_cpu_reference() {
+        let batch_size = 3;
+        let input_width = 128;
+        let output_rows = 37;
+        let input: Vec<f32> = (0..batch_size * input_width)
+            .map(|index| ((index % 29) as f32 - 14.0) * 0.046875)
+            .collect();
+        let quantized: Vec<u8> = (0..output_rows * input_width)
+            .map(|index| ((index * 13 + 7) % 16) as u8)
+            .collect();
+        let scales = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases = (0..output_rows * (input_width / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.0234375 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let runtime = MetalRuntime::new().unwrap();
+        let weights = runtime.buffer_from_slice(&pack_q4(&quantized)).unwrap();
+        let scales_buffer = runtime.buffer_from_slice(&scales).unwrap();
+        let biases_buffer = runtime.buffer_from_slice(&biases).unwrap();
+        let job = MappedQ4AffineJob::new(
+            &weights,
+            0,
+            &scales_buffer,
+            0,
+            &biases_buffer,
+            0,
+            output_rows,
+            true,
+        );
+        let actual = runtime
+            .q4_affine_argmax_mapped_batch(&input, batch_size, &job)
+            .unwrap();
+        let expected: Vec<u32> = input
+            .chunks_exact(input_width)
+            .map(|row| {
+                let values = cpu_q4_affine_matvec(row, &quantized, &scales, &biases, output_rows);
+                let mut best_index = 0;
+                for (index, value) in values.iter().enumerate().skip(1) {
+                    if *value > values[best_index] {
+                        best_index = index;
+                    }
+                }
+                best_index as u32
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn short_q4_matmul_unaligned_batch_matches_cpu_reference() {
+        let batch_size = 5;
+        let input_width = 128;
+        let output_rows = 5;
+        let input: Vec<f32> = (0..batch_size * input_width)
+            .map(|index| ((index % 29) as f32 - 14.0) * 0.046875)
+            .collect();
+        let quantized: Vec<u8> = (0..output_rows * input_width)
+            .map(|index| ((index * 11 + 3) % 16) as u8)
+            .collect();
+        let scales = vec![f32_to_bf16(0.09375); output_rows * 2];
+        let biases = vec![f32_to_bf16(-0.0234375); output_rows * 2];
+        let mut weight_bytes = vec![0_u8];
+        let mut scale_bytes = vec![0_u8];
+        let mut bias_bytes = vec![0_u8];
+        for value in pack_q4(&quantized) {
+            weight_bytes.extend(value.to_le_bytes());
+        }
+        for value in &scales {
+            scale_bytes.extend(value.to_le_bytes());
+        }
+        for value in &biases {
+            bias_bytes.extend(value.to_le_bytes());
+        }
+        let runtime = MetalRuntime::new().unwrap();
+        let weight_buffer = runtime.buffer_from_slice(&weight_bytes).unwrap();
+        let scale_buffer = runtime.buffer_from_slice(&scale_bytes).unwrap();
+        let bias_buffer = runtime.buffer_from_slice(&bias_bytes).unwrap();
+        let actual = runtime
+            .q4_affine_matmul_mapped_batch(
+                &input,
+                batch_size,
+                &[MappedQ4AffineJob::new(
+                    &weight_buffer,
+                    1,
+                    &scale_buffer,
+                    1,
+                    &bias_buffer,
+                    1,
+                    output_rows,
+                    false,
                 )],
             )
             .unwrap()
@@ -6365,6 +10770,301 @@ mod tests {
                 "actual {actual}, expected {expected}"
             );
         }
+
+        // Shadow prefill must produce the same block as an ordinary prefill,
+        // leave the source state untouched, and become the committed state by
+        // swapping buffers rather than copying their contents.
+        let mut active = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_prefill(
+                &weights,
+                &mut active,
+                &qkv[..12],
+                &z[..4],
+                &b[..2],
+                &a[..2],
+                2,
+                epsilon,
+            )
+            .unwrap();
+        let mut shadow = runtime.create_deltanet_state(&weights).unwrap();
+        let mut source_reference = runtime.clone_deltanet_state(&active).unwrap();
+        let shadow_output = runtime
+            .deltanet_prefill_from(
+                &weights,
+                &active,
+                &mut shadow,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                1,
+                epsilon,
+            )
+            .unwrap();
+        let mut ordinary = runtime.clone_deltanet_state(&active).unwrap();
+        let ordinary_output = runtime
+            .deltanet_prefill(
+                &weights,
+                &mut ordinary,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                1,
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in shadow_output.into_iter().zip(ordinary_output) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+        let source_output = runtime
+            .deltanet_step(
+                &weights,
+                &mut active,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                epsilon,
+            )
+            .unwrap();
+        let reference_output = runtime
+            .deltanet_step(
+                &weights,
+                &mut source_reference,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in source_output.into_iter().zip(reference_output) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+        let mut committed = runtime.create_deltanet_state(&weights).unwrap();
+        std::mem::swap(&mut committed, &mut shadow);
+        let committed_output = runtime
+            .deltanet_step(
+                &weights,
+                &mut committed,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                epsilon,
+            )
+            .unwrap();
+        let ordinary_output = runtime
+            .deltanet_step(
+                &weights,
+                &mut ordinary,
+                &next_qkv,
+                &next_z,
+                &next_b,
+                &next_a,
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in committed_output.into_iter().zip(ordinary_output) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+
+        // Every captured row must restore the same causal state as the
+        // corresponding number of ordinary single-token steps.
+        let mut snapshots = runtime.create_deltanet_snapshots(&weights, 2).unwrap();
+        let source = runtime.create_deltanet_state(&weights).unwrap();
+        let mut captured = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_prefill_from_with_snapshots(
+                &weights,
+                &source,
+                &mut captured,
+                &snapshots,
+                &qkv,
+                &z,
+                &b,
+                &a,
+                3,
+                epsilon,
+            )
+            .unwrap();
+
+        let mut expected_after_first = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_after_first,
+                &qkv[..6],
+                &z[..2],
+                &b[..1],
+                &a[..1],
+                epsilon,
+            )
+            .unwrap();
+        let mut restored_first = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .restore_deltanet_snapshot(&mut snapshots, 0, &mut restored_first)
+            .unwrap();
+        let expected_first_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_after_first,
+                &qkv[6..12],
+                &z[2..4],
+                &b[1..2],
+                &a[1..2],
+                epsilon,
+            )
+            .unwrap();
+        let restored_first_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut restored_first,
+                &qkv[6..12],
+                &z[2..4],
+                &b[1..2],
+                &a[1..2],
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in restored_first_next.into_iter().zip(expected_first_next) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+
+        let mut expected_after_second = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_after_second,
+                &qkv[..6],
+                &z[..2],
+                &b[..1],
+                &a[..1],
+                epsilon,
+            )
+            .unwrap();
+        runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_after_second,
+                &qkv[6..12],
+                &z[2..4],
+                &b[1..2],
+                &a[1..2],
+                epsilon,
+            )
+            .unwrap();
+        let mut restored_second = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .restore_deltanet_snapshot(&mut snapshots, 1, &mut restored_second)
+            .unwrap();
+        let expected_second_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_after_second,
+                &qkv[12..18],
+                &z[4..6],
+                &b[2..3],
+                &a[2..3],
+                epsilon,
+            )
+            .unwrap();
+        let restored_second_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut restored_second,
+                &qkv[12..18],
+                &z[4..6],
+                &b[2..3],
+                &a[2..3],
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in restored_second_next.into_iter().zip(expected_second_next) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
+
+        // The default MTP verifier has one intermediate row. Its snapshot is
+        // layout-compatible with a DeltaNet state, so restoring it swaps the
+        // buffers instead of copying the recurrent state through the CPU.
+        let mut single_row_snapshots = runtime.create_deltanet_snapshots(&weights, 1).unwrap();
+        let single_row_source = runtime.create_deltanet_state(&weights).unwrap();
+        let mut single_row_shadow = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_prefill_from_with_snapshots(
+                &weights,
+                &single_row_source,
+                &mut single_row_shadow,
+                &single_row_snapshots,
+                &qkv[..12],
+                &z[..4],
+                &b[..2],
+                &a[..2],
+                2,
+                epsilon,
+            )
+            .unwrap();
+        let mut expected_single_row = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_single_row,
+                &qkv[..6],
+                &z[..2],
+                &b[..1],
+                &a[..1],
+                epsilon,
+            )
+            .unwrap();
+        let mut swapped_single_row = runtime.create_deltanet_state(&weights).unwrap();
+        runtime
+            .restore_deltanet_snapshot(&mut single_row_snapshots, 0, &mut swapped_single_row)
+            .unwrap();
+        let expected_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut expected_single_row,
+                &qkv[6..12],
+                &z[2..4],
+                &b[1..2],
+                &a[1..2],
+                epsilon,
+            )
+            .unwrap();
+        let swapped_next = runtime
+            .deltanet_step(
+                &weights,
+                &mut swapped_single_row,
+                &qkv[6..12],
+                &z[2..4],
+                &b[1..2],
+                &a[1..2],
+                epsilon,
+            )
+            .unwrap();
+        for (actual, expected) in swapped_next.into_iter().zip(expected_next) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "actual {actual}, expected {expected}"
+            );
+        }
     }
 
     #[test]
@@ -6464,6 +11164,129 @@ mod tests {
     }
 
     #[test]
+    fn q8_gqa_prefill_matches_steps_when_kv_capacity_grows() {
+        let runtime = MetalRuntime::new().unwrap();
+        let mut step_state = runtime.create_q8_kv_state(1, 2).unwrap();
+        let mut prefill_state = runtime.create_q8_kv_state(1, 2).unwrap();
+        let row = |token: usize| {
+            let t = token as f32;
+            (
+                [
+                    0.15 + t * 0.01,
+                    -0.4 + t * 0.02,
+                    0.2 - t * 0.01,
+                    0.3 + t * 0.015,
+                ],
+                [0.05 - t * 0.01, -0.1 + t * 0.005, 0.02 + t * 0.01, -0.03],
+                [0.5 + t * 0.01, -0.7 + t * 0.005],
+                [0.8 - t * 0.02, -0.2 + t * 0.01],
+            )
+        };
+
+        for token in 0..16 {
+            let (query, gate, key, value) = row(token);
+            runtime
+                .gqa_attention_q8(&mut step_state, &query, &gate, &key, &value, 2)
+                .unwrap();
+        }
+
+        let mut queries = Vec::with_capacity(16 * 4);
+        let mut gates = Vec::with_capacity(16 * 4);
+        let mut keys = Vec::with_capacity(16 * 2);
+        let mut values = Vec::with_capacity(16 * 2);
+        for token in 0..16 {
+            let (query, gate, key, value) = row(token);
+            queries.extend(query);
+            gates.extend(gate);
+            keys.extend(key);
+            values.extend(value);
+        }
+        runtime
+            .gqa_attention_q8_prefill(&mut prefill_state, &queries, &gates, &keys, &values, 2, 16)
+            .unwrap();
+        assert_eq!(step_state.sequence_length, 16);
+        assert_eq!(prefill_state.sequence_length, 16);
+        let read_bytes = |buffer: &metal::Buffer, length: usize| unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>(), length).to_vec()
+        };
+        assert_eq!(
+            read_bytes(&step_state.keys, 16 * 2),
+            read_bytes(&prefill_state.keys, 16 * 2)
+        );
+        assert_eq!(
+            read_bytes(&step_state.values, 16 * 2),
+            read_bytes(&prefill_state.values, 16 * 2)
+        );
+        assert_eq!(
+            read_bytes(&step_state.key_scales, 16 * std::mem::size_of::<f32>()),
+            read_bytes(&prefill_state.key_scales, 16 * std::mem::size_of::<f32>())
+        );
+        assert_eq!(
+            read_bytes(&step_state.value_scales, 16 * std::mem::size_of::<f32>()),
+            read_bytes(&prefill_state.value_scales, 16 * std::mem::size_of::<f32>())
+        );
+        runtime.reserve_q8_kv_tokens(&mut step_state, 3).unwrap();
+        runtime.reserve_q8_kv_tokens(&mut prefill_state, 3).unwrap();
+        assert_eq!(
+            read_bytes(&step_state.keys, 16 * 2),
+            read_bytes(&prefill_state.keys, 16 * 2)
+        );
+
+        let mut expected = Vec::new();
+        let mut next_queries = Vec::with_capacity(3 * 4);
+        let mut next_gates = Vec::with_capacity(3 * 4);
+        let mut next_keys = Vec::with_capacity(3 * 2);
+        let mut next_values = Vec::with_capacity(3 * 2);
+        for token in 16..19 {
+            let (query, gate, key, value) = row(token);
+            expected.extend(
+                runtime
+                    .gqa_attention_q8(&mut step_state, &query, &gate, &key, &value, 2)
+                    .unwrap(),
+            );
+            next_queries.extend(query);
+            next_gates.extend(gate);
+            next_keys.extend(key);
+            next_values.extend(value);
+        }
+        let actual = runtime
+            .gqa_attention_q8_prefill(
+                &mut prefill_state,
+                &next_queries,
+                &next_gates,
+                &next_keys,
+                &next_values,
+                2,
+                3,
+            )
+            .unwrap();
+        assert_eq!(step_state.sequence_length, 19);
+        assert_eq!(prefill_state.sequence_length, 19);
+        assert_eq!(
+            read_bytes(&step_state.keys, 19 * 2),
+            read_bytes(&prefill_state.keys, 19 * 2)
+        );
+        assert_eq!(
+            read_bytes(&step_state.values, 19 * 2),
+            read_bytes(&prefill_state.values, 19 * 2)
+        );
+        assert_eq!(
+            read_bytes(&step_state.key_scales, 19 * std::mem::size_of::<f32>()),
+            read_bytes(&prefill_state.key_scales, 19 * std::mem::size_of::<f32>())
+        );
+        assert_eq!(
+            read_bytes(&step_state.value_scales, 19 * std::mem::size_of::<f32>()),
+            read_bytes(&prefill_state.value_scales, 19 * std::mem::size_of::<f32>())
+        );
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn q4_affine_matvec_rejects_incomplete_group() {
         let error = MatvecShape::validate(&[0.0; 63], &[], &[], &[], 1).unwrap_err();
         assert!(matches!(error, MetalRuntimeError::InputNotGrouped { .. }));
@@ -6537,6 +11360,87 @@ mod tests {
                 "actual {actual}, expected {expected}"
             );
         }
+    }
+
+    fn run_q4_pair_batch(
+        runtime: &MetalRuntime,
+        input: &[f32],
+        input_width: usize,
+        job_a: &MappedQ4AffineJob<'_>,
+        job_b: &MappedQ4AffineJob<'_>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        assert_eq!(input.len() % input_width, 0);
+        let batch_size = input.len() / input_width;
+        let input_buffer = runtime.buffer_from_slice(input).unwrap();
+        let output_a = runtime
+            .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * job_a.output_rows).unwrap())
+            .unwrap();
+        let output_b = runtime
+            .zeroed_shared_buffer(checked_byte_len::<f32>(batch_size * job_b.output_rows).unwrap())
+            .unwrap();
+        let words_per_row = u32::try_from(input_width / VALUES_PER_PACKED_WORD).unwrap();
+        let command_buffer = runtime.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        runtime
+            .encode_q4_affine_matmul_pair(
+                encoder,
+                &input_buffer,
+                &output_a,
+                job_a,
+                &output_b,
+                job_b,
+                words_per_row,
+                words_per_row,
+                batch_size,
+            )
+            .unwrap();
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_ne!(command_buffer.status(), MTLCommandBufferStatus::Error);
+        let output_a = unsafe {
+            std::slice::from_raw_parts(
+                output_a.contents().cast::<f32>(),
+                batch_size * job_a.output_rows,
+            )
+            .to_vec()
+        };
+        let output_b = unsafe {
+            std::slice::from_raw_parts(
+                output_b.contents().cast::<f32>(),
+                batch_size * job_b.output_rows,
+            )
+            .to_vec()
+        };
+        (output_a, output_b)
+    }
+
+    fn assert_q4_outputs_close(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} output length");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "{label} element {index}: actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    fn prefixed_u32_bytes(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(1 + std::mem::size_of_val(values));
+        bytes.push(0);
+        for value in values {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn prefixed_u16_bytes(values: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(1 + std::mem::size_of_val(values));
+        bytes.push(0);
+        for value in values {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
     }
 
     fn pack_q4(values: &[u8]) -> Vec<u32> {

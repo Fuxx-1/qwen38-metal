@@ -4,20 +4,22 @@ use crate::api::{
     ToolChoice,
 };
 use crate::metal_runtime::{
-    DeltaNetConfig, MappedQ4AffineJob, MappedWeightBuffers, MetalDecodeFullLayer, MetalDecodeLayer,
-    MetalDecodeLinearLayer, MetalDecodeState, MetalDeltaNetState, MetalDeltaNetWeights,
-    MetalF32Buffer, MetalGqaDecodeConfig, MetalRuntime, MetalRuntimeError, Q8KvState,
+    DeltaNetConfig, MappedQ4AffineJob, MappedWeightBuffers, MetalBatchDecodeLayer,
+    MetalBatchDecodeState, MetalDecodeFullLayer, MetalDecodeLayer, MetalDecodeLinearLayer,
+    MetalDecodeState, MetalDeltaNetSnapshots, MetalDeltaNetState, MetalDeltaNetWeights,
+    MetalF32Buffer, MetalGqaDecodeConfig, MetalMtpMlpF16, MetalMtpVerifyResult, MetalRuntime,
+    MetalRuntimeError, Q8KvState,
 };
 use crate::model::{open_mlx_safetensors_dir, MlxTensor, MlxWeightStore};
-use crate::mtp::SpeculativeDecodeSupport;
-use crate::preflight::inspect_model_dir;
+use crate::mtp::{accepted_token_count, MtpController, SpeculativeDecodeSupport};
+use crate::preflight::{inspect_model_dir, MtpSupport};
 use image::imageops::FilterType;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -29,6 +31,7 @@ const END_OF_MESSAGE_TOKEN_ID: u32 = 248_046;
 const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 2;
 const DEFAULT_PREFIX_CACHE_TOKENS: usize = 65_536;
 const DEFAULT_PREFIX_CACHE_MIN_TOKENS: usize = 64;
+const DEFAULT_MTP_DRAFT_TOKENS: usize = 1;
 // Keeps MPS matrix work large enough to amortize Q4 expansion without
 // materializing an entire long prompt's MLP intermediates at once.
 const PREFILL_CHUNK_TOKENS: usize = 8_192;
@@ -104,6 +107,8 @@ struct TextRuntimeConfig {
     layer_types: Vec<String>,
     #[serde(default)]
     full_attention_interval: usize,
+    #[serde(default)]
+    mtp_num_hidden_layers: usize,
     #[serde(default)]
     eos_token_id: Option<u32>,
     #[serde(default)]
@@ -263,6 +268,26 @@ impl NativeWeights {
         let jobs = self.mapped_q4_jobs(matrices, input.len() / batch_size)?;
         runtime
             .q4_affine_matmul_mapped_batch(input, batch_size, &jobs)
+            .map_err(NativeError::Metal)
+    }
+
+    /// Computes greedy tokens for a batched Q4 projection without copying
+    /// the full output matrix back from Metal.
+    fn q4_affine_argmax_batch(
+        &self,
+        runtime: &MetalRuntime,
+        matrix: &Q4AffineMatrix,
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<Vec<u32>, NativeError> {
+        if batch_size == 0 || input.is_empty() || input.len() % batch_size != 0 {
+            return Err(NativeError::InvalidConfig(
+                "a Q4 argmax batch needs non-empty, evenly sized rows".to_owned(),
+            ));
+        }
+        let jobs = self.mapped_q4_jobs(&[matrix], input.len() / batch_size)?;
+        runtime
+            .q4_affine_argmax_mapped_batch(input, batch_size, &jobs[0])
             .map_err(NativeError::Metal)
     }
 
@@ -529,6 +554,12 @@ pub struct NativeEngine {
     vision_tokens: Option<VisionTokenIds>,
     eos_token_ids: Vec<u32>,
     speculative: SpeculativeDecodeSupport,
+    mtp_adapter: Option<MtpAdapter>,
+    /// Maximum number of tokens proposed in one MTP round. The default keeps
+    /// M4 Pro verification in the more efficient two-row shape; an explicit
+    /// environment override is available for device-specific experiments.
+    mtp_max_draft_tokens: usize,
+    mtp_controller: Mutex<MtpController>,
     prefix_cache: Mutex<PrefixCache<Arc<RuntimeState>>>,
 }
 
@@ -541,6 +572,15 @@ struct VisionTokenIds {
 
 impl NativeEngine {
     pub fn open(path: impl AsRef<Path>, model_id: impl Into<String>) -> Result<Self, NativeError> {
+        let adapter_path = std::env::var_os("QWEN38_MTP_ADAPTER").map(PathBuf::from);
+        Self::open_with_mtp(path, model_id, adapter_path.as_deref())
+    }
+
+    pub fn open_with_mtp(
+        path: impl AsRef<Path>,
+        model_id: impl Into<String>,
+        mtp_adapter_path: Option<&Path>,
+    ) -> Result<Self, NativeError> {
         let path = path.as_ref();
         let model_id = model_id.into();
         let config_bytes =
@@ -594,7 +634,28 @@ impl NativeEngine {
             .map_err(|_| NativeError::DimensionOverflow("max_position_embeddings".to_owned()))?;
         let eos_token_ids = load_eos_token_ids(path, text_config.eos_token_id())?;
         let inspection = inspect_model_dir(path).map_err(NativeError::Preflight)?;
-        let speculative = SpeculativeDecodeSupport::from_mtp_support(&inspection.mtp_support);
+        let mtp_adapter = mtp_adapter_path
+            .map(|adapter_path| MtpAdapter::load(adapter_path, &text_config, &runtime))
+            .transpose()?;
+        let speculative = match &mtp_adapter {
+            Some(adapter) => SpeculativeDecodeSupport::from_loaded_adapter(
+                &inspection.mtp_support,
+                &adapter.support,
+                adapter.block_size as u8,
+            ),
+            None => SpeculativeDecodeSupport::from_mtp_support(&inspection.mtp_support),
+        };
+        let advertised_draft_tokens = usize::from(speculative.proposal_depth()).max(1);
+        let max_draft_tokens = if speculative.is_available() && mtp_adapter.is_some() {
+            configured_mtp_draft_limit(advertised_draft_tokens)?
+        } else {
+            advertised_draft_tokens
+        };
+        let max_draft_tokens_u8 = u8::try_from(max_draft_tokens).map_err(|_| {
+            NativeError::InvalidConfig("MTP draft depth exceeds u8 range".to_owned())
+        })?;
+        let mtp_controller = MtpController::new(1, max_draft_tokens_u8, max_draft_tokens_u8)
+            .map_err(|error| NativeError::InvalidConfig(error.to_string()))?;
 
         Ok(Self {
             descriptor: ModelDescriptor {
@@ -610,6 +671,9 @@ impl NativeEngine {
             vision_tokens,
             eos_token_ids,
             speculative,
+            mtp_adapter,
+            mtp_max_draft_tokens: max_draft_tokens,
+            mtp_controller: Mutex::new(mtp_controller),
             prefix_cache: Mutex::new(PrefixCache::from_env()),
         })
     }
@@ -913,48 +977,72 @@ impl NativeEngine {
                 "visual features exceed image placeholders in the tokenized prompt".to_owned(),
             ));
         }
+        let use_mtp = self.speculative.is_available()
+            && self.mtp_adapter.is_some()
+            && mtp_request_is_eligible(&request, images.is_empty());
         // Image embeddings are request-local inputs and are intentionally not
-        // part of the token-only cache key. Text prompts can reuse the full
-        // recurrent/KV state; multimodal prompts always take the normal path.
-        let cacheable = images.is_empty();
-        let prefix_hit = if cacheable {
-            self.lookup_prefix(&prompt_ids)?
+        // part of the token-only cache key. MTP also bypasses this cache until
+        // the adapter KV state is stored alongside the target state.
+        let cacheable = images.is_empty() && !use_mtp;
+        let (mut state, mut hidden, mtp_prompt_hidden) = if use_mtp {
+            let mut state = RuntimeState::new(&self.model, &self.runtime)?;
+            let hidden_rows = self.model.prefill_all(
+                &self.runtime,
+                &self.weights,
+                &mut state,
+                &prompt_ids,
+                &positions,
+                &embedding_overrides,
+            )?;
+            let final_offset = hidden_rows
+                .len()
+                .checked_sub(self.model.config.hidden_size)
+                .ok_or_else(|| {
+                    NativeError::DimensionOverflow("MTP prompt hidden activation".to_owned())
+                })?;
+            let hidden = hidden_rows[final_offset..].to_vec();
+            (state, hidden, Some(hidden_rows))
         } else {
-            None
-        };
-        let (mut state, mut hidden) = match prefix_hit {
-            Some(hit) if hit.token_count == prompt_ids.len() => (hit.state, hit.hidden),
-            Some(hit) => {
-                let token_count = hit.token_count;
-                let mut state = hit.state;
-                let hidden = self.model.prefill(
-                    &self.runtime,
-                    &self.weights,
-                    &mut state,
-                    &prompt_ids[token_count..],
-                    &positions[token_count..],
-                    &embedding_overrides[token_count..],
-                )?;
-                if cacheable {
-                    self.store_prefix(&prompt_ids, &hidden, &state)?;
+            let prefix_hit = if cacheable {
+                self.lookup_prefix(&prompt_ids)?
+            } else {
+                None
+            };
+            let (state, hidden) = match prefix_hit {
+                Some(hit) if hit.token_count == prompt_ids.len() => (hit.state, hit.hidden),
+                Some(hit) => {
+                    let token_count = hit.token_count;
+                    let mut state = hit.state;
+                    let hidden = self.model.prefill(
+                        &self.runtime,
+                        &self.weights,
+                        &mut state,
+                        &prompt_ids[token_count..],
+                        &positions[token_count..],
+                        &embedding_overrides[token_count..],
+                    )?;
+                    if cacheable {
+                        self.store_prefix(&prompt_ids, &hidden, &state)?;
+                    }
+                    (state, hidden)
                 }
-                (state, hidden)
-            }
-            None => {
-                let mut state = RuntimeState::new(&self.model, &self.runtime)?;
-                let hidden = self.model.prefill(
-                    &self.runtime,
-                    &self.weights,
-                    &mut state,
-                    &prompt_ids,
-                    &positions,
-                    &embedding_overrides,
-                )?;
-                if cacheable {
-                    self.store_prefix(&prompt_ids, &hidden, &state)?;
+                None => {
+                    let mut state = RuntimeState::new(&self.model, &self.runtime)?;
+                    let hidden = self.model.prefill(
+                        &self.runtime,
+                        &self.weights,
+                        &mut state,
+                        &prompt_ids,
+                        &positions,
+                        &embedding_overrides,
+                    )?;
+                    if cacheable {
+                        self.store_prefix(&prompt_ids, &hidden, &state)?;
+                    }
+                    (state, hidden)
                 }
-                (state, hidden)
-            }
+            };
+            (state, hidden, None)
         };
 
         let mut generated_ids = Vec::new();
@@ -967,6 +1055,20 @@ impl NativeEngine {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        if let Some(prompt_hidden_rows) = mtp_prompt_hidden {
+            return self.generate_mtp(
+                request,
+                input_tokens,
+                state,
+                hidden,
+                next_logits,
+                next_position,
+                prompt_ids,
+                positions,
+                prompt_hidden_rows,
+                on_event,
+            );
+        }
         for step in 0..request.max_tokens {
             let token_id = sample_token(
                 &next_logits,
@@ -1037,6 +1139,513 @@ impl NativeEngine {
             finish_reason,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_mtp(
+        &self,
+        request: GenerationRequest,
+        input_tokens: u32,
+        mut state: RuntimeState,
+        prompt_hidden: Vec<f32>,
+        next_logits: Vec<f32>,
+        mut next_position: u32,
+        prompt_ids: Vec<u32>,
+        prompt_positions: Vec<MropePosition>,
+        prompt_hidden_rows: Vec<f32>,
+        mut on_event: Option<&mut dyn FnMut(GenerationEvent) -> Result<(), NativeError>>,
+    ) -> Result<Generation, NativeError> {
+        let adapter = self
+            .mtp_adapter
+            .as_ref()
+            .ok_or_else(|| NativeError::Unavailable("MTP adapter is not loaded".to_owned()))?;
+        let mut bonus = argmax(&next_logits);
+        let mut adapter_state = adapter.new_request_state(&self.runtime, next_position)?;
+        adapter.prefill_prompt(
+            &self.runtime,
+            &self.weights,
+            &self.model,
+            &mut adapter_state,
+            &prompt_ids,
+            &prompt_positions,
+            &prompt_hidden_rows,
+            bonus,
+        )?;
+        // NativeModel::prefill returns the trunk hidden before model.norm.
+        // Qwen's MTP head applies its own pre_fc_norm_hidden to this value;
+        // applying the target final norm here would normalize it twice.
+        let mut target_hidden = prompt_hidden;
+        let mut generated_ids = Vec::new();
+        let mut streamed_text = String::new();
+        let mut finish_reason = FinishReason::Length;
+        let max_tokens = usize::try_from(request.max_tokens)
+            .map_err(|_| NativeError::DimensionOverflow("MTP output token count".to_owned()))?;
+        let profile = std::env::var_os("QWEN38_PROFILE").is_some();
+        let trace = std::env::var_os("QWEN38_MTP_TRACE").is_some();
+        let mtp_started = profile.then(Instant::now);
+        let mut rounds = 0_usize;
+        let mut drafted_tokens = 0_usize;
+        let mut accepted_tokens = 0_usize;
+        let mut round_elapsed = Duration::ZERO;
+        let mut draft_elapsed = Duration::ZERO;
+        let mut verify_elapsed = Duration::ZERO;
+        let mut commit_elapsed = Duration::ZERO;
+
+        if !self.emit_mtp_token(
+            bonus,
+            &request,
+            &mut generated_ids,
+            &mut streamed_text,
+            &mut finish_reason,
+            &mut on_event,
+        )? {
+            log_mtp_profile(
+                mtp_started,
+                rounds,
+                drafted_tokens,
+                accepted_tokens,
+                round_elapsed,
+                draft_elapsed,
+                verify_elapsed,
+                commit_elapsed,
+                generated_ids.len(),
+            );
+            return self.finish_generation(request, input_tokens, generated_ids, finish_reason);
+        }
+
+        while generated_ids.len() < max_tokens {
+            let remaining = max_tokens - generated_ids.len();
+            if remaining <= 1 {
+                if remaining == 1 {
+                    // The speculative round needs one target bonus token to
+                    // verify a draft. Finish a one-token tail with the normal
+                    // target path instead of silently returning short output.
+                    let hidden = self.model.forward_token(
+                        &self.runtime,
+                        &self.weights,
+                        &mut state,
+                        bonus,
+                        MropePosition::text(next_position),
+                    )?;
+                    let logits = self.model.logits(&self.runtime, &self.weights, &hidden)?;
+                    let token_id = argmax(&logits);
+                    if self.emit_mtp_token(
+                        token_id,
+                        &request,
+                        &mut generated_ids,
+                        &mut streamed_text,
+                        &mut finish_reason,
+                        &mut on_event,
+                    )? && generated_ids.len() == max_tokens
+                    {
+                        finish_reason = FinishReason::Length;
+                    }
+                }
+                break;
+            }
+            let controller_depth = self
+                .mtp_controller
+                .lock()
+                .map_err(|_| NativeError::MtpControllerPoisoned)?
+                .recommended_depth() as usize;
+            let draft_count = controller_depth
+                .min(self.mtp_max_draft_tokens)
+                .min(remaining.saturating_sub(1));
+            if draft_count == 0 {
+                break;
+            }
+
+            let round_started = profile.then(Instant::now);
+            let draft_started = profile.then(Instant::now);
+            let draft_tokens = adapter.draft_block(
+                &self.runtime,
+                &self.weights,
+                &self.model,
+                &mut adapter_state,
+                bonus,
+                &target_hidden,
+                draft_count,
+            )?;
+            if let Some(started) = draft_started {
+                draft_elapsed += started.elapsed();
+            }
+            drafted_tokens += draft_tokens.len();
+            let mut verify_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+            verify_tokens.push(bonus);
+            verify_tokens.extend_from_slice(&draft_tokens);
+            let mut verify_positions = Vec::with_capacity(verify_tokens.len());
+            for offset in 0..verify_tokens.len() {
+                verify_positions.push(MropePosition::text(
+                    next_position.saturating_add(offset as u32),
+                ));
+            }
+            let verify_overrides = vec![None; verify_tokens.len()];
+            let verify_started = profile.then(Instant::now);
+            state.begin_speculation(&self.model, &self.runtime)?;
+            if std::env::var_os("QWEN38_DISABLE_BATCH_VERIFY").is_none() {
+                if let Err(error) = state.prepare_speculation_snapshots(
+                    &self.model,
+                    &self.runtime,
+                    verify_tokens.len().saturating_sub(1),
+                ) {
+                    let _ = state.rollback_speculation(&self.model, &self.runtime);
+                    return Err(error);
+                }
+            }
+            enum VerificationResult {
+                Standard(Vec<f32>, Vec<u32>),
+                FusedSeed(MetalMtpVerifyResult),
+            }
+
+            // The one-draft production mode has no uncommitted adapter KV
+            // suffix: its proposal is the seed calculated in the preceding
+            // round. That makes the next seed safe to encode immediately
+            // after the target verifier chooses its accepted row.
+            let use_fused_seed = self.mtp_max_draft_tokens == DEFAULT_MTP_DRAFT_TOKENS
+                && draft_count == DEFAULT_MTP_DRAFT_TOKENS
+                && adapter_state.round_appended == 0
+                && std::env::var_os("QWEN38_DISABLE_BATCH_VERIFY").is_none()
+                && std::env::var_os("QWEN38_DISABLE_MTP_FUSED_SEED").is_none();
+            let verify_result = (|| {
+                if use_fused_seed {
+                    self.model
+                        .prefill_verify_mtp_seed_gpu(
+                            &self.runtime,
+                            &self.weights,
+                            &mut state,
+                            &verify_tokens,
+                            &verify_positions,
+                            adapter,
+                            &mut adapter_state,
+                            draft_tokens[0],
+                        )
+                        .map(VerificationResult::FusedSeed)
+                } else if std::env::var_os("QWEN38_DISABLE_BATCH_VERIFY").is_some() {
+                    let verify_hidden = self.model.prefill_all(
+                        &self.runtime,
+                        &self.weights,
+                        &mut state,
+                        &verify_tokens,
+                        &verify_positions,
+                        &verify_overrides,
+                    )?;
+                    let target_tokens = self.model.argmax_logits_rows(
+                        &self.runtime,
+                        &self.weights,
+                        &verify_hidden,
+                        verify_tokens.len(),
+                    )?;
+                    Ok::<_, NativeError>(VerificationResult::Standard(verify_hidden, target_tokens))
+                } else {
+                    self.model
+                        .prefill_verify_gpu(
+                            &self.runtime,
+                            &self.weights,
+                            &mut state,
+                            &verify_tokens,
+                            &verify_positions,
+                        )
+                        .map(|(hidden, tokens)| VerificationResult::Standard(hidden, tokens))
+                }
+            })();
+            let (verify_hidden, accepted, target_bonus, fused_seed, target_tokens) =
+                match verify_result {
+                    Ok(VerificationResult::FusedSeed(result)) => {
+                        (Vec::new(), result.accepted, result.target_bonus, true, None)
+                    }
+                    Ok(VerificationResult::Standard(hidden, tokens)) => {
+                        let accepted = accepted_token_count(&draft_tokens, &tokens, draft_count);
+                        let target_bonus = match tokens.get(accepted).copied() {
+                            Some(token) => token,
+                            None => {
+                                let _ = state.rollback_speculation(&self.model, &self.runtime);
+                                return Err(NativeError::VectorLengthMismatch {
+                                    actual: tokens.len(),
+                                    expected: draft_count + 1,
+                                });
+                            }
+                        };
+                        (hidden, accepted, target_bonus, false, Some(tokens))
+                    }
+                    Err(error) => {
+                        let _ = state.rollback_speculation(&self.model, &self.runtime);
+                        return Err(error);
+                    }
+                };
+            if let Some(started) = verify_started {
+                verify_elapsed += started.elapsed();
+            }
+            if trace {
+                if let Some(target_tokens) = target_tokens {
+                    eprintln!(
+                        "mtp round={} position={} bonus={} draft={:?} target={:?} accepted={} target_bonus={}",
+                        rounds,
+                        next_position,
+                        bonus,
+                        draft_tokens,
+                        target_tokens,
+                        accepted,
+                        target_bonus,
+                    );
+                } else {
+                    eprintln!(
+                        "mtp round={} position={} bonus={} draft={:?} accepted={} target_bonus={} fused_seed=true",
+                        rounds,
+                        next_position,
+                        bonus,
+                        draft_tokens,
+                        accepted,
+                        target_bonus,
+                    );
+                }
+            }
+
+            let commit_started = profile.then(Instant::now);
+            if accepted == draft_count {
+                // A fully accepted block already has the exact target state
+                // needed by the next round. Swap the shadow DeltaNet buffers
+                // into the request without copying recurrent state.
+                if let Err(error) = state.commit_speculation(&self.model) {
+                    let _ = state.rollback_speculation(&self.model, &self.runtime);
+                    return Err(error);
+                }
+            } else if std::env::var_os("QWEN38_DISABLE_BATCH_VERIFY").is_none()
+                && state.has_speculation_snapshots(&self.model)
+            {
+                // The verifier already produced a state image after every
+                // causal row. Restore the accepted row and retain exactly its
+                // KV suffix instead of re-executing the target prefix.
+                if let Err(error) =
+                    state.commit_speculation_prefix(&self.model, &self.runtime, accepted + 1)
+                {
+                    let _ = state.rollback_speculation(&self.model, &self.runtime);
+                    return Err(error);
+                }
+            } else {
+                // Full-attention KV bytes were appended in place, while the
+                // DeltaNet result lives only in shadow buffers. Discard the
+                // transaction before replaying the accepted target prefix.
+                state.rollback_speculation(&self.model, &self.runtime)?;
+                let mut committed_tokens = Vec::with_capacity(accepted + 1);
+                committed_tokens.push(bonus);
+                committed_tokens.extend_from_slice(&draft_tokens[..accepted]);
+                let committed_positions = (0..committed_tokens.len())
+                    .map(|offset| MropePosition::text(next_position.saturating_add(offset as u32)))
+                    .collect::<Vec<_>>();
+                for (token_id, position) in committed_tokens
+                    .iter()
+                    .copied()
+                    .zip(committed_positions.iter().copied())
+                {
+                    let _ = self.model.forward_token(
+                        &self.runtime,
+                        &self.weights,
+                        &mut state,
+                        token_id,
+                        position,
+                    )?;
+                }
+            }
+
+            next_position = next_position.saturating_add(accepted as u32 + 1);
+            if !fused_seed {
+                let hidden_offset = accepted
+                    .checked_mul(self.model.config.hidden_size)
+                    .ok_or_else(|| {
+                        NativeError::DimensionOverflow("MTP target hidden offset".to_owned())
+                    })?;
+                let hidden_end = hidden_offset
+                    .checked_add(self.model.config.hidden_size)
+                    .ok_or_else(|| {
+                        NativeError::DimensionOverflow("MTP target hidden end".to_owned())
+                    })?;
+                target_hidden = verify_hidden
+                    .get(hidden_offset..hidden_end)
+                    .ok_or_else(|| NativeError::VectorLengthMismatch {
+                        actual: verify_hidden.len(),
+                        expected: (accepted + 1) * self.model.config.hidden_size,
+                    })?
+                    .to_vec();
+            }
+
+            let mut stopped = false;
+            for token_id in draft_tokens
+                .iter()
+                .copied()
+                .take(accepted)
+                .chain(std::iter::once(target_bonus))
+            {
+                if !self.emit_mtp_token(
+                    token_id,
+                    &request,
+                    &mut generated_ids,
+                    &mut streamed_text,
+                    &mut finish_reason,
+                    &mut on_event,
+                )? || generated_ids.len() >= max_tokens
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                if let Some(started) = commit_started {
+                    commit_elapsed += started.elapsed();
+                }
+                rounds += 1;
+                accepted_tokens += accepted;
+                if let Some(started) = round_started {
+                    round_elapsed += started.elapsed();
+                }
+                break;
+            }
+
+            if !fused_seed {
+                adapter.accept_verified(
+                    &self.runtime,
+                    &self.weights,
+                    &self.model,
+                    &mut adapter_state,
+                    &draft_tokens,
+                    accepted,
+                    target_bonus,
+                    &verify_hidden,
+                )?;
+            }
+            if let Some(started) = commit_started {
+                commit_elapsed += started.elapsed();
+            }
+            self.mtp_controller
+                .lock()
+                .map_err(|_| NativeError::MtpControllerPoisoned)?
+                .observe(draft_count as u8, accepted as u8)
+                .map_err(|error| NativeError::InvalidConfig(error.to_string()))?;
+            bonus = target_bonus;
+            rounds += 1;
+            accepted_tokens += accepted;
+            if let Some(started) = round_started {
+                round_elapsed += started.elapsed();
+            }
+        }
+
+        if generated_ids.len() == max_tokens {
+            finish_reason = FinishReason::Length;
+        }
+        log_mtp_profile(
+            mtp_started,
+            rounds,
+            drafted_tokens,
+            accepted_tokens,
+            round_elapsed,
+            draft_elapsed,
+            verify_elapsed,
+            commit_elapsed,
+            generated_ids.len(),
+        );
+        self.finish_generation(request, input_tokens, generated_ids, finish_reason)
+    }
+
+    fn emit_mtp_token(
+        &self,
+        token_id: u32,
+        request: &GenerationRequest,
+        generated_ids: &mut Vec<u32>,
+        streamed_text: &mut String,
+        finish_reason: &mut FinishReason,
+        on_event: &mut Option<&mut dyn FnMut(GenerationEvent) -> Result<(), NativeError>>,
+    ) -> Result<bool, NativeError> {
+        if self.eos_token_ids.contains(&token_id) {
+            *finish_reason = FinishReason::Stop;
+            return Ok(false);
+        }
+        generated_ids.push(token_id);
+        if let Some(stop_index) =
+            token_sequence_stop_index(&self.tokenizer, generated_ids, &request.stop)?
+        {
+            generated_ids.truncate(stop_index);
+            *finish_reason = FinishReason::StopSequence;
+            return Ok(false);
+        }
+        if let Some(callback) = on_event.as_deref_mut() {
+            let decoded = self
+                .tokenizer
+                .decode(generated_ids, true)
+                .map_err(|error| NativeError::Tokenizer(error.to_string()))?;
+            if let Some(delta) = decoded.strip_prefix(streamed_text.as_str()) {
+                if !delta.is_empty() {
+                    callback(GenerationEvent::RawToken(delta.to_owned()))?;
+                }
+            } else if !decoded.is_empty() {
+                callback(GenerationEvent::RawToken(decoded.clone()))?;
+            }
+            *streamed_text = decoded;
+        }
+        Ok(true)
+    }
+
+    fn finish_generation(
+        &self,
+        request: GenerationRequest,
+        input_tokens: u32,
+        generated_ids: Vec<u32>,
+        finish_reason: FinishReason,
+    ) -> Result<Generation, NativeError> {
+        let raw = self
+            .tokenizer
+            .decode(&generated_ids, true)
+            .map_err(|error| NativeError::Tokenizer(error.to_string()))?;
+        let output_tokens = u32::try_from(generated_ids.len())
+            .map_err(|_| NativeError::DimensionOverflow("output token count".to_owned()))?;
+        let parts = parse_model_output(&raw, request.thinking, &request.tools)
+            .map_err(|error| NativeError::Prompt(error.to_string()))?;
+        let finish_reason = if parts.tool_calls.is_empty() {
+            finish_reason
+        } else {
+            FinishReason::ToolCalls
+        };
+        Ok(Generation {
+            text: parts.text,
+            reasoning: parts.reasoning,
+            tool_calls: parts.tool_calls,
+            input_tokens,
+            output_tokens,
+            finish_reason,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_mtp_profile(
+    started: Option<Instant>,
+    rounds: usize,
+    drafted_tokens: usize,
+    accepted_tokens: usize,
+    round_elapsed: Duration,
+    draft_elapsed: Duration,
+    verify_elapsed: Duration,
+    commit_elapsed: Duration,
+    output_tokens: usize,
+) {
+    let Some(started) = started else {
+        return;
+    };
+    let elapsed = started.elapsed();
+    let acceptance = if drafted_tokens == 0 {
+        0.0
+    } else {
+        accepted_tokens as f64 / drafted_tokens as f64
+    };
+    let token_per_second = if elapsed.is_zero() {
+        0.0
+    } else {
+        output_tokens as f64 / elapsed.as_secs_f64()
+    };
+    eprintln!(
+        "mtp rounds={rounds} drafted={drafted_tokens} accepted={accepted_tokens} acceptance={acceptance:.3} round_ms={:.3} draft_ms={:.3} verify_ms={:.3} commit_ms={:.3} output_tokens={output_tokens} decode_tok_per_s={token_per_second:.3}",
+        round_elapsed.as_secs_f64() * 1_000.0,
+        draft_elapsed.as_secs_f64() * 1_000.0,
+        verify_elapsed.as_secs_f64() * 1_000.0,
+        commit_elapsed.as_secs_f64() * 1_000.0,
+    );
 }
 
 fn render_prompt_content(
@@ -1841,6 +2450,7 @@ struct NativeModel {
     embed_tokens: Q4AffineMatrix,
     lm_head: Q4AffineMatrix,
     model_norm: Vec<f32>,
+    model_norm_gpu: MetalF32Buffer,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1900,6 +2510,9 @@ impl NativeModel {
                 expected: config.hidden_size,
             });
         }
+        let model_norm_gpu = runtime
+            .create_f32_buffer(&model_norm)
+            .map_err(NativeError::Metal)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
@@ -2024,6 +2637,7 @@ impl NativeModel {
             embed_tokens,
             lm_head,
             model_norm,
+            model_norm_gpu,
         })
     }
 
@@ -2035,6 +2649,28 @@ impl NativeModel {
     ) -> Result<Vec<f32>, NativeError> {
         let normalized = rms_norm(hidden, &self.model_norm, self.config.rms_norm_eps)?;
         weights.q4_affine_matvec(runtime, &self.lm_head, &normalized)
+    }
+
+    fn argmax_logits_rows(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        hidden: &[f32],
+        batch_size: usize,
+    ) -> Result<Vec<u32>, NativeError> {
+        let expected_hidden = batch_size
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| {
+                NativeError::DimensionOverflow("argmax batch hidden elements".to_owned())
+            })?;
+        if batch_size == 0 || hidden.len() != expected_hidden {
+            return Err(NativeError::VectorLengthMismatch {
+                actual: hidden.len(),
+                expected: expected_hidden,
+            });
+        }
+        let normalized = rms_norm_rows(hidden, &self.model_norm, self.config.rms_norm_eps)?;
+        weights.q4_affine_argmax_batch(runtime, &self.lm_head, &normalized, batch_size)
     }
 
     fn forward_token(
@@ -2063,6 +2699,305 @@ impl NativeModel {
         token_ids: &[u32],
         positions: &[MropePosition],
         embedding_overrides: &[Option<&[f32]>],
+    ) -> Result<Vec<f32>, NativeError> {
+        self.prefill_internal(
+            runtime,
+            weights,
+            state,
+            token_ids,
+            positions,
+            embedding_overrides,
+            false,
+        )
+    }
+
+    /// Variant used by speculative verification. It preserves every causal
+    /// row's hidden state so the target logits for drafted tokens and the
+    /// bonus token can be sampled in one projection batch.
+    fn prefill_all(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        token_ids: &[u32],
+        positions: &[MropePosition],
+        embedding_overrides: &[Option<&[f32]>],
+    ) -> Result<Vec<f32>, NativeError> {
+        self.prefill_internal(
+            runtime,
+            weights,
+            state,
+            token_ids,
+            positions,
+            embedding_overrides,
+            true,
+        )
+    }
+
+    /// Verifies a short speculative block through the GPU-resident batch
+    /// graph. The caller must have opened a speculation transaction so linear
+    /// layers can write their shadow recurrent states and full-attention KV
+    /// caches can be rolled back on rejection.
+    fn prefill_verify_gpu(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        token_ids: &[u32],
+        positions: &[MropePosition],
+    ) -> Result<(Vec<f32>, Vec<u32>), NativeError> {
+        if token_ids.is_empty() || token_ids.len() != positions.len() {
+            return Err(NativeError::Prompt(
+                "MTP verify tokens and positions must have matching non-zero lengths".to_owned(),
+            ));
+        }
+        let batch_size = token_ids.len();
+        let mut hidden = Vec::with_capacity(
+            batch_size
+                .checked_mul(self.config.hidden_size)
+                .ok_or_else(|| NativeError::DimensionOverflow("MTP verify hidden".to_owned()))?,
+        );
+        for &token_id in token_ids {
+            if token_id as usize >= self.config.vocab_size {
+                return Err(NativeError::TokenOutOfRange(token_id));
+            }
+            hidden.extend_from_slice(&dequantized_row(
+                weights,
+                &self.embed_tokens,
+                token_id as usize,
+            )?);
+        }
+        let mut batch = match state.verify_batch.take() {
+            Some(batch) if batch.batch_size == batch_size => batch,
+            _ => runtime
+                .create_batch_decode_state(self.config.hidden_size, batch_size)
+                .map_err(NativeError::Metal)?,
+        };
+        runtime
+            .write_batch_decode_hidden(&mut batch, &hidden)
+            .map_err(NativeError::Metal)?;
+        let positions = positions
+            .iter()
+            .map(|position| position.0)
+            .collect::<Vec<_>>();
+        let workspace = state.speculation.as_ref().ok_or_else(|| {
+            NativeError::InvalidConfig("MTP verify graph requires active speculation".to_owned())
+        })?;
+        let rope = self.config.rope();
+        let lm_head_job = weights
+            .mapped_q4_jobs(&[&self.lm_head], self.config.hidden_size)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NativeError::InvalidConfig("MTP LM head mapping is empty".to_owned()))?;
+        let mut graph = Vec::with_capacity(self.layers.len());
+        let mut layer_states = state.layers.iter_mut();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_state = layer_states.next().ok_or_else(|| {
+                NativeError::InvalidConfig("MTP verify layer state is incomplete".to_owned())
+            })?;
+            match (layer, layer_state) {
+                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(active)) => {
+                    let shadow =
+                        workspace.shadow_linear[layer_index]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                NativeError::InvalidConfig(
+                                    "MTP verify DeltaNet shadow is missing".to_owned(),
+                                )
+                            })?;
+                    let descriptor = linear.gpu_decode_layer(weights, shadow)?;
+                    graph.push(MetalBatchDecodeLayer::Linear {
+                        layer: descriptor,
+                        source: &*active,
+                        destination: shadow,
+                        snapshots: workspace.snapshots[layer_index].as_ref(),
+                    });
+                }
+                (LayerWeights::Full(full), LayerRuntimeState::Full(kv_state)) => {
+                    let descriptor =
+                        full.gpu_decode_layer(weights, MropePosition(positions[0]), &rope)?;
+                    graph.push(MetalBatchDecodeLayer::Full(descriptor, kv_state));
+                }
+                _ => unreachable!("layer weights and runtime state are constructed together"),
+            }
+        }
+        let result = runtime
+            .decode_batch_layers_with_argmax(
+                &mut batch,
+                &mut graph,
+                &positions,
+                self.config.rms_norm_eps,
+                &self.model_norm_gpu,
+                &lm_head_job,
+            )
+            .map_err(NativeError::Metal);
+        state.verify_batch = Some(batch);
+        result
+    }
+
+    /// Fuses the default one-draft MTP round with its next adapter seed. The
+    /// target verifier still owns acceptance and output tokens; the adapter
+    /// only consumes the selected target row after its greedy result exists.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_verify_mtp_seed_gpu(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        token_ids: &[u32],
+        positions: &[MropePosition],
+        adapter: &MtpAdapter,
+        adapter_state: &mut MtpRequestState,
+        draft_token: u32,
+    ) -> Result<MetalMtpVerifyResult, NativeError> {
+        if token_ids.len() != 2 || positions.len() != token_ids.len() {
+            return Err(NativeError::Prompt(
+                "fused MTP verification requires exactly one draft token".to_owned(),
+            ));
+        }
+        if token_ids[1] != draft_token {
+            return Err(NativeError::InvalidConfig(
+                "fused MTP draft token does not match the verifier row".to_owned(),
+            ));
+        }
+        let mut hidden = Vec::with_capacity(
+            token_ids
+                .len()
+                .checked_mul(self.config.hidden_size)
+                .ok_or_else(|| {
+                    NativeError::DimensionOverflow("fused MTP verify hidden".to_owned())
+                })?,
+        );
+        for &token_id in token_ids {
+            if token_id as usize >= self.config.vocab_size {
+                return Err(NativeError::TokenOutOfRange(token_id));
+            }
+            hidden.extend_from_slice(&dequantized_row(
+                weights,
+                &self.embed_tokens,
+                token_id as usize,
+            )?);
+        }
+        let batch_size = token_ids.len();
+        let mut batch = match state.verify_batch.take() {
+            Some(batch) if batch.batch_size == batch_size => batch,
+            _ => runtime
+                .create_batch_decode_state(self.config.hidden_size, batch_size)
+                .map_err(NativeError::Metal)?,
+        };
+        runtime
+            .write_batch_decode_hidden(&mut batch, &hidden)
+            .map_err(NativeError::Metal)?;
+        let positions = positions
+            .iter()
+            .map(|position| position.0)
+            .collect::<Vec<_>>();
+        let workspace = state.speculation.as_ref().ok_or_else(|| {
+            NativeError::InvalidConfig("MTP verify graph requires active speculation".to_owned())
+        })?;
+        let rope = self.config.rope();
+        let lm_head_job = weights
+            .mapped_q4_jobs(&[&self.lm_head], self.config.hidden_size)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NativeError::InvalidConfig("MTP LM head mapping is empty".to_owned()))?;
+        let embedding_job = weights
+            .mapped_q4_jobs(&[&self.embed_tokens], self.config.hidden_size)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                NativeError::InvalidConfig("MTP embedding mapping is empty".to_owned())
+            })?;
+        let adapter_fc = adapter
+            .weights
+            .mapped_q4_jobs(&[&adapter.fc], self.config.hidden_size * 2)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                NativeError::InvalidConfig("MTP adapter FC mapping is empty".to_owned())
+            })?;
+        let adapter_rope = adapter.config.rope();
+        let adapter_layer = adapter.layer.gpu_decode_layer(
+            &adapter.weights,
+            MropePosition::text(adapter_state.next_position),
+            &adapter_rope,
+        )?;
+        let mut graph = Vec::with_capacity(self.layers.len());
+        let mut layer_states = state.layers.iter_mut();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_state = layer_states.next().ok_or_else(|| {
+                NativeError::InvalidConfig("MTP verify layer state is incomplete".to_owned())
+            })?;
+            match (layer, layer_state) {
+                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(active)) => {
+                    let shadow =
+                        workspace.shadow_linear[layer_index]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                NativeError::InvalidConfig(
+                                    "MTP verify DeltaNet shadow is missing".to_owned(),
+                                )
+                            })?;
+                    let descriptor = linear.gpu_decode_layer(weights, shadow)?;
+                    graph.push(MetalBatchDecodeLayer::Linear {
+                        layer: descriptor,
+                        source: &*active,
+                        destination: shadow,
+                        snapshots: workspace.snapshots[layer_index].as_ref(),
+                    });
+                }
+                (LayerWeights::Full(full), LayerRuntimeState::Full(kv_state)) => {
+                    let descriptor =
+                        full.gpu_decode_layer(weights, MropePosition(positions[0]), &rope)?;
+                    graph.push(MetalBatchDecodeLayer::Full(descriptor, kv_state));
+                }
+                _ => unreachable!("layer weights and runtime state are constructed together"),
+            }
+        }
+        let result = runtime
+            .decode_batch_layers_with_mtp_seed(
+                &mut batch,
+                &mut graph,
+                &positions,
+                self.config.rms_norm_eps,
+                &self.model_norm_gpu,
+                &lm_head_job,
+                &mut adapter_state.decode,
+                &embedding_job,
+                &adapter.pre_fc_norm_embedding_gpu,
+                &adapter.pre_fc_norm_hidden_gpu,
+                &adapter_fc,
+                &adapter_layer,
+                adapter.mtp_mlp_f16.as_ref(),
+                &mut adapter_state.kv,
+                &adapter.norm_gpu,
+                adapter.config.rms_norm_eps,
+                draft_token,
+            )
+            .map_err(NativeError::Metal);
+        state.verify_batch = Some(batch);
+        match result {
+            Ok(result) => {
+                adapter_state.next_position = adapter_state.next_position.saturating_add(1);
+                adapter_state.seed_token = Some(result.seed_token);
+                adapter_state.seed_hidden = None;
+                adapter_state.round_appended = 0;
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_internal(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        state: &mut RuntimeState,
+        token_ids: &[u32],
+        positions: &[MropePosition],
+        embedding_overrides: &[Option<&[f32]>],
+        return_all: bool,
     ) -> Result<Vec<f32>, NativeError> {
         if token_ids.is_empty()
             || token_ids.len() != positions.len()
@@ -2122,8 +3057,9 @@ impl NativeModel {
         let prefill_started = profile.then(Instant::now);
         let prefill_chunk_size = configured_prefill_chunk_tokens(batch_size)?;
         let rope = self.config.rope();
+        let (layer_states, speculation) = (&mut state.layers, &mut state.speculation);
         for (layer_index, (layer, layer_state)) in
-            self.layers.iter().zip(state.layers.iter_mut()).enumerate()
+            self.layers.iter().zip(layer_states.iter_mut()).enumerate()
         {
             let layer_started = profile.then(Instant::now);
             let mut norm_elapsed = Duration::ZERO;
@@ -2134,6 +3070,7 @@ impl NativeModel {
             let mut mlp_residual_elapsed = Duration::ZERO;
             let (gate_proj, up_proj, down_proj) = layer.mlp_projections();
             for chunk_start in (0..batch_size).step_by(prefill_chunk_size) {
+                let first_chunk = chunk_start == 0;
                 let chunk_end = (chunk_start + prefill_chunk_size).min(batch_size);
                 let chunk_tokens = chunk_end - chunk_start;
                 let hidden_start = chunk_start
@@ -2160,14 +3097,47 @@ impl NativeModel {
                 let mixed_started = profile.then(Instant::now);
                 let mixed = match (layer, &mut *layer_state) {
                     (LayerWeights::Linear(linear), LayerRuntimeState::Linear(layer_state)) => {
-                        linear.forward_prefill(
-                            runtime,
-                            weights,
-                            &normalized,
-                            chunk_tokens,
-                            layer_state,
-                            self.config.rms_norm_eps,
-                        )?
+                        if let Some(workspace) =
+                            speculation.as_mut().filter(|workspace| workspace.active)
+                        {
+                            let shadow =
+                                workspace.shadow_linear[layer_index]
+                                    .as_mut()
+                                    .ok_or_else(|| {
+                                        NativeError::InvalidConfig(
+                                            "missing DeltaNet speculation shadow".to_owned(),
+                                        )
+                                    })?;
+                            if first_chunk {
+                                linear.forward_prefill_from(
+                                    runtime,
+                                    weights,
+                                    &normalized,
+                                    chunk_tokens,
+                                    layer_state,
+                                    shadow,
+                                    self.config.rms_norm_eps,
+                                )?
+                            } else {
+                                linear.forward_prefill(
+                                    runtime,
+                                    weights,
+                                    &normalized,
+                                    chunk_tokens,
+                                    shadow,
+                                    self.config.rms_norm_eps,
+                                )?
+                            }
+                        } else {
+                            linear.forward_prefill(
+                                runtime,
+                                weights,
+                                &normalized,
+                                chunk_tokens,
+                                layer_state,
+                                self.config.rms_norm_eps,
+                            )?
+                        }
                     }
                     (LayerWeights::Full(full), LayerRuntimeState::Full(layer_state)) => full
                         .forward_prefill(
@@ -2235,6 +3205,9 @@ impl NativeModel {
                 prefill_started.elapsed().as_secs_f64() * 1_000.0,
                 batch_size as f64 / prefill_started.elapsed().as_secs_f64(),
             );
+        }
+        if return_all {
+            return Ok(hidden);
         }
         let final_offset = hidden
             .len()
@@ -2458,6 +3431,689 @@ impl NativeModel {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MtpAdapterFileConfig {
+    model_type: String,
+    block_size: usize,
+    text_config: TextRuntimeConfig,
+}
+
+/// The standalone Qwen3.5 MTP export contains a small one-layer drafter. It
+/// reuses the target model's embedding table and LM head; only `fc`, the
+/// adapter transformer layer, and its norms are owned here.
+struct MtpAdapter {
+    weights: NativeWeights,
+    support: MtpSupport,
+    block_size: usize,
+    config: TextRuntimeConfig,
+    fc: Q4AffineMatrix,
+    pre_fc_norm_embedding: Vec<f32>,
+    pre_fc_norm_hidden: Vec<f32>,
+    pre_fc_norm_embedding_gpu: MetalF32Buffer,
+    pre_fc_norm_hidden_gpu: MetalF32Buffer,
+    layer: FullLayerWeights,
+    norm: Vec<f32>,
+    norm_gpu: MetalF32Buffer,
+    mtp_mlp_f16: Option<MetalMtpMlpF16>,
+}
+
+struct MtpRequestState {
+    kv: Q8KvState,
+    decode: MetalDecodeState,
+    next_position: u32,
+    seed_token: Option<u32>,
+    seed_hidden: Option<Vec<f32>>,
+    round_appended: usize,
+}
+
+struct MtpForwardResult {
+    hidden: Vec<f32>,
+    logits: Option<Vec<f32>>,
+    token: Option<u32>,
+}
+
+impl MtpAdapter {
+    fn load(
+        path: &Path,
+        target_config: &TextRuntimeConfig,
+        runtime: &MetalRuntime,
+    ) -> Result<Self, NativeError> {
+        let config_path = path.join("config.json");
+        let config_bytes =
+            std::fs::read(&config_path).map_err(|source| NativeError::ConfigRead {
+                path: config_path,
+                source,
+            })?;
+        let file_config: MtpAdapterFileConfig =
+            serde_json::from_slice(&config_bytes).map_err(NativeError::ConfigJson)?;
+        if !file_config.model_type.eq_ignore_ascii_case("qwen3_5_mtp") {
+            return Err(NativeError::InvalidConfig(format!(
+                "MTP adapter model_type must be qwen3_5_mtp, got {:?}",
+                file_config.model_type
+            )));
+        }
+        if file_config.block_size < 2 || file_config.block_size > u8::MAX as usize {
+            return Err(NativeError::InvalidConfig(format!(
+                "MTP adapter block_size must be between 2 and {}, got {}",
+                u8::MAX,
+                file_config.block_size
+            )));
+        }
+        if file_config.text_config.mtp_num_hidden_layers != 1 {
+            return Err(NativeError::InvalidConfig(format!(
+                "native MTP currently supports one adapter layer, got {}",
+                file_config.text_config.mtp_num_hidden_layers
+            )));
+        }
+        validate_runtime_config(&file_config.text_config)?;
+        validate_mtp_pair(target_config, &file_config.text_config)?;
+
+        let weights = NativeWeights::open(path, runtime)?;
+        let inspection = inspect_model_dir(path).map_err(NativeError::Preflight)?;
+        if !matches!(inspection.mtp_support, MtpSupport::Available { .. }) {
+            return Err(NativeError::InvalidConfig(format!(
+                "MTP adapter weights are incomplete: {}",
+                inspection.mtp_support
+            )));
+        }
+
+        let config = file_config.text_config;
+        let hidden_size = config.hidden_size;
+        let fc = weights.q4_matrix("fc.weight")?;
+        let expected_fc_input = hidden_size
+            .checked_mul(2)
+            .ok_or_else(|| NativeError::DimensionOverflow("MTP fc input".to_owned()))?;
+        if fc.input_elements != expected_fc_input as u64 || fc.output_rows != hidden_size as u64 {
+            return Err(NativeError::InvalidConfig(format!(
+                "MTP fc shape is {}x{}, expected {}x{}",
+                fc.output_rows, fc.input_elements, hidden_size, expected_fc_input
+            )));
+        }
+        let pre_fc_norm_embedding =
+            load_vector(&weights, "pre_fc_norm_embedding.weight", hidden_size)?;
+        let pre_fc_norm_hidden = load_vector(&weights, "pre_fc_norm_hidden.weight", hidden_size)?;
+        let pre_fc_norm_embedding_gpu = runtime
+            .create_f32_buffer(&pre_fc_norm_embedding)
+            .map_err(NativeError::Metal)?;
+        let pre_fc_norm_hidden_gpu = runtime
+            .create_f32_buffer(&pre_fc_norm_hidden)
+            .map_err(NativeError::Metal)?;
+        let norm = load_vector(&weights, "norm.weight", hidden_size)?;
+        let norm_gpu = runtime
+            .create_f32_buffer(&norm)
+            .map_err(NativeError::Metal)?;
+
+        let prefix = "layers.0";
+        let input_norm = load_vector(
+            &weights,
+            &format!("{prefix}.input_layernorm.weight"),
+            hidden_size,
+        )?;
+        let post_attention_norm = load_vector(
+            &weights,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            hidden_size,
+        )?;
+        let common = CommonLayerWeights {
+            input_norm_gpu: runtime
+                .create_f32_buffer(&input_norm)
+                .map_err(NativeError::Metal)?,
+            post_attention_norm_gpu: runtime
+                .create_f32_buffer(&post_attention_norm)
+                .map_err(NativeError::Metal)?,
+            input_norm,
+            post_attention_norm,
+            gate_proj: weights.q4_matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
+            up_proj: weights.q4_matrix(&format!("{prefix}.mlp.up_proj.weight"))?,
+            down_proj: weights.q4_matrix(&format!("{prefix}.mlp.down_proj.weight"))?,
+        };
+        let q_norm = load_vector(
+            &weights,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            config.head_dim,
+        )?;
+        let k_norm = load_vector(
+            &weights,
+            &format!("{prefix}.self_attn.k_norm.weight"),
+            config.head_dim,
+        )?;
+        let layer = FullLayerWeights {
+            common,
+            q_proj: weights.q4_matrix(&format!("{prefix}.self_attn.q_proj.weight"))?,
+            k_proj: weights.q4_matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
+            v_proj: weights.q4_matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
+            o_proj: weights.q4_matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            q_norm_gpu: runtime
+                .create_f32_buffer(&q_norm)
+                .map_err(NativeError::Metal)?,
+            k_norm_gpu: runtime
+                .create_f32_buffer(&k_norm)
+                .map_err(NativeError::Metal)?,
+            q_norm,
+            k_norm,
+            num_attention_heads: config.num_attention_heads,
+            num_key_value_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+        };
+        let mtp_mlp_f16 = if std::env::var_os("QWEN38_ENABLE_MTP_FP16_MLP").is_some()
+            && std::env::var_os("QWEN38_DISABLE_MTP_FP16_MLP").is_none()
+            && runtime.mps_available()
+        {
+            let gate_up_jobs = weights.mapped_q4_jobs(
+                &[&layer.common.gate_proj, &layer.common.up_proj],
+                hidden_size,
+            )?;
+            let down_jobs = weights.mapped_q4_jobs(
+                &[&layer.common.down_proj],
+                layer.common.gate_proj.output_rows as usize,
+            )?;
+            match runtime.create_mtp_mlp_f16(
+                hidden_size,
+                &gate_up_jobs[0],
+                &gate_up_jobs[1],
+                &down_jobs[0],
+            ) {
+                Ok(mlp) => {
+                    eprintln!("MTP adapter MLP: persistent FP16 path enabled");
+                    Some(mlp)
+                }
+                Err(error) => {
+                    eprintln!("MTP adapter MLP: FP16 path unavailable, using Q4 ({error})");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            weights,
+            support: inspection.mtp_support,
+            block_size: file_config.block_size,
+            config,
+            fc,
+            pre_fc_norm_embedding,
+            pre_fc_norm_hidden,
+            pre_fc_norm_embedding_gpu,
+            pre_fc_norm_hidden_gpu,
+            layer,
+            norm,
+            norm_gpu,
+            mtp_mlp_f16,
+        })
+    }
+
+    fn new_request_state(
+        &self,
+        runtime: &MetalRuntime,
+        next_position: u32,
+    ) -> Result<MtpRequestState, NativeError> {
+        Ok(MtpRequestState {
+            kv: runtime
+                .create_q8_kv_state(self.layer.num_key_value_heads, self.layer.head_dim)
+                .map_err(NativeError::Metal)?,
+            decode: runtime
+                .create_decode_state(self.config.hidden_size)
+                .map_err(NativeError::Metal)?,
+            next_position,
+            seed_token: None,
+            seed_hidden: None,
+            round_appended: 0,
+        })
+    }
+
+    /// Replays the target prompt into the adapter's attention cache. MTP uses
+    /// the shifted pairs `(x[1], h[0]) .. (x[N-1], h[N-2])` and pairs the
+    /// target's first bonus token with the final prompt hidden `h[N-1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_prompt(
+        &self,
+        runtime: &MetalRuntime,
+        target_weights: &NativeWeights,
+        target_model: &NativeModel,
+        state: &mut MtpRequestState,
+        prompt_ids: &[u32],
+        _prompt_positions: &[MropePosition],
+        prompt_hidden_rows: &[f32],
+        bonus_token: u32,
+    ) -> Result<(), NativeError> {
+        if prompt_ids.is_empty() || prompt_ids.len() != _prompt_positions.len() {
+            return Err(NativeError::Prompt(
+                "MTP prompt tokens and positions must have matching non-zero lengths".to_owned(),
+            ));
+        }
+        let hidden_size = self.config.hidden_size;
+        let expected_hidden = prompt_ids
+            .len()
+            .checked_mul(hidden_size)
+            .ok_or_else(|| NativeError::DimensionOverflow("MTP prompt hidden rows".to_owned()))?;
+        if prompt_hidden_rows.len() != expected_hidden {
+            return Err(NativeError::VectorLengthMismatch {
+                actual: prompt_hidden_rows.len(),
+                expected: expected_hidden,
+            });
+        }
+
+        // MTP consumes shifted prompt tokens and the target's first bonus:
+        //   (x[1], h[0]), ..., (x[N-1], h[N-2]), (bonus, h[N-1]).
+        // Its cache has an independent position space starting at zero.
+        let row_count = prompt_ids.len();
+        let chunk_size = configured_prefill_chunk_tokens(row_count)?;
+        state.next_position = 0;
+        for chunk_start in (0..row_count).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(row_count);
+            let chunk_tokens = chunk_end - chunk_start;
+            let mut fc_input =
+                Vec::with_capacity(chunk_tokens.checked_mul(hidden_size * 2).ok_or_else(|| {
+                    NativeError::DimensionOverflow("MTP prompt FC activations".to_owned())
+                })?);
+            for row_index in chunk_start..chunk_end {
+                let token_id = prompt_ids
+                    .get(row_index + 1)
+                    .copied()
+                    .unwrap_or(bonus_token);
+                let embedding = dequantized_row(
+                    target_weights,
+                    &target_model.embed_tokens,
+                    token_id as usize,
+                )?;
+                let embedding = rms_norm(
+                    &embedding,
+                    &self.pre_fc_norm_embedding,
+                    self.config.rms_norm_eps,
+                )?;
+                let hidden_start = row_index.checked_mul(hidden_size).ok_or_else(|| {
+                    NativeError::DimensionOverflow("MTP prompt hidden offset".to_owned())
+                })?;
+                let hidden_end = hidden_start.checked_add(hidden_size).ok_or_else(|| {
+                    NativeError::DimensionOverflow("MTP prompt hidden end".to_owned())
+                })?;
+                let hidden = prompt_hidden_rows.get(hidden_start..hidden_end).ok_or(
+                    NativeError::VectorLengthMismatch {
+                        actual: prompt_hidden_rows.len(),
+                        expected: expected_hidden,
+                    },
+                )?;
+                let hidden = rms_norm(hidden, &self.pre_fc_norm_hidden, self.config.rms_norm_eps)?;
+                fc_input.extend_from_slice(&embedding);
+                fc_input.extend_from_slice(&hidden);
+            }
+
+            let mut projected = self
+                .weights
+                .q4_affine_matmul_batch(runtime, &[&self.fc], &fc_input, chunk_tokens)?
+                .remove(0);
+            ensure_batched_width(
+                &projected,
+                chunk_tokens,
+                hidden_size,
+                "MTP prompt FC projection",
+            )?;
+            let positions = (chunk_start..chunk_end)
+                .map(|position| MropePosition::text(position as u32))
+                .collect::<Vec<_>>();
+            let attention = self.layer.forward_prefill(
+                runtime,
+                &self.weights,
+                &projected,
+                &positions,
+                &mut state.kv,
+                &self.config.rope(),
+                self.config.rms_norm_eps,
+            )?;
+            add_in_place(&mut projected, &attention)?;
+            let post_norm = rms_norm_rows(
+                &projected,
+                &self.layer.common.post_attention_norm,
+                self.config.rms_norm_eps,
+            )?;
+            let mlp = self.weights.q4_affine_mlp_batch(
+                runtime,
+                &self.layer.common.gate_proj,
+                &self.layer.common.up_proj,
+                &self.layer.common.down_proj,
+                &post_norm,
+                chunk_tokens,
+            )?;
+            add_in_place(&mut projected, &mlp)?;
+
+            if chunk_end == row_count {
+                let final_offset =
+                    (chunk_tokens - 1).checked_mul(hidden_size).ok_or_else(|| {
+                        NativeError::DimensionOverflow("MTP seed hidden offset".to_owned())
+                    })?;
+                let final_end = final_offset.checked_add(hidden_size).ok_or_else(|| {
+                    NativeError::DimensionOverflow("MTP seed hidden end".to_owned())
+                })?;
+                let final_hidden = projected.get(final_offset..final_end).ok_or_else(|| {
+                    NativeError::VectorLengthMismatch {
+                        actual: projected.len(),
+                        expected: chunk_tokens * hidden_size,
+                    }
+                })?;
+                let seed_hidden = rms_norm(final_hidden, &self.norm, self.config.rms_norm_eps)?;
+                let seed_token = target_weights
+                    .q4_affine_argmax_batch(runtime, &target_model.lm_head, &seed_hidden, 1)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        NativeError::InvalidConfig("target argmax returned no token".to_owned())
+                    })?;
+                state.seed_token = Some(seed_token);
+                state.seed_hidden = Some(seed_hidden);
+            }
+        }
+        state.next_position = u32::try_from(row_count)
+            .map_err(|_| NativeError::DimensionOverflow("MTP prompt position".to_owned()))?;
+        state.round_appended = 0;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_input(
+        &self,
+        runtime: &MetalRuntime,
+        target_weights: &NativeWeights,
+        target_model: &NativeModel,
+        state: &mut MtpRequestState,
+        token_id: u32,
+        hidden: &[f32],
+        need_logits: bool,
+    ) -> Result<MtpForwardResult, NativeError> {
+        if hidden.len() != self.config.hidden_size {
+            return Err(NativeError::VectorLengthMismatch {
+                actual: hidden.len(),
+                expected: self.config.hidden_size,
+            });
+        }
+        let embedding = dequantized_row(
+            target_weights,
+            &target_model.embed_tokens,
+            token_id as usize,
+        )?;
+        let embedding = rms_norm(
+            &embedding,
+            &self.pre_fc_norm_embedding,
+            self.config.rms_norm_eps,
+        )?;
+        let hidden = rms_norm(hidden, &self.pre_fc_norm_hidden, self.config.rms_norm_eps)?;
+        let mut fc_input = Vec::with_capacity(embedding.len() + hidden.len());
+        fc_input.extend_from_slice(&embedding);
+        fc_input.extend_from_slice(&hidden);
+
+        if std::env::var_os("QWEN38_DISABLE_MTP_GPU_DECODE").is_none() {
+            let fc_jobs = self.weights.mapped_q4_jobs(&[&self.fc], fc_input.len())?;
+            let rope = self.config.rope();
+            let layer = self.layer.gpu_decode_layer(
+                &self.weights,
+                MropePosition::text(state.next_position),
+                &rope,
+            )?;
+            let lm_jobs = need_logits
+                .then(|| {
+                    target_weights.mapped_q4_jobs(&[&target_model.lm_head], self.config.hidden_size)
+                })
+                .transpose()?;
+            runtime
+                .mtp_decode_step(
+                    &mut state.decode,
+                    &fc_input,
+                    &fc_jobs[0],
+                    &layer,
+                    self.mtp_mlp_f16.as_ref(),
+                    &mut state.kv,
+                    &self.norm_gpu,
+                    lm_jobs.as_ref().map(|jobs| &jobs[0]),
+                    self.config.rms_norm_eps,
+                )
+                .map_err(NativeError::Metal)?;
+            state.next_position = state.next_position.saturating_add(1);
+            let hidden = runtime
+                .read_decode_normalized(&state.decode)
+                .map_err(NativeError::Metal)?;
+            let token = lm_jobs
+                .is_some()
+                .then(|| runtime.read_decode_token(&state.decode))
+                .transpose()
+                .map_err(NativeError::Metal)?;
+            return Ok(MtpForwardResult {
+                hidden,
+                logits: None,
+                token,
+            });
+        }
+
+        let projected = self
+            .weights
+            .q4_affine_matvec(runtime, &self.fc, &fc_input)?;
+        let output = self.layer.forward(
+            runtime,
+            &self.weights,
+            &projected,
+            &mut state.kv,
+            MropePosition::text(state.next_position),
+            self.config.rope(),
+            self.config.rms_norm_eps,
+        )?;
+        state.next_position = state.next_position.saturating_add(1);
+        let mut hidden = projected;
+        add_in_place(&mut hidden, &output)?;
+        let post_norm = rms_norm(
+            &hidden,
+            &self.layer.common.post_attention_norm,
+            self.config.rms_norm_eps,
+        )?;
+        let mlp = self.weights.q4_affine_mlp_batch(
+            runtime,
+            &self.layer.common.gate_proj,
+            &self.layer.common.up_proj,
+            &self.layer.common.down_proj,
+            &post_norm,
+            1,
+        )?;
+        add_in_place(&mut hidden, &mlp)?;
+        let hidden = rms_norm(&hidden, &self.norm, self.config.rms_norm_eps)?;
+        let logits = if need_logits {
+            Some(self.target_logits(runtime, target_weights, target_model, &hidden)?)
+        } else {
+            None
+        };
+        Ok(MtpForwardResult {
+            hidden,
+            logits,
+            token: None,
+        })
+    }
+
+    fn target_logits(
+        &self,
+        runtime: &MetalRuntime,
+        target_weights: &NativeWeights,
+        target_model: &NativeModel,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, NativeError> {
+        target_weights.q4_affine_matvec(runtime, &target_model.lm_head, hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_block(
+        &self,
+        runtime: &MetalRuntime,
+        target_weights: &NativeWeights,
+        target_model: &NativeModel,
+        state: &mut MtpRequestState,
+        bonus: u32,
+        target_hidden: &[f32],
+        draft_count: usize,
+    ) -> Result<Vec<u32>, NativeError> {
+        let mut previous_hidden = target_hidden.to_vec();
+        let mut current_token = bonus;
+        let mut tokens = Vec::with_capacity(draft_count);
+        let mut appended = 0;
+        let mut seed_hidden_available = true;
+        if let Some(seed_token) = state.seed_token.take() {
+            current_token = seed_token;
+            if let Some(seed_hidden) = state.seed_hidden.take() {
+                previous_hidden = seed_hidden;
+            } else {
+                // The fused default path only needs the token itself because
+                // it proposes one item. An experimental multi-token block
+                // must retain the adapter activation to advance further.
+                seed_hidden_available = false;
+            }
+            tokens.push(current_token);
+        }
+        while tokens.len() < draft_count {
+            if !seed_hidden_available && !tokens.is_empty() {
+                return Err(NativeError::InvalidConfig(
+                    "MTP seed activation is required for a multi-token draft".to_owned(),
+                ));
+            }
+            let output = self.forward_input(
+                runtime,
+                target_weights,
+                target_model,
+                state,
+                current_token,
+                &previous_hidden,
+                true,
+            )?;
+            appended += 1;
+            previous_hidden = output.hidden;
+            seed_hidden_available = true;
+            current_token = output
+                .token
+                .or_else(|| output.logits.as_ref().map(|logits| argmax(logits)))
+                .ok_or_else(|| {
+                    NativeError::InvalidConfig("MTP draft step did not produce logits".to_owned())
+                })?;
+            tokens.push(current_token);
+        }
+        state.round_appended = appended;
+        Ok(tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_verified(
+        &self,
+        runtime: &MetalRuntime,
+        target_weights: &NativeWeights,
+        target_model: &NativeModel,
+        state: &mut MtpRequestState,
+        draft_tokens: &[u32],
+        accepted: usize,
+        target_bonus: u32,
+        verify_hidden: &[f32],
+    ) -> Result<(), NativeError> {
+        let hidden_size = self.config.hidden_size;
+        let keep_appended = accepted.min(state.round_appended);
+        let trim = state.round_appended.saturating_sub(keep_appended);
+        if trim > 0 {
+            let sequence_length =
+                state
+                    .kv
+                    .sequence_length()
+                    .checked_sub(trim)
+                    .ok_or_else(|| {
+                        NativeError::InvalidConfig("MTP KV rollback underflow".to_owned())
+                    })?;
+            runtime
+                .truncate_q8_kv_tokens(&mut state.kv, sequence_length)
+                .map_err(NativeError::Metal)?;
+            state.next_position = state.next_position.saturating_sub(trim as u32);
+        }
+
+        for (index, &draft_token) in draft_tokens
+            .iter()
+            .enumerate()
+            .skip(keep_appended)
+            .take(accepted.saturating_sub(keep_appended))
+        {
+            let offset = index.checked_mul(hidden_size).ok_or_else(|| {
+                NativeError::DimensionOverflow("MTP verify hidden offset".to_owned())
+            })?;
+            let end = offset.checked_add(hidden_size).ok_or_else(|| {
+                NativeError::DimensionOverflow("MTP verify hidden end".to_owned())
+            })?;
+            let hidden = verify_hidden.get(offset..end).ok_or_else(|| {
+                NativeError::VectorLengthMismatch {
+                    actual: verify_hidden.len(),
+                    expected: (accepted + 1) * hidden_size,
+                }
+            })?;
+            let _ = self.forward_input(
+                runtime,
+                target_weights,
+                target_model,
+                state,
+                draft_token,
+                hidden,
+                false,
+            )?;
+        }
+
+        let offset = accepted
+            .checked_mul(hidden_size)
+            .ok_or_else(|| NativeError::DimensionOverflow("MTP bonus hidden offset".to_owned()))?;
+        let end = offset
+            .checked_add(hidden_size)
+            .ok_or_else(|| NativeError::DimensionOverflow("MTP bonus hidden end".to_owned()))?;
+        let hidden =
+            verify_hidden
+                .get(offset..end)
+                .ok_or_else(|| NativeError::VectorLengthMismatch {
+                    actual: verify_hidden.len(),
+                    expected: (accepted + 1) * hidden_size,
+                })?;
+        let seed = self.forward_input(
+            runtime,
+            target_weights,
+            target_model,
+            state,
+            target_bonus,
+            hidden,
+            true,
+        )?;
+        let seed_token = seed
+            .token
+            .or_else(|| seed.logits.as_ref().map(|logits| argmax(logits)))
+            .ok_or_else(|| {
+                NativeError::InvalidConfig("MTP seed step did not produce logits".to_owned())
+            })?;
+        state.seed_token = Some(seed_token);
+        state.seed_hidden = Some(seed.hidden);
+        state.round_appended = 0;
+        Ok(())
+    }
+}
+
+fn validate_mtp_pair(
+    target: &TextRuntimeConfig,
+    adapter: &TextRuntimeConfig,
+) -> Result<(), NativeError> {
+    for (name, target_value, adapter_value) in [
+        ("hidden_size", target.hidden_size, adapter.hidden_size),
+        ("vocab_size", target.vocab_size, adapter.vocab_size),
+        (
+            "num_attention_heads",
+            target.num_attention_heads,
+            adapter.num_attention_heads,
+        ),
+        (
+            "num_key_value_heads",
+            target.num_key_value_heads,
+            adapter.num_key_value_heads,
+        ),
+        ("head_dim", target.head_dim, adapter.head_dim),
+    ] {
+        if target_value != adapter_value {
+            return Err(NativeError::InvalidConfig(format!(
+                "MTP adapter {name}={adapter_value} does not match target {target_value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl LayerWeights {
     fn input_norm(&self) -> &[f32] {
         match self {
@@ -2508,6 +4164,25 @@ fn load_vector(
 struct RuntimeState {
     layers: Vec<LayerRuntimeState>,
     decode: MetalDecodeState,
+    /// Reusable short-batch activation state for MTP target verification.
+    /// Its buffers are request-local scratch and do not participate in
+    /// speculation commit/rollback.
+    verify_batch: Option<MetalBatchDecodeState>,
+    speculation: Option<SpeculationWorkspace>,
+}
+
+struct SpeculationWorkspace {
+    /// One reusable destination state for each DeltaNet layer. The buffers are
+    /// allocated only when a request first enters speculative verification.
+    shadow_linear: Vec<Option<MetalDeltaNetState>>,
+    /// Optional per-row state images used to commit a partially accepted
+    /// verification block without replaying its target prefix.
+    snapshots: Vec<Option<MetalDeltaNetSnapshots>>,
+    /// Sequence lengths captured before the current verification transaction.
+    /// Full-attention KV bytes can be appended in place and rolled back by
+    /// restoring these logical lengths.
+    full_lengths: Vec<usize>,
+    active: bool,
 }
 
 enum LayerRuntimeState {
@@ -2537,6 +4212,8 @@ impl RuntimeState {
             decode: runtime
                 .create_decode_state(model.config.hidden_size)
                 .map_err(NativeError::Metal)?,
+            verify_batch: None,
+            speculation: None,
         })
     }
 
@@ -2552,6 +4229,232 @@ impl RuntimeState {
                     .map_err(NativeError::Metal)?;
             }
         }
+        Ok(())
+    }
+
+    fn begin_speculation(
+        &mut self,
+        model: &NativeModel,
+        runtime: &MetalRuntime,
+    ) -> Result<(), NativeError> {
+        if self.layers.len() != model.layers.len() {
+            return Err(NativeError::InvalidConfig(
+                "runtime state layer count does not match model".to_owned(),
+            ));
+        }
+        let workspace = self
+            .speculation
+            .get_or_insert_with(|| SpeculationWorkspace {
+                shadow_linear: (0..model.layers.len()).map(|_| None).collect(),
+                snapshots: (0..model.layers.len()).map(|_| None).collect(),
+                full_lengths: Vec::with_capacity(model.layers.len()),
+                active: false,
+            });
+        if workspace.active {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is already active".to_owned(),
+            ));
+        }
+        workspace.full_lengths.clear();
+        workspace.full_lengths.resize(model.layers.len(), 0);
+        for (layer_index, (layer, layer_state)) in
+            model.layers.iter().zip(self.layers.iter()).enumerate()
+        {
+            match (layer, layer_state) {
+                (LayerWeights::Linear(linear), LayerRuntimeState::Linear(_)) => {
+                    if workspace.shadow_linear[layer_index].is_none() {
+                        workspace.shadow_linear[layer_index] = Some(
+                            runtime
+                                .create_deltanet_state(&linear.delta)
+                                .map_err(NativeError::Metal)?,
+                        );
+                    }
+                }
+                (LayerWeights::Full(_), LayerRuntimeState::Full(state)) => {
+                    workspace.full_lengths[layer_index] = state.sequence_length();
+                }
+                _ => unreachable!("layer weights and runtime state are constructed together"),
+            }
+        }
+        workspace.active = true;
+        Ok(())
+    }
+
+    fn commit_speculation(&mut self, model: &NativeModel) -> Result<(), NativeError> {
+        let Some(workspace) = self.speculation.as_mut() else {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        };
+        if !workspace.active {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        }
+        for (layer_index, (layer, layer_state)) in
+            model.layers.iter().zip(self.layers.iter_mut()).enumerate()
+        {
+            if matches!(layer, LayerWeights::Linear(_)) {
+                let LayerRuntimeState::Linear(active) = layer_state else {
+                    unreachable!("layer weights and runtime state are constructed together")
+                };
+                let shadow = workspace.shadow_linear[layer_index]
+                    .as_mut()
+                    .ok_or_else(|| {
+                        NativeError::InvalidConfig("missing DeltaNet speculation shadow".to_owned())
+                    })?;
+                // The old active buffers remain in `shadow` and can be reused
+                // as the destination of the next transaction.
+                self_runtime_swap_deltanet_state(active, shadow);
+            }
+        }
+        workspace.active = false;
+        Ok(())
+    }
+
+    fn prepare_speculation_snapshots(
+        &mut self,
+        model: &NativeModel,
+        runtime: &MetalRuntime,
+        row_count: usize,
+    ) -> Result<(), NativeError> {
+        if !mtp_state_snapshots_enabled() || row_count == 0 {
+            return Ok(());
+        }
+        let workspace = self.speculation.as_mut().ok_or_else(|| {
+            NativeError::InvalidConfig("speculative state transaction is not active".to_owned())
+        })?;
+        if !workspace.active {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        }
+        for (layer_index, (layer, layer_state)) in
+            model.layers.iter().zip(self.layers.iter()).enumerate()
+        {
+            if let (LayerWeights::Linear(linear), LayerRuntimeState::Linear(_)) =
+                (layer, layer_state)
+            {
+                let needs_allocation = workspace.snapshots[layer_index]
+                    .as_ref()
+                    .is_none_or(|snapshots| snapshots.row_count() < row_count);
+                if needs_allocation {
+                    workspace.snapshots[layer_index] = Some(
+                        runtime
+                            .create_deltanet_snapshots(&linear.delta, row_count)
+                            .map_err(NativeError::Metal)?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_speculation_snapshots(&self, model: &NativeModel) -> bool {
+        if !mtp_state_snapshots_enabled() {
+            return false;
+        }
+        let Some(workspace) = self.speculation.as_ref() else {
+            return false;
+        };
+        workspace.active
+            && model
+                .layers
+                .iter()
+                .enumerate()
+                .all(|(layer_index, layer)| match layer {
+                    LayerWeights::Linear(_) => workspace.snapshots[layer_index].is_some(),
+                    LayerWeights::Full(_) => true,
+                })
+    }
+
+    /// Commits the first `rows` rows of an active verification transaction.
+    /// DeltaNet rows are restored from their GPU-produced snapshots and full
+    /// attention simply shortens its logical KV length.
+    fn commit_speculation_prefix(
+        &mut self,
+        model: &NativeModel,
+        runtime: &MetalRuntime,
+        rows: usize,
+    ) -> Result<(), NativeError> {
+        if rows == 0 {
+            return Err(NativeError::InvalidConfig(
+                "speculative prefix must contain at least one row".to_owned(),
+            ));
+        }
+        let workspace = self.speculation.as_mut().ok_or_else(|| {
+            NativeError::InvalidConfig("speculative state transaction is not active".to_owned())
+        })?;
+        if !workspace.active {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        }
+        let snapshot_row = rows - 1;
+        for (layer_index, (layer, layer_state)) in
+            model.layers.iter().zip(self.layers.iter_mut()).enumerate()
+        {
+            match (layer, layer_state) {
+                (LayerWeights::Linear(_), LayerRuntimeState::Linear(active)) => {
+                    let snapshots = workspace.snapshots[layer_index].as_mut().ok_or_else(|| {
+                        NativeError::InvalidConfig(
+                            "missing DeltaNet state snapshots for partial commit".to_owned(),
+                        )
+                    })?;
+                    runtime
+                        .restore_deltanet_snapshot(snapshots, snapshot_row, active)
+                        .map_err(NativeError::Metal)?;
+                }
+                (LayerWeights::Full(_), LayerRuntimeState::Full(state)) => {
+                    let sequence_length = workspace.full_lengths[layer_index]
+                        .checked_add(rows)
+                        .ok_or_else(|| {
+                            NativeError::DimensionOverflow(
+                                "speculative full-attention prefix length".to_owned(),
+                            )
+                        })?;
+                    if sequence_length > state.sequence_length() {
+                        return Err(NativeError::InvalidConfig(
+                            "speculative full-attention state is shorter than the accepted prefix"
+                                .to_owned(),
+                        ));
+                    }
+                    runtime
+                        .truncate_q8_kv_tokens(state, sequence_length)
+                        .map_err(NativeError::Metal)?;
+                }
+                _ => unreachable!("layer weights and runtime state are constructed together"),
+            }
+        }
+        workspace.active = false;
+        Ok(())
+    }
+
+    fn rollback_speculation(
+        &mut self,
+        model: &NativeModel,
+        runtime: &MetalRuntime,
+    ) -> Result<(), NativeError> {
+        let Some(workspace) = self.speculation.as_mut() else {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        };
+        if !workspace.active {
+            return Err(NativeError::InvalidConfig(
+                "speculative state transaction is not active".to_owned(),
+            ));
+        }
+        for (layer_index, (layer, layer_state)) in
+            model.layers.iter().zip(self.layers.iter_mut()).enumerate()
+        {
+            if let (LayerWeights::Full(_), LayerRuntimeState::Full(state)) = (layer, layer_state) {
+                runtime
+                    .truncate_q8_kv_tokens(state, workspace.full_lengths[layer_index])
+                    .map_err(NativeError::Metal)?;
+            }
+        }
+        workspace.active = false;
         Ok(())
     }
 
@@ -2584,8 +4487,17 @@ impl RuntimeState {
             decode: runtime
                 .create_decode_state(model.config.hidden_size)
                 .map_err(NativeError::Metal)?,
+            verify_batch: None,
+            speculation: None,
         })
     }
+}
+
+fn self_runtime_swap_deltanet_state(
+    active: &mut MetalDeltaNetState,
+    shadow: &mut MetalDeltaNetState,
+) {
+    std::mem::swap(active, shadow);
 }
 
 impl LinearLayerWeights {
@@ -2698,6 +4610,63 @@ impl LinearLayerWeights {
 
         let output = runtime
             .deltanet_prefill(&self.delta, state, &qkv, &z, &b, &a, batch_size, eps)
+            .map_err(NativeError::Metal)?;
+        let mut projected =
+            weights.q4_affine_matmul_batch(runtime, &[&self.out_proj], &output, batch_size)?;
+        Ok(projected.remove(0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill_from(
+        &self,
+        runtime: &MetalRuntime,
+        weights: &NativeWeights,
+        input: &[f32],
+        batch_size: usize,
+        source: &MetalDeltaNetState,
+        destination: &mut MetalDeltaNetState,
+        eps: f32,
+    ) -> Result<Vec<f32>, NativeError> {
+        let mut projections = weights.q4_affine_matmul_batch(
+            runtime,
+            &[
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &self.in_proj_b,
+                &self.in_proj_a,
+            ],
+            input,
+            batch_size,
+        )?;
+        let qkv = projections.remove(0);
+        let z = projections.remove(0);
+        let b = projections.remove(0);
+        let a = projections.remove(0);
+        let qkv_width = usize::try_from(self.in_proj_qkv.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet qkv rows".to_owned()))?;
+        let z_width = usize::try_from(self.in_proj_z.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet z rows".to_owned()))?;
+        let b_width = usize::try_from(self.in_proj_b.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet b rows".to_owned()))?;
+        let a_width = usize::try_from(self.in_proj_a.output_rows)
+            .map_err(|_| NativeError::DimensionOverflow("DeltaNet a rows".to_owned()))?;
+        ensure_batched_width(&qkv, batch_size, qkv_width, "DeltaNet qkv prefill")?;
+        ensure_batched_width(&z, batch_size, z_width, "DeltaNet z prefill")?;
+        ensure_batched_width(&b, batch_size, b_width, "DeltaNet b prefill")?;
+        ensure_batched_width(&a, batch_size, a_width, "DeltaNet a prefill")?;
+
+        let output = runtime
+            .deltanet_prefill_from(
+                &self.delta,
+                source,
+                destination,
+                &qkv,
+                &z,
+                &b,
+                &a,
+                batch_size,
+                eps,
+            )
             .map_err(NativeError::Metal)?;
         let mut projected =
             weights.q4_affine_matmul_batch(runtime, &[&self.out_proj], &output, batch_size)?;
@@ -3214,6 +5183,58 @@ fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
 }
 
+fn mtp_request_is_eligible(request: &GenerationRequest, text_only: bool) -> bool {
+    text_only
+        && request.tools.is_empty()
+        && !request.thinking.enabled
+        && request.max_tokens >= 2
+        && request.temperature.unwrap_or(0.0) <= f32::EPSILON
+        && request.top_p.unwrap_or(1.0) >= 1.0 - f32::EPSILON
+}
+
+/// Returns the configured speculative depth. Apple Q4 verification is
+/// bandwidth-bound, and one proposal keeps the target batch at two rows. The
+/// adapter's wider trained block remains available as an explicit override.
+fn configured_mtp_draft_limit(advertised: usize) -> Result<usize, NativeError> {
+    let env_value = std::env::var_os("QWEN38_MTP_MAX_DRAFT_TOKENS");
+    let raw = env_value
+        .as_deref()
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                NativeError::InvalidConfig(
+                    "QWEN38_MTP_MAX_DRAFT_TOKENS must be an ASCII integer".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    configured_mtp_draft_limit_with_override(advertised, raw)
+}
+
+fn configured_mtp_draft_limit_with_override(
+    advertised: usize,
+    raw: Option<&str>,
+) -> Result<usize, NativeError> {
+    const MAX_EXPERIMENTAL_DEPTH: usize = 8;
+    let Some(raw) = raw else {
+        return Ok(advertised.min(DEFAULT_MTP_DRAFT_TOKENS));
+    };
+    let depth = raw.parse::<usize>().map_err(|_| {
+        NativeError::InvalidConfig(format!(
+            "QWEN38_MTP_MAX_DRAFT_TOKENS must be between 1 and {MAX_EXPERIMENTAL_DEPTH}, got {raw:?}"
+        ))
+    })?;
+    if !(1..=MAX_EXPERIMENTAL_DEPTH).contains(&depth) {
+        return Err(NativeError::InvalidConfig(format!(
+            "QWEN38_MTP_MAX_DRAFT_TOKENS must be between 1 and {MAX_EXPERIMENTAL_DEPTH}, got {depth}"
+        )));
+    }
+    Ok(depth)
+}
+
+fn mtp_state_snapshots_enabled() -> bool {
+    std::env::var_os("QWEN38_DISABLE_MTP_STATE_SNAPSHOTS").is_none()
+}
+
 fn sample_token(logits: &[f32], temperature: Option<f32>, top_p: Option<f32>, seed: u64) -> u32 {
     let temperature = temperature.unwrap_or(0.0);
     if temperature <= f32::EPSILON {
@@ -3558,6 +5579,7 @@ pub enum NativeError {
     Streaming(String),
     Preflight(crate::preflight::PreflightError),
     PrefixCachePoisoned,
+    MtpControllerPoisoned,
 }
 
 impl fmt::Display for NativeError {
@@ -3648,6 +5670,7 @@ impl fmt::Display for NativeError {
             Self::Streaming(message) => write!(formatter, "stream receiver unavailable: {message}"),
             Self::Preflight(error) => write!(formatter, "cannot inspect MTP capability: {error}"),
             Self::PrefixCachePoisoned => write!(formatter, "prefix cache lock is poisoned"),
+            Self::MtpControllerPoisoned => write!(formatter, "MTP controller lock is poisoned"),
         }
     }
 }
@@ -3679,7 +5702,8 @@ impl Error for NativeError {
             | Self::ContextLimit { .. }
             | Self::Unavailable(_)
             | Self::Streaming(_)
-            | Self::PrefixCachePoisoned => None,
+            | Self::PrefixCachePoisoned
+            | Self::MtpControllerPoisoned => None,
             Self::ConfigRead { source, .. } => Some(source),
             Self::ConfigJson(error) => Some(error),
             Self::GenerationConfigJson(error) => Some(error),
@@ -3691,6 +5715,7 @@ impl Error for NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{PromptMessage, ThinkingConfig, ToolDefinition};
 
     fn tensor(dtype: &str, shape: &[u64], byte_len: u64) -> MlxTensor {
         MlxTensor {
@@ -3727,6 +5752,57 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, NativeError::InvalidAffineTensor { .. }));
+    }
+
+    #[test]
+    fn mtp_eligibility_is_limited_to_greedy_text() {
+        let request = GenerationRequest {
+            messages: vec![PromptMessage::text(PromptRole::User, "hello")],
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            thinking: ThinkingConfig::DISABLED,
+            max_tokens: 4,
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            stop: Vec::new(),
+        };
+        assert!(mtp_request_is_eligible(&request, true));
+
+        let mut with_tools = request.clone();
+        with_tools.tools.push(ToolDefinition {
+            name: "lookup".to_owned(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+        assert!(!mtp_request_is_eligible(&with_tools, true));
+
+        let mut with_thinking = request.clone();
+        with_thinking.thinking = ThinkingConfig::ENABLED;
+        assert!(!mtp_request_is_eligible(&with_thinking, true));
+
+        let mut sampled = request.clone();
+        sampled.temperature = Some(0.2);
+        assert!(!mtp_request_is_eligible(&sampled, true));
+
+        let mut narrowed = request;
+        narrowed.top_p = Some(0.9);
+        assert!(!mtp_request_is_eligible(&narrowed, true));
+    }
+
+    #[test]
+    fn mtp_defaults_to_a_single_draft_token() {
+        assert_eq!(
+            configured_mtp_draft_limit_with_override(2, None).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn mtp_draft_override_can_restore_the_adapter_block_depth() {
+        assert_eq!(
+            configured_mtp_draft_limit_with_override(2, Some("2")).unwrap(),
+            2
+        );
     }
 
     #[test]
