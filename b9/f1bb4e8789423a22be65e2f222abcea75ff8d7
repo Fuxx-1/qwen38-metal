@@ -1,0 +1,45 @@
+src/metal_runtime.rs
+  s_da61af4672b9a0::t_3783d27626a2a7 695-704,864-865
+  s_da61af4672b9a0::t_2dc5df9f4b2c1c 9939-9976,10002-10005
+  s_da61af4672b9a0::t_c53b1fc7204e00 72,96-97
+  s_da61af4672b9a0::t_f28ec41e76d609 5822-5823,5825,5827-5899
+  s_da61af4672b9a0::t_81222f25086963 9903-9938,9977-10001,10006-10053
+  s_da61af4672b9a0::t_426cd2b3d91704 5655,5824,6386
+  s_da61af4672b9a0::t_5bc835f6b8844d 100-101
+  s_da61af4672b9a0::t_e17734eee3cf32 2364-2371
+  s_da61af4672b9a0::t_7de95e9a00bf6d 715-724,868-869
+  s_da61af4672b9a0::t_12840ef8055d16 2408-2409
+  s_da61af4672b9a0::t_f64bf7c7f8952b 735-744,872-873
+  s_da61af4672b9a0::t_840a3c84a77c90 104-105
+  s_da61af4672b9a0::t_cf1c48681c027c 2399-2407,2410-2419,2441,2461-2463,2466-2477
+  s_da61af4672b9a0::t_8fc94e89e1d2de 5653-5654,5656-5727
+  s_da61af4672b9a0::t_5cabae3437c6fb 5826
+  s_da61af4672b9a0::t_f0a17c899c2ef1 6384-6385,6387-6507
+  s_da61af4672b9a0::t_40d1c9bd64cc50 2478,9902
+README.md
+  s_da61af4672b9a0::t_532c3aa15e65e8 97
+  s_da61af4672b9a0::t_75ce3f2f28a3dd 95
+shaders/qwen38.metal
+  s_da61af4672b9a0::t_5f7d8d07e68647 2104,2196
+  s_da61af4672b9a0::t_72831545b0a5c6 4665,4670,4672
+  s_da61af4672b9a0::t_bf63d85bec8d7b 2076-2103,2105-2195,2197-2270
+  s_da61af4672b9a0::t_7d925f46807a51 2406-2599
+  s_da61af4672b9a0::t_eb58b0c5848bfa 4577-4596,4609,4612,4620-4621,4623-4624,4681,4683,4690-4692,4724
+  s_da61af4672b9a0::t_3e5a4b4629e7c9 2812-3134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "b9f1bb4e8789423a22be65e2f222abcea75ff8d7",
+  "prompts": {},
+  "sessions": {
+    "s_da61af4672b9a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04e4a-c0cd-7010-a70c-2a80787db5dd",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Fuxx-1 <Fuxx-1@users.noreply.github.com>"
+    }
+  }
+}
