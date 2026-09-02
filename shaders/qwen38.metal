@@ -2073,6 +2073,201 @@ kernel void qwen38_q4_affine_matmul_batch2_vector_unaligned(
     }
 }
 
+// Experimental batch-2 row tile. Two adjacent output rows share the same
+// activation panel while each lane keeps four accumulators (two batches by
+// two output rows). This trades a little register pressure for halving the
+// repeated activation reads made by the one-row batch-2 kernel.
+kernel void qwen38_q4_affine_matmul_batch2_rows2_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows) {
+        return;
+    }
+    const bool active_row1 = row1 < output_rows;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result00 = 0.0f;
+    float result01 = 0.0f;
+    float result10 = 0.0f;
+    float result11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot00 = 0.0f;
+        float dot01 = 0.0f;
+        float dot10 = 0.0f;
+        float dot11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            const uint packed0 = packed_weights[word_base0 + word];
+            const float4 quantized00 = qwen38_q4_low_values(packed0);
+            const float4 quantized01 = qwen38_q4_high_values(packed0);
+            dot00 += dot(values00, quantized00) + dot(values01, quantized01);
+            dot01 += dot(values10, quantized00) + dot(values11, quantized01);
+            if (active_row1) {
+                const uint packed1 = packed_weights[word_base1 + word];
+                const float4 quantized10 = qwen38_q4_low_values(packed1);
+                const float4 quantized11 = qwen38_q4_high_values(packed1);
+                dot10 += dot(values00, quantized10) + dot(values01, quantized11);
+                dot11 += dot(values10, quantized10) + dot(values11, quantized11);
+            }
+        }
+        const float scale0 = qwen38_bf16_to_float(scales[row0 * groups_per_row + group]);
+        const float bias0 = qwen38_bf16_to_float(biases[row0 * groups_per_row + group]);
+        result00 += dot00 * scale0 + input_sum0 * bias0;
+        result01 += dot01 * scale0 + input_sum1 * bias0;
+        if (active_row1) {
+            const float scale1 = qwen38_bf16_to_float(scales[row1 * groups_per_row + group]);
+            const float bias1 = qwen38_bf16_to_float(biases[row1 * groups_per_row + group]);
+            result10 += dot10 * scale1 + input_sum0 * bias1;
+            result11 += dot11 * scale1 + input_sum1 * bias1;
+        }
+    }
+
+    result00 = simd_sum(result00);
+    result01 = simd_sum(result01);
+    result10 = simd_sum(result10);
+    result11 = simd_sum(result11);
+    if (lane == 0u) {
+        output[row0] = result00;
+        output[output_rows + row0] = result01;
+        if (active_row1) {
+            output[row1] = result10;
+            output[output_rows + row1] = result11;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_batch2_rows2_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows) {
+        return;
+    }
+    const bool active_row1 = row1 < output_rows;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result00 = 0.0f;
+    float result01 = 0.0f;
+    float result10 = 0.0f;
+    float result11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot00 = 0.0f;
+        float dot01 = 0.0f;
+        float dot10 = 0.0f;
+        float dot11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            const ulong packed_address0 =
+                weight_byte_offset + ulong(word_base0 + word) * 4ul;
+            const uint packed0 = qwen38_load_u32(packed_weights, packed_address0);
+            const float4 quantized00 = qwen38_q4_low_values(packed0);
+            const float4 quantized01 = qwen38_q4_high_values(packed0);
+            dot00 += dot(values00, quantized00) + dot(values01, quantized01);
+            dot01 += dot(values10, quantized00) + dot(values11, quantized01);
+            if (active_row1) {
+                const ulong packed_address1 =
+                    weight_byte_offset + ulong(word_base1 + word) * 4ul;
+                const uint packed1 = qwen38_load_u32(packed_weights, packed_address1);
+                const float4 quantized10 = qwen38_q4_low_values(packed1);
+                const float4 quantized11 = qwen38_q4_high_values(packed1);
+                dot10 += dot(values00, quantized10) + dot(values01, quantized11);
+                dot11 += dot(values10, quantized10) + dot(values11, quantized11);
+            }
+        }
+        const ulong parameter0 = (ulong(row0) * ulong(groups_per_row) + ulong(group)) * 2ul;
+        const float scale0 = qwen38_bf16_to_float(
+            qwen38_load_u16(scales, scale_byte_offset + parameter0));
+        const float bias0 = qwen38_bf16_to_float(
+            qwen38_load_u16(biases, bias_byte_offset + parameter0));
+        result00 += dot00 * scale0 + input_sum0 * bias0;
+        result01 += dot01 * scale0 + input_sum1 * bias0;
+        if (active_row1) {
+            const ulong parameter1 = (ulong(row1) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale1 = qwen38_bf16_to_float(
+                qwen38_load_u16(scales, scale_byte_offset + parameter1));
+            const float bias1 = qwen38_bf16_to_float(
+                qwen38_load_u16(biases, bias_byte_offset + parameter1));
+            result10 += dot10 * scale1 + input_sum0 * bias1;
+            result11 += dot11 * scale1 + input_sum1 * bias1;
+        }
+    }
+
+    result00 = simd_sum(result00);
+    result01 = simd_sum(result01);
+    result10 = simd_sum(result10);
+    result11 = simd_sum(result11);
+    if (lane == 0u) {
+        output[row0] = result00;
+        output[output_rows + row0] = result01;
+        if (active_row1) {
+            output[row1] = result10;
+            output[output_rows + row1] = result11;
+        }
+    }
+}
+
 // Batch-2 residual form. The projection result is accumulated directly into
 // the row-major residual stream, avoiding a temporary output matrix and a
 // separate add_rows dispatch for attention/MLP residuals.
@@ -2205,6 +2400,200 @@ kernel void qwen38_q4_affine_matmul_batch2_vector_add_unaligned(
     if (lane == 0u) {
         destination[row] += result0;
         destination[output_rows + row] += result1;
+    }
+}
+
+// Batch-2 residual variant of the two-row tile. The activation panel is
+// loaded once for two adjacent output rows while the projection is accumulated
+// directly into the row-major residual stream.
+kernel void qwen38_q4_affine_matmul_batch2_rows2_vector_add(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]],
+    device const ushort* biases [[buffer(3)]],
+    device float* destination [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant uint& output_rows [[buffer(6)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows) {
+        return;
+    }
+    const bool active_row1 = row1 < output_rows;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result00 = 0.0f;
+    float result01 = 0.0f;
+    float result10 = 0.0f;
+    float result11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot00 = 0.0f;
+        float dot01 = 0.0f;
+        float dot10 = 0.0f;
+        float dot11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            const uint packed0 = packed_weights[word_base0 + word];
+            const float4 quantized00 = qwen38_q4_low_values(packed0);
+            const float4 quantized01 = qwen38_q4_high_values(packed0);
+            dot00 += dot(values00, quantized00) + dot(values01, quantized01);
+            dot01 += dot(values10, quantized00) + dot(values11, quantized01);
+            if (active_row1) {
+                const uint packed1 = packed_weights[word_base1 + word];
+                const float4 quantized10 = qwen38_q4_low_values(packed1);
+                const float4 quantized11 = qwen38_q4_high_values(packed1);
+                dot10 += dot(values00, quantized10) + dot(values01, quantized11);
+                dot11 += dot(values10, quantized10) + dot(values11, quantized11);
+            }
+        }
+        const float scale0 = qwen38_bf16_to_float(scales[row0 * groups_per_row + group]);
+        const float bias0 = qwen38_bf16_to_float(biases[row0 * groups_per_row + group]);
+        result00 += dot00 * scale0 + input_sum0 * bias0;
+        result01 += dot01 * scale0 + input_sum1 * bias0;
+        if (active_row1) {
+            const float scale1 = qwen38_bf16_to_float(scales[row1 * groups_per_row + group]);
+            const float bias1 = qwen38_bf16_to_float(biases[row1 * groups_per_row + group]);
+            result10 += dot10 * scale1 + input_sum0 * bias1;
+            result11 += dot11 * scale1 + input_sum1 * bias1;
+        }
+    }
+
+    result00 = simd_sum(result00);
+    result01 = simd_sum(result01);
+    result10 = simd_sum(result10);
+    result11 = simd_sum(result11);
+    if (lane == 0u) {
+        destination[row0] += result00;
+        destination[output_rows + row0] += result01;
+        if (active_row1) {
+            destination[row1] += result10;
+            destination[output_rows + row1] += result11;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_batch2_rows2_vector_add_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights [[buffer(1)]],
+    device const uchar* scales [[buffer(2)]],
+    device const uchar* biases [[buffer(3)]],
+    device float* destination [[buffer(4)]],
+    constant uint& words_per_row [[buffer(5)]],
+    constant ulong& weight_byte_offset [[buffer(6)]],
+    constant ulong& scale_byte_offset [[buffer(7)]],
+    constant ulong& bias_byte_offset [[buffer(8)]],
+    constant uint& output_rows [[buffer(9)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows) {
+        return;
+    }
+    const bool active_row1 = row1 < output_rows;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result00 = 0.0f;
+    float result01 = 0.0f;
+    float result10 = 0.0f;
+    float result11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot00 = 0.0f;
+        float dot01 = 0.0f;
+        float dot10 = 0.0f;
+        float dot11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            const ulong packed_address0 =
+                weight_byte_offset + ulong(word_base0 + word) * 4ul;
+            const uint packed0 = qwen38_load_u32(packed_weights, packed_address0);
+            const float4 quantized00 = qwen38_q4_low_values(packed0);
+            const float4 quantized01 = qwen38_q4_high_values(packed0);
+            dot00 += dot(values00, quantized00) + dot(values01, quantized01);
+            dot01 += dot(values10, quantized00) + dot(values11, quantized01);
+            if (active_row1) {
+                const ulong packed_address1 =
+                    weight_byte_offset + ulong(word_base1 + word) * 4ul;
+                const uint packed1 = qwen38_load_u32(packed_weights, packed_address1);
+                const float4 quantized10 = qwen38_q4_low_values(packed1);
+                const float4 quantized11 = qwen38_q4_high_values(packed1);
+                dot10 += dot(values00, quantized10) + dot(values01, quantized11);
+                dot11 += dot(values10, quantized10) + dot(values11, quantized11);
+            }
+        }
+        const ulong parameter0 = (ulong(row0) * ulong(groups_per_row) + ulong(group)) * 2ul;
+        const float scale0 = qwen38_bf16_to_float(
+            qwen38_load_u16(scales, scale_byte_offset + parameter0));
+        const float bias0 = qwen38_bf16_to_float(
+            qwen38_load_u16(biases, bias_byte_offset + parameter0));
+        result00 += dot00 * scale0 + input_sum0 * bias0;
+        result01 += dot01 * scale0 + input_sum1 * bias0;
+        if (active_row1) {
+            const ulong parameter1 = (ulong(row1) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale1 = qwen38_bf16_to_float(
+                qwen38_load_u16(scales, scale_byte_offset + parameter1));
+            const float bias1 = qwen38_bf16_to_float(
+                qwen38_load_u16(biases, bias_byte_offset + parameter1));
+            result10 += dot10 * scale1 + input_sum0 * bias1;
+            result11 += dot11 * scale1 + input_sum1 * bias1;
+        }
+    }
+
+    result00 = simd_sum(result00);
+    result01 = simd_sum(result01);
+    result10 = simd_sum(result10);
+    result11 = simd_sum(result11);
+    if (lane == 0u) {
+        destination[row0] += result00;
+        destination[output_rows + row0] += result01;
+        if (active_row1) {
+            destination[row1] += result10;
+            destination[output_rows + row1] += result11;
+        }
     }
 }
 
@@ -2416,6 +2805,329 @@ kernel void qwen38_q4_affine_matmul_pair_batch2_vector_unaligned(
         if (active_b) {
             output_b[row] = result_b0;
             output_b[output_rows_b + row] = result_b1;
+        }
+    }
+}
+
+// Paired variant of the experimental two-row tile. It keeps activation
+// values shared across both output rows and both matrices while retaining the
+// row-major output layout expected by the verifier.
+kernel void qwen38_q4_affine_matmul_pair_batch2_rows2_vector(
+    device const float* input [[buffer(0)]],
+    device const uint* packed_weights_a [[buffer(1)]],
+    device const ushort* scales_a [[buffer(2)]],
+    device const ushort* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    device const uint* packed_weights_b [[buffer(6)]],
+    device const ushort* scales_b [[buffer(7)]],
+    device const ushort* biases_b [[buffer(8)]],
+    device float* output_b [[buffer(9)]],
+    constant uint& output_rows_b [[buffer(10)]],
+    constant uint& words_per_row [[buffer(11)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows_a && row0 >= output_rows_b) {
+        return;
+    }
+    const bool active_a0 = row0 < output_rows_a;
+    const bool active_a1 = row1 < output_rows_a;
+    const bool active_b0 = row0 < output_rows_b;
+    const bool active_b1 = row1 < output_rows_b;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result_a00 = 0.0f;
+    float result_a01 = 0.0f;
+    float result_a10 = 0.0f;
+    float result_a11 = 0.0f;
+    float result_b00 = 0.0f;
+    float result_b01 = 0.0f;
+    float result_b10 = 0.0f;
+    float result_b11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot_a00 = 0.0f;
+        float dot_a01 = 0.0f;
+        float dot_a10 = 0.0f;
+        float dot_a11 = 0.0f;
+        float dot_b00 = 0.0f;
+        float dot_b01 = 0.0f;
+        float dot_b10 = 0.0f;
+        float dot_b11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            if (active_a0) {
+                const uint packed = packed_weights_a[word_base0 + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a00 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a01 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_a1) {
+                const uint packed = packed_weights_a[word_base1 + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a10 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a11 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b0) {
+                const uint packed = packed_weights_b[word_base0 + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b00 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b01 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b1) {
+                const uint packed = packed_weights_b[word_base1 + word];
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b10 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b11 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+        }
+        if (active_a0) {
+            const float scale = qwen38_bf16_to_float(scales_a[row0 * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_a[row0 * groups_per_row + group]);
+            result_a00 += dot_a00 * scale + input_sum0 * bias;
+            result_a01 += dot_a01 * scale + input_sum1 * bias;
+        }
+        if (active_a1) {
+            const float scale = qwen38_bf16_to_float(scales_a[row1 * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_a[row1 * groups_per_row + group]);
+            result_a10 += dot_a10 * scale + input_sum0 * bias;
+            result_a11 += dot_a11 * scale + input_sum1 * bias;
+        }
+        if (active_b0) {
+            const float scale = qwen38_bf16_to_float(scales_b[row0 * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_b[row0 * groups_per_row + group]);
+            result_b00 += dot_b00 * scale + input_sum0 * bias;
+            result_b01 += dot_b01 * scale + input_sum1 * bias;
+        }
+        if (active_b1) {
+            const float scale = qwen38_bf16_to_float(scales_b[row1 * groups_per_row + group]);
+            const float bias = qwen38_bf16_to_float(biases_b[row1 * groups_per_row + group]);
+            result_b10 += dot_b10 * scale + input_sum0 * bias;
+            result_b11 += dot_b11 * scale + input_sum1 * bias;
+        }
+    }
+
+    result_a00 = simd_sum(result_a00);
+    result_a01 = simd_sum(result_a01);
+    result_a10 = simd_sum(result_a10);
+    result_a11 = simd_sum(result_a11);
+    result_b00 = simd_sum(result_b00);
+    result_b01 = simd_sum(result_b01);
+    result_b10 = simd_sum(result_b10);
+    result_b11 = simd_sum(result_b11);
+    if (lane == 0u) {
+        if (active_a0) {
+            output_a[row0] = result_a00;
+            output_a[output_rows_a + row0] = result_a01;
+        }
+        if (active_a1) {
+            output_a[row1] = result_a10;
+            output_a[output_rows_a + row1] = result_a11;
+        }
+        if (active_b0) {
+            output_b[row0] = result_b00;
+            output_b[output_rows_b + row0] = result_b01;
+        }
+        if (active_b1) {
+            output_b[row1] = result_b10;
+            output_b[output_rows_b + row1] = result_b11;
+        }
+    }
+}
+
+kernel void qwen38_q4_affine_matmul_pair_batch2_rows2_vector_unaligned(
+    device const float* input [[buffer(0)]],
+    device const uchar* packed_weights_a [[buffer(1)]],
+    device const uchar* scales_a [[buffer(2)]],
+    device const uchar* biases_a [[buffer(3)]],
+    device float* output_a [[buffer(4)]],
+    constant uint& output_rows_a [[buffer(5)]],
+    constant ulong& weight_byte_offset_a [[buffer(6)]],
+    constant ulong& scale_byte_offset_a [[buffer(7)]],
+    constant ulong& bias_byte_offset_a [[buffer(8)]],
+    device const uchar* packed_weights_b [[buffer(9)]],
+    device const uchar* scales_b [[buffer(10)]],
+    device const uchar* biases_b [[buffer(11)]],
+    device float* output_b [[buffer(12)]],
+    constant uint& output_rows_b [[buffer(13)]],
+    constant ulong& weight_byte_offset_b [[buffer(14)]],
+    constant ulong& scale_byte_offset_b [[buffer(15)]],
+    constant ulong& bias_byte_offset_b [[buffer(16)]],
+    constant uint& words_per_row [[buffer(17)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = tile * 2u;
+    const uint row1 = row0 + 1u;
+    if (row0 >= output_rows_a && row0 >= output_rows_b) {
+        return;
+    }
+    const bool active_a0 = row0 < output_rows_a;
+    const bool active_a1 = row1 < output_rows_a;
+    const bool active_b0 = row0 < output_rows_b;
+    const bool active_b1 = row1 < output_rows_b;
+    const uint groups_per_row = words_per_row / 8u;
+    const uint input_elements = words_per_row * 8u;
+    const uint second_input = input_elements;
+    float result_a00 = 0.0f;
+    float result_a01 = 0.0f;
+    float result_a10 = 0.0f;
+    float result_a11 = 0.0f;
+    float result_b00 = 0.0f;
+    float result_b01 = 0.0f;
+    float result_b10 = 0.0f;
+    float result_b11 = 0.0f;
+
+    for (uint group = lane; group < groups_per_row; group += QWEN38_BATCH3_VECTOR_THREADS) {
+        const uint input_base = group * 64u;
+        const uint word_base0 = row0 * words_per_row + group * 8u;
+        const uint word_base1 = row1 * words_per_row + group * 8u;
+        float dot_a00 = 0.0f;
+        float dot_a01 = 0.0f;
+        float dot_a10 = 0.0f;
+        float dot_a11 = 0.0f;
+        float dot_b00 = 0.0f;
+        float dot_b01 = 0.0f;
+        float dot_b10 = 0.0f;
+        float dot_b11 = 0.0f;
+        float input_sum0 = 0.0f;
+        float input_sum1 = 0.0f;
+        for (uint word = 0; word < 8u; ++word) {
+            const uint offset = input_base + word * 8u;
+            const float4 values00 = float4(
+                input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            const float4 values01 = float4(
+                input[offset + 4u], input[offset + 5u], input[offset + 6u], input[offset + 7u]);
+            const float4 values10 = float4(
+                input[second_input + offset], input[second_input + offset + 1u],
+                input[second_input + offset + 2u], input[second_input + offset + 3u]);
+            const float4 values11 = float4(
+                input[second_input + offset + 4u], input[second_input + offset + 5u],
+                input[second_input + offset + 6u], input[second_input + offset + 7u]);
+            input_sum0 += values00.x + values00.y + values00.z + values00.w
+                + values01.x + values01.y + values01.z + values01.w;
+            input_sum1 += values10.x + values10.y + values10.z + values10.w
+                + values11.x + values11.y + values11.z + values11.w;
+            if (active_a0) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_a, weight_byte_offset_a + ulong(word_base0 + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a00 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a01 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_a1) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_a, weight_byte_offset_a + ulong(word_base1 + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_a10 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_a11 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b0) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_b, weight_byte_offset_b + ulong(word_base0 + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b00 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b01 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+            if (active_b1) {
+                const uint packed = qwen38_load_u32(
+                    packed_weights_b, weight_byte_offset_b + ulong(word_base1 + word) * 4ul);
+                const float4 quantized0 = qwen38_q4_low_values(packed);
+                const float4 quantized1 = qwen38_q4_high_values(packed);
+                dot_b10 += dot(values00, quantized0) + dot(values01, quantized1);
+                dot_b11 += dot(values10, quantized0) + dot(values11, quantized1);
+            }
+        }
+        if (active_a0) {
+            const ulong parameter = (ulong(row0) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_a, scale_byte_offset_a + parameter));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_a, bias_byte_offset_a + parameter));
+            result_a00 += dot_a00 * scale + input_sum0 * bias;
+            result_a01 += dot_a01 * scale + input_sum1 * bias;
+        }
+        if (active_a1) {
+            const ulong parameter = (ulong(row1) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_a, scale_byte_offset_a + parameter));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_a, bias_byte_offset_a + parameter));
+            result_a10 += dot_a10 * scale + input_sum0 * bias;
+            result_a11 += dot_a11 * scale + input_sum1 * bias;
+        }
+        if (active_b0) {
+            const ulong parameter = (ulong(row0) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_b, scale_byte_offset_b + parameter));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_b, bias_byte_offset_b + parameter));
+            result_b00 += dot_b00 * scale + input_sum0 * bias;
+            result_b01 += dot_b01 * scale + input_sum1 * bias;
+        }
+        if (active_b1) {
+            const ulong parameter = (ulong(row1) * ulong(groups_per_row) + ulong(group)) * 2ul;
+            const float scale = qwen38_bf16_to_float(
+                qwen38_load_u16(scales_b, scale_byte_offset_b + parameter));
+            const float bias = qwen38_bf16_to_float(
+                qwen38_load_u16(biases_b, bias_byte_offset_b + parameter));
+            result_b10 += dot_b10 * scale + input_sum0 * bias;
+            result_b11 += dot_b11 * scale + input_sum1 * bias;
+        }
+    }
+
+    result_a00 = simd_sum(result_a00);
+    result_a01 = simd_sum(result_a01);
+    result_a10 = simd_sum(result_a10);
+    result_a11 = simd_sum(result_a11);
+    result_b00 = simd_sum(result_b00);
+    result_b01 = simd_sum(result_b01);
+    result_b10 = simd_sum(result_b10);
+    result_b11 = simd_sum(result_b11);
+    if (lane == 0u) {
+        if (active_a0) {
+            output_a[row0] = result_a00;
+            output_a[output_rows_a + row0] = result_a01;
+        }
+        if (active_a1) {
+            output_a[row1] = result_a10;
+            output_a[output_rows_a + row1] = result_a11;
+        }
+        if (active_b0) {
+            output_b[row0] = result_b00;
+            output_b[output_rows_b + row0] = result_b01;
+        }
+        if (active_b1) {
+            output_b[row1] = result_b10;
+            output_b[output_rows_b + row1] = result_b11;
         }
     }
 }
@@ -3862,6 +4574,26 @@ kernel void qwen38_deltanet_prefill(
     for (uint token = 0; token < batch_size; ++token) {
         const uint qkv_base = token * channels;
         const uint value_base = token * value_elements;
+        // The default one-draft verifier only needs the state after row 0.
+        // Write that row directly into the snapshot and let row 1 consume it
+        // into the ordinary destination. This removes a full recurrent-state
+        // copy for every linear layer. Multi-draft verification keeps the
+        // original copy-based path because it needs more than one snapshot.
+        const bool direct_snapshot = snapshot_rows == 1u;
+        const bool first_token = token == 0u;
+        const bool second_token = direct_snapshot && token == 1u;
+        device const float* conv_input = first_token
+            ? initial_conv_history
+            : (second_token ? snapshot_conv_history : conv_history);
+        device float* conv_output = first_token && direct_snapshot
+            ? snapshot_conv_history
+            : conv_history;
+        device const float* recurrent_input = first_token
+            ? initial_recurrent
+            : (second_token ? snapshot_recurrent : recurrent);
+        device float* recurrent_output = first_token && direct_snapshot
+            ? snapshot_recurrent
+            : recurrent;
         if (thread_index < key_head_dim) {
             const uint query_channel = key_head * key_head_dim + thread_index;
             const uint key_channel = key_elements + query_channel;
@@ -3874,10 +4606,10 @@ kernel void qwen38_deltanet_prefill(
             for (uint tap = 0; tap < history_width; ++tap) {
                 const float query_history = token == 0
                     ? initial_conv_history[query_history_base + tap]
-                    : conv_history[query_history_base + tap];
+                    : conv_input[query_history_base + tap];
                 const float key_history = token == 0
                     ? initial_conv_history[key_history_base + tap]
-                    : conv_history[key_history_base + tap];
+                    : conv_input[key_history_base + tap];
                 query_sum += conv_weight[query_channel * conv_kernel_size + tap] * query_history;
                 key_sum += conv_weight[key_channel * conv_kernel_size + tap] * key_history;
             }
@@ -3885,11 +4617,11 @@ kernel void qwen38_deltanet_prefill(
             key_values[thread_index] = qwen38_silu(key_sum);
             if (history_width > 0) {
                 for (uint tap = 0; tap + 1 < history_width; ++tap) {
-                    conv_history[query_history_base + tap] = conv_history[query_history_base + tap + 1];
-                    conv_history[key_history_base + tap] = conv_history[key_history_base + tap + 1];
+                    conv_output[query_history_base + tap] = conv_input[query_history_base + tap + 1];
+                    conv_output[key_history_base + tap] = conv_input[key_history_base + tap + 1];
                 }
-                conv_history[query_history_base + history_width - 1] = qkv[qkv_base + query_channel];
-                conv_history[key_history_base + history_width - 1] = qkv[qkv_base + key_channel];
+                conv_output[query_history_base + history_width - 1] = qkv[qkv_base + query_channel];
+                conv_output[key_history_base + history_width - 1] = qkv[qkv_base + key_channel];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3930,14 +4662,14 @@ kernel void qwen38_deltanet_prefill(
             for (uint tap = 0; tap < history_width; ++tap) {
                 const float value_history = token == 0
                     ? initial_conv_history[value_history_base + tap]
-                    : conv_history[value_history_base + tap];
+                    : conv_input[value_history_base + tap];
                 value_sum += conv_weight[value_channel * conv_kernel_size + tap] * value_history;
             }
             if (history_width > 0) {
                 for (uint tap = 0; tap + 1 < history_width; ++tap) {
-                    conv_history[value_history_base + tap] = conv_history[value_history_base + tap + 1];
+                    conv_output[value_history_base + tap] = conv_input[value_history_base + tap + 1];
                 }
-                conv_history[value_history_base + history_width - 1] = qkv[qkv_base + value_channel];
+                conv_output[value_history_base + history_width - 1] = qkv[qkv_base + value_channel];
             }
             const float decay = exp(-exp(a_log[value_head])
                 * qwen38_softplus(a[token * value_heads + value_head] + dt_bias[value_head]));
@@ -3946,19 +4678,18 @@ kernel void qwen38_deltanet_prefill(
             float kv_mem = 0.0f;
             for (uint key_index = 0; key_index < key_head_dim; ++key_index) {
                 const uint state_index = state_base + key_index;
-                const float prior_state = token == 0
-                    ? initial_recurrent[state_index]
-                    : recurrent[state_index];
+                const float prior_state = recurrent_input[state_index];
                 const float state_value = prior_state * decay;
-                recurrent[state_index] = state_value;
+                recurrent_output[state_index] = state_value;
                 kv_mem += state_value * key_values[key_index];
             }
             const float delta = (qwen38_silu(value_sum) - kv_mem) * beta;
             float output_value = 0.0f;
             for (uint key_index = 0; key_index < key_head_dim; ++key_index) {
                 const uint state_index = state_base + key_index;
-                const float state_value = recurrent[state_index] + key_values[key_index] * delta;
-                recurrent[state_index] = state_value;
+                const float state_value = recurrent_output[state_index]
+                    + key_values[key_index] * delta;
+                recurrent_output[state_index] = state_value;
                 output_value += state_value * query_values[key_index];
             }
             output[value_base + value_head * value_head_dim + value_index] = output_value;
@@ -3990,7 +4721,7 @@ kernel void qwen38_deltanet_prefill(
         // Preserve the causal state after each row while all writes are
         // complete. Each key-head group owns disjoint q/k/value and recurrent
         // ranges, so snapshots can be filled in parallel without atomics.
-        if (token < snapshot_rows) {
+        if (!direct_snapshot && token < snapshot_rows) {
             const uint snapshot_conv_base = token * snapshot_conv_stride;
             const uint snapshot_recurrent_base = token * snapshot_recurrent_stride;
             const uint key_elements_per_head = key_head_dim;

@@ -69,6 +69,7 @@ const Q4_BATCH_SIMD_VALUES_PER_LANE: usize = 16;
 const Q4_BATCH_SIMD_VALUES_PER_BLOCK: usize = Q4_BATCH_SIMD_VALUES_PER_LANE * 32;
 const Q4_BATCH3_VECTOR_THREADS: u64 = 32;
 const Q4_BATCH2_VECTOR_THREADS: u64 = 32;
+const Q4_BATCH2_ROWS2_VECTOR_THREADS: u64 = 32;
 // The one-row batch-vector kernel has excellent locality for transformer
 // projections, but a vocabulary-sized output launches hundreds of thousands
 // of tiny threadgroups. Use the existing 8-row SIMD tile for those matrices
@@ -92,10 +93,16 @@ pub struct MetalRuntime {
     q4_affine_matmul_pair_batch3_vector_unaligned: ComputePipelineState,
     q4_affine_matmul_batch2_vector: ComputePipelineState,
     q4_affine_matmul_batch2_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_batch2_rows2_vector: ComputePipelineState,
+    q4_affine_matmul_batch2_rows2_vector_unaligned: ComputePipelineState,
     q4_affine_matmul_pair_batch2_vector: ComputePipelineState,
     q4_affine_matmul_pair_batch2_vector_unaligned: ComputePipelineState,
+    q4_affine_matmul_pair_batch2_rows2_vector: ComputePipelineState,
+    q4_affine_matmul_pair_batch2_rows2_vector_unaligned: ComputePipelineState,
     q4_affine_matmul_batch2_vector_add: ComputePipelineState,
     q4_affine_matmul_batch2_vector_add_unaligned: ComputePipelineState,
+    q4_affine_matmul_batch2_rows2_vector_add: ComputePipelineState,
+    q4_affine_matmul_batch2_rows2_vector_add_unaligned: ComputePipelineState,
     q4_affine_matvec_simd: ComputePipelineState,
     q4_affine_matvec_simd_unaligned: ComputePipelineState,
     q4_affine_matvec_mlx_fast: ComputePipelineState,
@@ -685,6 +692,16 @@ impl MetalRuntime {
             &library,
             "qwen38_q4_affine_matmul_batch2_vector_unaligned",
         )?;
+        let q4_affine_matmul_batch2_rows2_vector = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_rows2_vector",
+        )?;
+        let q4_affine_matmul_batch2_rows2_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_rows2_vector_unaligned",
+        )?;
         let q4_affine_matmul_pair_batch2_vector = pipeline_for(
             &device,
             &library,
@@ -695,6 +712,16 @@ impl MetalRuntime {
             &library,
             "qwen38_q4_affine_matmul_pair_batch2_vector_unaligned",
         )?;
+        let q4_affine_matmul_pair_batch2_rows2_vector = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch2_rows2_vector",
+        )?;
+        let q4_affine_matmul_pair_batch2_rows2_vector_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_pair_batch2_rows2_vector_unaligned",
+        )?;
         let q4_affine_matmul_batch2_vector_add = pipeline_for(
             &device,
             &library,
@@ -704,6 +731,16 @@ impl MetalRuntime {
             &device,
             &library,
             "qwen38_q4_affine_matmul_batch2_vector_add_unaligned",
+        )?;
+        let q4_affine_matmul_batch2_rows2_vector_add = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_rows2_vector_add",
+        )?;
+        let q4_affine_matmul_batch2_rows2_vector_add_unaligned = pipeline_for(
+            &device,
+            &library,
+            "qwen38_q4_affine_matmul_batch2_rows2_vector_add_unaligned",
         )?;
         let q4_affine_matvec_simd =
             pipeline_for(&device, &library, "qwen38_q4_affine_matvec_simd")?;
@@ -824,10 +861,16 @@ impl MetalRuntime {
             q4_affine_matmul_pair_batch3_vector_unaligned,
             q4_affine_matmul_batch2_vector,
             q4_affine_matmul_batch2_vector_unaligned,
+            q4_affine_matmul_batch2_rows2_vector,
+            q4_affine_matmul_batch2_rows2_vector_unaligned,
             q4_affine_matmul_pair_batch2_vector,
             q4_affine_matmul_pair_batch2_vector_unaligned,
+            q4_affine_matmul_pair_batch2_rows2_vector,
+            q4_affine_matmul_pair_batch2_rows2_vector_unaligned,
             q4_affine_matmul_batch2_vector_add,
             q4_affine_matmul_batch2_vector_add_unaligned,
+            q4_affine_matmul_batch2_rows2_vector_add,
+            q4_affine_matmul_batch2_rows2_vector_add_unaligned,
             q4_affine_matvec_simd,
             q4_affine_matvec_simd_unaligned,
             q4_affine_matvec_mlx_fast,
@@ -2318,7 +2361,14 @@ impl MetalRuntime {
             .expect("fused MTP target token buffer is initialized")
             .buffer;
 
-        let command_buffer = self.command_queue.new_command_buffer();
+        // The fused path normally stays in one command buffer. The existing
+        // batch-profile switch deliberately splits target verification from
+        // the adapter seed so their GPU durations can be measured separately;
+        // this diagnostic mode adds a submission boundary and is never used
+        // by the production path.
+        let batch_profile = std::env::var_os("QWEN38_BATCH_PROFILE").is_some();
+        let target_started = batch_profile.then(Instant::now);
+        let mut command_buffer = self.command_queue.new_command_buffer();
         let mut mps_resources = MpsCommandResources::default();
         let full_sequence_lengths =
             self.encode_decode_batch_graph(command_buffer, state, layers, positions, epsilon)?;
@@ -2346,6 +2396,27 @@ impl MetalRuntime {
         self.encode_argmax_rows(final_encoder, logits, tokens, output_rows, batch_size);
         final_encoder.end_encoding();
 
+        let mut target_sequence_updated = false;
+        let mut target_wall_ms = None;
+        let mut target_gpu_ms = None;
+        if batch_profile {
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalRuntimeError::CommandFailed);
+            }
+            target_wall_ms =
+                target_started.map(|started| started.elapsed().as_secs_f64() * 1_000.0);
+            target_gpu_ms = Some(completed_command_buffer_gpu_ms(command_buffer));
+            update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+            target_sequence_updated = true;
+            // Start the adapter graph only after target argmax has completed.
+            // This preserves the dependency that is implicit in the fused
+            // single-buffer path while giving the profiler an isolated sample.
+            command_buffer = self.command_queue.new_command_buffer();
+            mps_resources = MpsCommandResources::default();
+        }
+
         {
             let adapter_input = &adapter_state
                 .fc_input
@@ -2367,6 +2438,7 @@ impl MetalRuntime {
             )?;
             prepare_encoder.end_encoding();
         }
+        let adapter_started = batch_profile.then(Instant::now);
         let adapter_sequence_length = self.encode_mtp_decode_step(
             command_buffer,
             adapter_state,
@@ -2386,8 +2458,23 @@ impl MetalRuntime {
         if command_buffer.status() == MTLCommandBufferStatus::Error {
             return Err(MetalRuntimeError::CommandFailed);
         }
-        update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+        if !target_sequence_updated {
+            update_batch_full_sequence_lengths(layers, &full_sequence_lengths);
+        }
         adapter_kv.sequence_length = adapter_sequence_length;
+
+        if batch_profile {
+            let adapter_wall_ms = adapter_started
+                .map(|started| started.elapsed().as_secs_f64() * 1_000.0)
+                .unwrap_or(0.0);
+            let adapter_gpu_ms = completed_command_buffer_gpu_ms(command_buffer);
+            eprintln!(
+                "mtp_batch timing target_wall_ms={:.3} target_gpu_ms={:.3} adapter_wall_ms={adapter_wall_ms:.3} adapter_gpu_ms={adapter_gpu_ms:.3} total_wall_ms={:.3}",
+                target_wall_ms.unwrap_or(0.0),
+                target_gpu_ms.unwrap_or(0.0),
+                target_wall_ms.unwrap_or(0.0) + adapter_wall_ms,
+            );
+        }
 
         let result_tokens = unsafe {
             std::slice::from_raw_parts(tokens.contents().cast::<u32>(), state.batch_size)
@@ -5563,6 +5650,81 @@ impl MetalRuntime {
         words_per_row: u32,
         batch_size: usize,
     ) -> Result<bool, MetalRuntimeError> {
+        let use_batch2_rows2 = batch_size == 2
+            && self.fast_q4_prefill
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_ROW_TILE").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_none()
+            && std::env::var_os("QWEN38_DISABLE_RESIDUAL_FUSION").is_none()
+            && words_per_row % 8 == 0;
+        if use_batch2_rows2 {
+            let output_rows = u32::try_from(job.output_rows)
+                .map_err(|_| MetalRuntimeError::DimensionOverflow("residual row-tile rows"))?;
+            encoder.set_compute_pipeline_state(if job.aligned {
+                &self.q4_affine_matmul_batch2_rows2_vector_add
+            } else {
+                &self.q4_affine_matmul_batch2_rows2_vector_add_unaligned
+            });
+            encoder.set_buffer(0, Some(input), 0);
+            if job.aligned {
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+                encoder.set_buffer(4, Some(destination), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as u64,
+                    (&output_rows as *const u32).cast(),
+                );
+            } else {
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+                encoder.set_buffer(4, Some(destination), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    9,
+                    size_of::<u32>() as u64,
+                    (&output_rows as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job.output_rows.div_ceil(2)).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("residual row-tile output rows")
+                    })?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(Q4_BATCH2_ROWS2_VECTOR_THREADS, 1, 1),
+            );
+            return Ok(true);
+        }
         if batch_size != 2
             || !self.fast_q4_prefill
             || std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_some()
@@ -5657,6 +5819,84 @@ impl MetalRuntime {
         let input_elements = (words_per_row as usize)
             .checked_mul(VALUES_PER_PACKED_WORD)
             .ok_or(MetalRuntimeError::DimensionOverflow("Q4 input elements"))?;
+        let use_batch2_rows2 = self.fast_q4_prefill
+            && batch_size == 2
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_ROW_TILE").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_none()
+            && words_per_row % 8 == 0;
+        if use_batch2_rows2 {
+            if std::env::var_os("QWEN38_BATCH2_ROW_TRACE").is_some() {
+                eprintln!(
+                    "q4 batch2 mode=rows2 rows={} words={} aligned={}",
+                    job.output_rows, words_per_row, job.aligned,
+                );
+            }
+            encoder.set_compute_pipeline_state(if job.aligned {
+                &self.q4_affine_matmul_batch2_rows2_vector
+            } else {
+                &self.q4_affine_matmul_batch2_rows2_vector_unaligned
+            });
+            encoder.set_buffer(0, Some(input), 0);
+            if job.aligned {
+                encoder.set_buffer(1, Some(job.weights), job.weight_offset);
+                encoder.set_buffer(2, Some(job.scales), job.scale_offset);
+                encoder.set_buffer(3, Some(job.biases), job.bias_offset);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+            } else {
+                encoder.set_buffer(1, Some(job.weights), 0);
+                encoder.set_buffer(2, Some(job.scales), 0);
+                encoder.set_buffer(3, Some(job.biases), 0);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&words_per_row as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    9,
+                    size_of::<u32>() as u64,
+                    (&output_rows_u32 as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job.output_rows.div_ceil(2)).map_err(|_| {
+                        MetalRuntimeError::DimensionOverflow("batch2 row-tile output rows")
+                    })?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(Q4_BATCH2_ROWS2_VECTOR_THREADS, 1, 1),
+            );
+            return Ok(());
+        }
         let use_batch_vector = self.fast_q4_prefill
             && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
             && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
@@ -6141,6 +6381,130 @@ impl MetalRuntime {
         words_per_row_b: u32,
         batch_size: usize,
     ) -> Result<(), MetalRuntimeError> {
+        let use_batch2_rows2 = self.fast_q4_prefill
+            && batch_size == 2
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_ROW_TILE").is_none()
+            && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
+            && std::env::var_os("QWEN38_DISABLE_BATCH2_WEIGHT_VECTOR").is_none()
+            && std::env::var_os("QWEN38_DISABLE_FUSED_PAIR").is_none()
+            && words_per_row_a == words_per_row_b
+            && words_per_row_a % 8 == 0;
+        if use_batch2_rows2 {
+            let aligned = job_a.aligned && job_b.aligned;
+            if std::env::var_os("QWEN38_PAIR_TRACE").is_some() {
+                eprintln!(
+                    "q4 pair mode=batch2_rows2 rows={}+{} words={} aligned={}+{}",
+                    job_a.output_rows,
+                    job_b.output_rows,
+                    words_per_row_a,
+                    job_a.aligned,
+                    job_b.aligned,
+                );
+            }
+            let output_rows_a_u32 = u32::try_from(job_a.output_rows).map_err(|_| {
+                MetalRuntimeError::DimensionOverflow("paired batch2 row-tile output rows")
+            })?;
+            let output_rows_b_u32 = u32::try_from(job_b.output_rows).map_err(|_| {
+                MetalRuntimeError::DimensionOverflow("paired batch2 row-tile output rows")
+            })?;
+            encoder.set_compute_pipeline_state(if aligned {
+                &self.q4_affine_matmul_pair_batch2_rows2_vector
+            } else {
+                &self.q4_affine_matmul_pair_batch2_rows2_vector_unaligned
+            });
+            encoder.set_buffer(0, Some(input), 0);
+            if aligned {
+                encoder.set_buffer(1, Some(job_a.weights), job_a.weight_offset);
+                encoder.set_buffer(2, Some(job_a.scales), job_a.scale_offset);
+                encoder.set_buffer(3, Some(job_a.biases), job_a.bias_offset);
+                encoder.set_buffer(4, Some(output_a), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&output_rows_a_u32 as *const u32).cast(),
+                );
+                encoder.set_buffer(6, Some(job_b.weights), job_b.weight_offset);
+                encoder.set_buffer(7, Some(job_b.scales), job_b.scale_offset);
+                encoder.set_buffer(8, Some(job_b.biases), job_b.bias_offset);
+                encoder.set_buffer(9, Some(output_b), 0);
+                encoder.set_bytes(
+                    10,
+                    size_of::<u32>() as u64,
+                    (&output_rows_b_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    11,
+                    size_of::<u32>() as u64,
+                    (&words_per_row_a as *const u32).cast(),
+                );
+            } else {
+                encoder.set_buffer(1, Some(job_a.weights), 0);
+                encoder.set_buffer(2, Some(job_a.scales), 0);
+                encoder.set_buffer(3, Some(job_a.biases), 0);
+                encoder.set_buffer(4, Some(output_a), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of::<u32>() as u64,
+                    (&output_rows_a_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of::<u64>() as u64,
+                    (&job_a.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    7,
+                    size_of::<u64>() as u64,
+                    (&job_a.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    8,
+                    size_of::<u64>() as u64,
+                    (&job_a.bias_offset as *const u64).cast(),
+                );
+                encoder.set_buffer(9, Some(job_b.weights), 0);
+                encoder.set_buffer(10, Some(job_b.scales), 0);
+                encoder.set_buffer(11, Some(job_b.biases), 0);
+                encoder.set_buffer(12, Some(output_b), 0);
+                encoder.set_bytes(
+                    13,
+                    size_of::<u32>() as u64,
+                    (&output_rows_b_u32 as *const u32).cast(),
+                );
+                encoder.set_bytes(
+                    14,
+                    size_of::<u64>() as u64,
+                    (&job_b.weight_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    15,
+                    size_of::<u64>() as u64,
+                    (&job_b.scale_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    16,
+                    size_of::<u64>() as u64,
+                    (&job_b.bias_offset as *const u64).cast(),
+                );
+                encoder.set_bytes(
+                    17,
+                    size_of::<u32>() as u64,
+                    (&words_per_row_a as *const u32).cast(),
+                );
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::try_from(job_a.output_rows.max(job_b.output_rows).div_ceil(2)).map_err(
+                        |_| MetalRuntimeError::DimensionOverflow("paired batch2 row-tile rows"),
+                    )?,
+                    1,
+                    1,
+                ),
+                MTLSize::new(Q4_BATCH2_ROWS2_VECTOR_THREADS, 1, 1),
+            );
+            return Ok(());
+        }
         let use_pair_batch_vector = self.fast_q4_prefill
             && std::env::var_os("QWEN38_DISABLE_SHORT_BATCH").is_none()
             && std::env::var_os("QWEN38_DISABLE_BATCH_SIMDGROUP").is_none()
@@ -9532,6 +9896,158 @@ mod tests {
                 (actual - expected).abs() < 0.001,
                 "unaligned actual {actual}, expected {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn batch2_rows2_residual_matches_cpu_reference() {
+        const BATCH_SIZE: usize = 2;
+        const INPUT_WIDTH: usize = 128;
+        const OUTPUT_ROWS: usize = 5;
+        let words_per_row = u32::try_from(INPUT_WIDTH / VALUES_PER_PACKED_WORD).unwrap();
+        let input: Vec<f32> = (0..BATCH_SIZE * INPUT_WIDTH)
+            .map(|index| ((index % 29) as f32 - 14.0) * 0.046875)
+            .collect();
+        let quantized: Vec<u8> = (0..OUTPUT_ROWS * INPUT_WIDTH)
+            .map(|index| ((index * 11 + 3) % 16) as u8)
+            .collect();
+        let scales = (0..OUTPUT_ROWS * (INPUT_WIDTH / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(0.0625 + (index % 3) as f32 * 0.015625))
+            .collect::<Vec<_>>();
+        let biases = (0..OUTPUT_ROWS * (INPUT_WIDTH / AFFINE_GROUP_SIZE))
+            .map(|index| f32_to_bf16(-0.0234375 + (index % 2) as f32 * 0.0078125))
+            .collect::<Vec<_>>();
+        let initial: Vec<f32> = (0..BATCH_SIZE * OUTPUT_ROWS)
+            .map(|index| 0.125 + index as f32 * 0.03125)
+            .collect();
+        let mut expected = initial.clone();
+        for batch in 0..BATCH_SIZE {
+            let projection = cpu_q4_affine_matvec(
+                &input[batch * INPUT_WIDTH..(batch + 1) * INPUT_WIDTH],
+                &quantized,
+                &scales,
+                &biases,
+                OUTPUT_ROWS,
+            );
+            for (row, value) in projection.into_iter().enumerate() {
+                expected[batch * OUTPUT_ROWS + row] += value;
+            }
+        }
+
+        let runtime = MetalRuntime::new().unwrap();
+        for aligned in [true, false] {
+            let (
+                weight_buffer,
+                scale_buffer,
+                bias_buffer,
+                weight_offset,
+                scale_offset,
+                bias_offset,
+            ) = if aligned {
+                (
+                    runtime.buffer_from_slice(&pack_q4(&quantized)).unwrap(),
+                    runtime.buffer_from_slice(&scales).unwrap(),
+                    runtime.buffer_from_slice(&biases).unwrap(),
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                )
+            } else {
+                let mut weight_bytes = vec![0_u8];
+                let mut scale_bytes = vec![0_u8];
+                let mut bias_bytes = vec![0_u8];
+                for value in pack_q4(&quantized) {
+                    weight_bytes.extend(value.to_le_bytes());
+                }
+                for value in &scales {
+                    scale_bytes.extend(value.to_le_bytes());
+                }
+                for value in &biases {
+                    bias_bytes.extend(value.to_le_bytes());
+                }
+                (
+                    runtime.buffer_from_slice(&weight_bytes).unwrap(),
+                    runtime.buffer_from_slice(&scale_bytes).unwrap(),
+                    runtime.buffer_from_slice(&bias_bytes).unwrap(),
+                    1_u64,
+                    1_u64,
+                    1_u64,
+                )
+            };
+            let job = MappedQ4AffineJob::new(
+                &weight_buffer,
+                weight_offset,
+                &scale_buffer,
+                scale_offset,
+                &bias_buffer,
+                bias_offset,
+                OUTPUT_ROWS,
+                aligned,
+            );
+            let input_buffer = runtime.buffer_from_slice(&input).unwrap();
+            let destination = runtime.buffer_from_slice(&initial).unwrap();
+            let command_buffer = runtime.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let used_rows2 = runtime
+                .encode_q4_affine_matmul_add(
+                    encoder,
+                    &input_buffer,
+                    &destination,
+                    &job,
+                    words_per_row,
+                    BATCH_SIZE,
+                )
+                .unwrap();
+
+            // When a diagnostic switch disables residual fusion entirely,
+            // exercise the same contract via the existing output-plus-add
+            // fallback. Disabling only rows2 intentionally selects the older
+            // fused batch-2 kernel, which also returns true here.
+            let fallback_output = if used_rows2 {
+                None
+            } else {
+                let output = runtime
+                    .zeroed_shared_buffer(
+                        checked_byte_len::<f32>(BATCH_SIZE * OUTPUT_ROWS).unwrap(),
+                    )
+                    .unwrap();
+                runtime
+                    .encode_q4_affine_matmul(
+                        encoder,
+                        &input_buffer,
+                        &output,
+                        &job,
+                        words_per_row,
+                        BATCH_SIZE,
+                    )
+                    .unwrap();
+                runtime.encode_add_rows(
+                    encoder,
+                    &destination,
+                    &output,
+                    u32::try_from(OUTPUT_ROWS).unwrap(),
+                    u32::try_from(BATCH_SIZE).unwrap(),
+                );
+                Some(output)
+            };
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_ne!(command_buffer.status(), MTLCommandBufferStatus::Error);
+            drop(fallback_output);
+            let actual = unsafe {
+                std::slice::from_raw_parts(
+                    destination.contents().cast::<f32>(),
+                    BATCH_SIZE * OUTPUT_ROWS,
+                )
+                .to_vec()
+            };
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 0.001,
+                    "aligned={aligned} element {index}: actual {actual}, expected {expected}"
+                );
+            }
         }
     }
 
